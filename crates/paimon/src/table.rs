@@ -15,12 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+//! Table API for Apache Paimon
 
-pub mod catalog;
-pub mod file_index;
-pub mod io;
-pub mod spec;
-mod table;
+/// Table represents a table in the catalog.
+#[derive(Debug, Clone)]
+pub struct Table {}

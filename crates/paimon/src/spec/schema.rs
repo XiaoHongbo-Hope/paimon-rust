@@ -111,7 +111,7 @@ pub const PARTITION_OPTION: &str = "partition";
 
 /// Schema of a table (logical DDL schema).
 ///
-/// Corresponds to [org.apache.paimon.schema.Schema](https://github.com/apache/paimon/blob/1.3/paimon-api/src/main/java/org/apache/paimon/schema/Schema.java).
+/// Corresponds to [org.apache.paimon.schema.Schema](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/schema/Schema.java).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Schema {
@@ -124,7 +124,7 @@ pub struct Schema {
 
 impl Schema {
     /// Build a schema with validation. Normalizes partition/primary keys from options if present.
-    pub fn new(
+    fn new(
         fields: Vec<DataField>,
         partition_keys: Vec<String>,
         primary_keys: Vec<String>,

@@ -66,6 +66,24 @@ pub enum Error {
         display("Paimon hitting invalid file index format: {}", message)
     )]
     FileIndexFormatInvalid { message: String },
+
+    // ======================= catalog errors ===============================
+    #[snafu(display("Database {} already exists.", database))]
+    DatabaseAlreadyExist { database: String },
+    #[snafu(display("Database {} does not exist.", database))]
+    DatabaseNotExist { database: String },
+    #[snafu(display("Database {} is not empty.", database))]
+    DatabaseNotEmpty { database: String },
+    #[snafu(display("Table {} already exists.", full_name))]
+    TableAlreadyExist { full_name: String },
+    #[snafu(display("Table {} does not exist.", full_name))]
+    TableNotExist { full_name: String },
+    #[snafu(display("Column {} already exists in table {}.", column, full_name))]
+    ColumnAlreadyExist { full_name: String, column: String },
+    #[snafu(display("Column {} does not exist in table {}.", column, full_name))]
+    ColumnNotExist { full_name: String, column: String },
+    #[snafu(display("Invalid identifier: {}", message))]
+    IdentifierInvalid { message: String },
 }
 
 impl From<opendal::Error> for Error {
