@@ -17,6 +17,7 @@
 
 //! Table API for Apache Paimon
 
+mod snapshot_manager;
 mod source;
 
 pub use source::{DataSplit, Plan};
