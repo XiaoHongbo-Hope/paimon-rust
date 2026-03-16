@@ -90,11 +90,15 @@ jobs:
       - name: Start Docker containers
         run: make docker-up
 
-      - name: Integration Test
+      - name: Rust Integration Test
         run: cargo test -p paimon-integration-tests --all-targets
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
+
+      - name: Go Integration Test
+        working-directory: bindings/go
+        run: make test
 
       - name: Stop Docker containers
         if: always()

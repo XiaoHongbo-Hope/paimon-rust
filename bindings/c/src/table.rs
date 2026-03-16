@@ -205,6 +205,19 @@ pub unsafe extern "C" fn paimon_plan_free(plan: *mut paimon_plan) {
     }
 }
 
+/// Return the number of data splits in a plan.
+///
+/// # Safety
+/// `plan` must be a valid pointer from `paimon_table_scan_plan`, or null (returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_plan_num_splits(plan: *const paimon_plan) -> usize {
+    if plan.is_null() {
+        return 0;
+    }
+    let plan_ref = &*((*plan).inner as *const Plan);
+    plan_ref.splits().len()
+}
+
 // ======================= TableRead ===============================
 
 /// Free a paimon_table_read.
@@ -222,12 +235,18 @@ pub unsafe extern "C" fn paimon_table_read_free(read: *mut paimon_table_read) {
 /// via `paimon_record_batch_reader_next`. This avoids loading all batches
 /// into memory at once.
 ///
+/// `offset` and `length` select a contiguous sub-range of splits from the
+/// plan. The range is clamped to the available splits (out-of-range values
+/// are silently adjusted).
+///
 /// # Safety
 /// `read` and `plan` must be valid pointers from previous paimon C calls, or null (returns error).
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_read_to_arrow(
     read: *const paimon_table_read,
     plan: *const paimon_plan,
+    offset: usize,
+    length: usize,
 ) -> paimon_result_record_batch_reader {
     if let Err(e) = check_non_null(read, "read") {
         return paimon_result_record_batch_reader {
@@ -244,10 +263,14 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
 
     let table = &*((*read).inner as *const Table);
     let plan_ref = &*((*plan).inner as *const Plan);
+    let all_splits = plan_ref.splits();
+    let start = offset.min(all_splits.len());
+    let end = (offset.saturating_add(length)).min(all_splits.len());
+    let selected = &all_splits[start..end];
 
     let rb = table.new_read_builder();
     match rb.new_read() {
-        Ok(table_read) => match table_read.to_arrow(plan_ref.splits()) {
+        Ok(table_read) => match table_read.to_arrow(selected) {
             Ok(stream) => {
                 let reader = Box::new(stream);
                 let wrapper = Box::new(paimon_record_batch_reader {
