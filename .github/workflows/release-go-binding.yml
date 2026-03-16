@@ -1,0 +1,187 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Release Go Binding
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example v0.1.0 or v0.1.0-rc.1
+        required: true
+        type: string
+      source_ref:
+        description: Rust release baseline ref, for example main, v0.1.0-rc.1, or a commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      source_sha: ${{ steps.meta.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+
+      - name: Validate release version and tag
+        id: meta
+        shell: bash
+        run: |
+          version='${{ inputs.version }}'
+          source_ref='${{ inputs.source_ref }}'
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid version: $version; expected vX.Y.Z or vX.Y.Z-rc.N" >&2
+            exit 1
+          fi
+          if [[ -z "$source_ref" ]]; then
+            echo "source_ref must not be empty" >&2
+            exit 1
+          fi
+
+          git rev-parse --verify "$source_ref^{commit}" >/dev/null 2>&1 || {
+            echo "source_ref does not resolve to a commit: $source_ref" >&2
+            exit 1
+          }
+
+          tag="bindings/go/$version"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "tag already exists: $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse "$source_ref^{commit}")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            expected_file: libpaimon_c.linux.amd64.so.zst
+          - runner: ubuntu-24.04-arm
+            expected_file: libpaimon_c.linux.arm64.so.zst
+          - runner: macos-15-intel
+            expected_file: libpaimon_c.darwin.amd64.dylib.zst
+          - runner: macos-14
+            expected_file: libpaimon_c.darwin.arm64.dylib.zst
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install zstd on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Install zstd on macOS
+        if: runner.os == 'macOS'
+        run: brew install zstd
+
+      - name: Build embedded shared library
+        working-directory: bindings/go
+        run: make build
+
+      - name: Verify packaged library
+        working-directory: bindings/go
+        shell: bash
+        run: |
+          test -s '${{ matrix.expected_file }}'
+
+      - name: Upload packaged library
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.expected_file }}
+          path: bindings/go/${{ matrix.expected_file }}
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.source_sha }}
+
+      - name: Download packaged libraries
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/go
+          merge-multiple: true
+
+      - name: Verify embedded assets
+        working-directory: bindings/go
+        shell: bash
+        run: |
+          for file in \
+            libpaimon_c.linux.amd64.so.zst \
+            libpaimon_c.linux.arm64.so.zst \
+            libpaimon_c.darwin.amd64.dylib.zst \
+            libpaimon_c.darwin.arm64.dylib.zst
+          do
+            test -s "$file"
+          done
+
+      - name: Create release tag commit
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add bindings/go/libpaimon_c.*.zst
+
+          if ! git diff --cached --quiet; then
+            git commit -m "bindings/go: release ${VERSION} (from ${SOURCE_REF}@${SOURCE_SHA})"
+          fi
+
+          git tag -a "$TAG" -m "Release Go binding ${VERSION} from ${SOURCE_REF}@${SOURCE_SHA}"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            bindings/go/libpaimon_c.linux.amd64.so.zst
+            bindings/go/libpaimon_c.linux.arm64.so.zst
+            bindings/go/libpaimon_c.darwin.amd64.dylib.zst
+            bindings/go/libpaimon_c.darwin.arm64.dylib.zst
