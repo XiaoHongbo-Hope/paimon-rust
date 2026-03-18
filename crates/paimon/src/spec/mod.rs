@@ -22,6 +22,9 @@
 mod data_file;
 pub use data_file::*;
 
+mod core_options;
+pub use core_options::*;
+
 mod schema;
 pub use schema::*;
 

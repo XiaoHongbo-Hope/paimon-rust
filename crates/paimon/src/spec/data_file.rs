@@ -226,7 +226,7 @@ impl BinaryRow {
 /// Metadata of a data file.
 ///
 /// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/io/DataFileMeta.java>
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataFileMeta {
     #[serde(rename = "_FILE_NAME")]
