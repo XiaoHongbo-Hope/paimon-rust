@@ -90,7 +90,7 @@ impl RESTServer {
                 let err = ErrorResponse::new(
                     None,
                     None,
-                    Some(format!("Warehouse {} not found", warehouse)),
+                    Some(format!("Warehouse {warehouse} not found")),
                     Some(404),
                 );
                 return (StatusCode::NOT_FOUND, Json(err)).into_response();
@@ -130,7 +130,7 @@ impl RESTServer {
 
     /// Get the server URL.
     pub fn url(&self) -> Option<String> {
-        self.addr.map(|a| format!("http://{}", a))
+        self.addr.map(|a| format!("http://{a}"))
     }
 
     /// Get the server address.
@@ -174,7 +174,7 @@ pub async fn start_mock_server(
         .route("/v1/config", get(RESTServer::get_config))
         // Database routes
         .route(
-            &format!("{}/databases", prefix),
+            &format!("{prefix}/databases"),
             get(RESTServer::list_databases),
         )
         .layer(Extension(state));
@@ -186,7 +186,7 @@ pub async fn start_mock_server(
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-            eprintln!("mock server error: {}", e);
+            eprintln!("mock server error: {e}");
         }
     });
 

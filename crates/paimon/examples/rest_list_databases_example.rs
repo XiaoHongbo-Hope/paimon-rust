@@ -48,7 +48,7 @@ async fn main() {
     let api = match RESTApi::new(options, true).await {
         Ok(api) => api,
         Err(e) => {
-            eprintln!("Failed to create RESTApi: {}", e);
+            eprintln!("Failed to create RESTApi: {e}");
             return;
         }
     };
@@ -57,11 +57,11 @@ async fn main() {
     println!("Calling list_databases()...");
     match api.list_databases().await {
         Ok(databases) => {
-            println!("Databases found: {:?}", databases);
+            println!("Databases found: {databases:?}");
             println!("Total count: {}", databases.len());
         }
         Err(e) => {
-            eprintln!("Failed to list databases: {}", e);
+            eprintln!("Failed to list databases: {e}");
         }
     }
 }

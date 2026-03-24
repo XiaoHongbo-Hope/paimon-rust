@@ -189,7 +189,7 @@ fn resolve_partition_fields<'a>(
                 .iter()
                 .find(|f| f.name() == key)
                 .ok_or_else(|| Error::UnexpectedError {
-                    message: format!("Partition key '{}' not found in schema fields", key),
+                    message: format!("Partition key '{key}' not found in schema fields"),
                     source: None,
                 })
         })
@@ -298,7 +298,7 @@ fn format_partition_value(
         | DataType::Multiset(_)
         | DataType::Row(_) => {
             return Err(Error::Unsupported {
-                message: format!("{:?} type is not supported as partition key", data_type),
+                message: format!("{data_type:?} type is not supported as partition key"),
             });
         }
     };
@@ -330,7 +330,7 @@ fn format_time(millis_of_day: i32, precision: u32) -> String {
     let s = (ms % 60_000) / 1_000;
     let mut frac_ms = ms % 1_000;
 
-    let hms = format!("{:02}:{:02}:{:02}", h, m, s);
+    let hms = format!("{h:02}:{m:02}:{s:02}");
     if precision == 0 || frac_ms == 0 {
         return hms;
     }
@@ -348,7 +348,7 @@ fn format_time(millis_of_day: i32, precision: u32) -> String {
         remaining -= 1;
     }
 
-    format!("{}.{}", hms, frac)
+    format!("{hms}.{frac}")
 }
 
 /// Format an unscaled i128 value with the given scale to a plain decimal string.
@@ -448,9 +448,9 @@ fn format_timestamp_legacy(dt: NaiveDateTime) -> String {
         return date_hour_min;
     }
 
-    let mut result = format!("{}:{:02}", date_hour_min, sec);
+    let mut result = format!("{date_hour_min}:{sec:02}");
     if nano > 0 {
-        let frac = format!("{:09}", nano);
+        let frac = format!("{nano:09}");
         let trimmed = frac.trim_end_matches('0');
         result.push('.');
         result.push_str(trimmed);
@@ -471,7 +471,7 @@ fn format_timestamp_non_legacy(dt: NaiveDateTime, precision: u32) -> String {
     }
 
     // Pad nano to 9 digits, then strip trailing zeros but keep at least up to `precision` digits.
-    let nano_str = format!("{:09}", nano);
+    let nano_str = format!("{nano:09}");
     let mut fraction = &nano_str[..];
 
     // Strip trailing zeros, but don't go below the precision boundary.
@@ -482,7 +482,7 @@ fn format_timestamp_non_legacy(dt: NaiveDateTime, precision: u32) -> String {
     if fraction.is_empty() {
         ymdhms
     } else {
-        format!("{}.{}", ymdhms, fraction)
+        format!("{ymdhms}.{fraction}")
     }
 }
 

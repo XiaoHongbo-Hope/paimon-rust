@@ -53,7 +53,7 @@ impl AuthProviderFactory {
                 message: "auth provider is required".to_string(),
             }),
             Some(unknown) => Err(Error::ConfigInvalid {
-                message: format!("Unknown auth provider: {}", unknown),
+                message: format!("Unknown auth provider: {unknown}"),
             }),
         }
     }
