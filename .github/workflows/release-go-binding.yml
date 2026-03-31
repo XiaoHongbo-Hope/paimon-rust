@@ -18,14 +18,20 @@
 name: Release Go Binding
 
 on:
+  push:
+    tags:
+      # Trigger this workflow when tag follows the versioning format: v<major>.<minor>.<patch> OR v<major>.<minor>.<patch>-rc<release_candidate>
+      # Example valid tags: v0.4.0, v0.4.0-rc1
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example v0.1.0 or v0.1.0-rc.1
+        description: Release version, for example v0.1.0 or v0.1.0-rc1
         required: true
         type: string
       source_ref:
-        description: Rust release baseline ref, for example main, v0.1.0-rc.1, or a commit SHA
+        description: Rust release baseline ref, for example main, v0.1.0-rc1, or a commit SHA
         required: true
         type: string
 
@@ -36,20 +42,33 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     outputs:
+      version: ${{ steps.meta.outputs.version }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
       tag: ${{ steps.meta.outputs.tag }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Validate release version and tag
         id: meta
         shell: bash
         run: |
-          version='${{ inputs.version }}'
-          source_ref='${{ inputs.source_ref }}'
+          event_name='${{ github.event_name }}'
+          version=''
+          source_ref=''
+
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            version='${{ inputs.version }}'
+            source_ref='${{ inputs.source_ref }}'
+          else
+            tag_name='${{ github.ref_name }}'
+            source_ref='${{ github.sha }}'
+            version="$tag_name"
+          fi
+
           if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
             echo "invalid version: $version; expected vX.Y.Z or vX.Y.Z-rc.N" >&2
             exit 1
@@ -71,6 +90,8 @@ jobs:
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
           echo "source_sha=$(git rev-parse "$source_ref^{commit}")" >> "$GITHUB_OUTPUT"
 
   build:
@@ -158,8 +179,8 @@ jobs:
       - name: Create release tag commit
         env:
           TAG: ${{ needs.validate.outputs.tag }}
-          VERSION: ${{ inputs.version }}
-          SOURCE_REF: ${{ inputs.source_ref }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
         shell: bash
         run: |
