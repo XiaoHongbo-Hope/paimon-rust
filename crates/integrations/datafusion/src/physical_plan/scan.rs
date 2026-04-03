@@ -16,8 +16,10 @@
 // under the License.
 
 use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -25,7 +27,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use paimon::table::Table;
 use paimon::DataSplit;
 
@@ -46,6 +48,8 @@ pub struct PaimonTableScan {
     /// Wrapped in `Arc` to avoid deep-cloning `DataSplit` metadata in `execute()`.
     planned_partitions: Vec<Arc<[DataSplit]>>,
     plan_properties: PlanProperties,
+    /// Optional limit on the number of rows to return.
+    limit: Option<usize>,
 }
 
 impl PaimonTableScan {
@@ -54,6 +58,7 @@ impl PaimonTableScan {
         table: Table,
         projected_columns: Option<Vec<String>>,
         planned_partitions: Vec<Arc<[DataSplit]>>,
+        limit: Option<usize>,
     ) -> Self {
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -66,6 +71,7 @@ impl PaimonTableScan {
             projected_columns,
             planned_partitions,
             plan_properties,
+            limit,
         }
     }
 
@@ -76,6 +82,10 @@ impl PaimonTableScan {
     #[cfg(test)]
     pub(crate) fn planned_partitions(&self) -> &[Arc<[DataSplit]>] {
         &self.planned_partitions
+    }
+
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
     }
 }
 
@@ -118,6 +128,7 @@ impl ExecutionPlan for PaimonTableScan {
         let table = self.table.clone();
         let schema = self.schema();
         let projected_columns = self.projected_columns.clone();
+        let limit = self.limit;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -138,9 +149,30 @@ impl ExecutionPlan for PaimonTableScan {
         };
 
         let stream = futures::stream::once(fut).try_flatten();
+
+        // Enforce the final LIMIT at the DataFusion execution layer.
+        let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            if let Some(limit) = limit {
+                let mut remaining = limit;
+                Box::pin(stream.try_filter_map(move |batch| {
+                    futures::future::ready(if remaining == 0 {
+                        Ok(None)
+                    } else if batch.num_rows() <= remaining {
+                        remaining -= batch.num_rows();
+                        Ok(Some(batch))
+                    } else {
+                        let limited_batch = batch.slice(0, remaining);
+                        remaining = 0;
+                        Ok(Some(limited_batch))
+                    })
+                }))
+            } else {
+                Box::pin(stream)
+            };
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream,
+            limited_stream,
         )))
     }
 }
@@ -155,7 +187,11 @@ impl DisplayAs for PaimonTableScan {
             f,
             "PaimonTableScan: partitions={}",
             self.planned_partitions.len()
-        )
+        )?;
+        if let Some(limit) = self.limit {
+            write!(f, ", limit={limit}")?;
+        }
+        Ok(())
     }
 }
 
@@ -176,7 +212,13 @@ mod tests {
     #[test]
     fn test_partition_count_empty_plan() {
         let schema = test_schema();
-        let scan = PaimonTableScan::new(schema, dummy_table(), None, vec![Arc::from(Vec::new())]);
+        let scan = PaimonTableScan::new(
+            schema,
+            dummy_table(),
+            None,
+            vec![Arc::from(Vec::new())],
+            None,
+        );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
     }
 
@@ -188,7 +230,7 @@ mod tests {
             Arc::from(Vec::new()),
             Arc::from(Vec::new()),
         ];
-        let scan = PaimonTableScan::new(schema, dummy_table(), None, planned_partitions);
+        let scan = PaimonTableScan::new(schema, dummy_table(), None, planned_partitions, None);
         assert_eq!(scan.properties().output_partitioning().partition_count(), 3);
     }
 

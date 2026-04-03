@@ -36,6 +36,7 @@ pub struct ReadBuilder<'a> {
     table: &'a Table,
     projected_fields: Option<Vec<String>>,
     filter: Option<Predicate>,
+    limit: Option<usize>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -44,6 +45,7 @@ impl<'a> ReadBuilder<'a> {
             table,
             projected_fields: None,
             filter: None,
+            limit: None,
         }
     }
 
@@ -72,9 +74,22 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Push a row-limit hint down to scan planning.
+    ///
+    /// This allows the scan to generate fewer splits when possible. The hint is
+    /// applied based on the `merged_row_count()` of each split.
+    ///
+    /// Note: This method does not guarantee that exactly `limit` rows will be
+    /// returned by [`TableRead`]. It is only a pushdown hint for planning.
+    /// Callers or query engines are responsible for enforcing the final LIMIT.
+    pub fn with_limit(&mut self, limit: usize) -> &mut Self {
+        self.limit = Some(limit);
+        self
+    }
+
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
-        TableScan::new(self.table, self.filter.clone())
+        TableScan::new(self.table, self.filter.clone(), self.limit)
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).

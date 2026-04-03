@@ -27,7 +27,7 @@ use crate::spec::{
     IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
-use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
+use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 use crate::table::SnapshotManager;
 use crate::Error;
 use std::collections::{HashMap, HashSet};
@@ -173,7 +173,7 @@ fn partition_matches_predicate(
 /// Files without `first_row_id` become their own group.
 ///
 /// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
-fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+pub(crate) fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
     files.sort_by(|a, b| {
         let a_row_id = a.first_row_id.unwrap_or(i64::MIN);
         let b_row_id = b.first_row_id.unwrap_or(i64::MIN);
@@ -226,11 +226,18 @@ fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFile
 pub struct TableScan<'a> {
     table: &'a Table,
     filter: Option<Predicate>,
+    /// Optional limit on the number of rows to return.
+    /// When set, the scan will try to return only enough splits to satisfy the limit.
+    limit: Option<usize>,
 }
 
 impl<'a> TableScan<'a> {
-    pub fn new(table: &'a Table, filter: Option<Predicate>) -> Self {
-        Self { table, filter }
+    pub fn new(table: &'a Table, filter: Option<Predicate>, limit: Option<usize>) -> Self {
+        Self {
+            table,
+            filter,
+            limit,
+        }
     }
 
     /// Plan the full scan: read latest snapshot, manifest list, manifest entries, then build DataSplits using bin packing.
@@ -244,6 +251,53 @@ impl<'a> TableScan<'a> {
             None => return Ok(Plan::new(Vec::new())),
         };
         self.plan_snapshot(snapshot).await
+    }
+
+    /// Apply a limit-pushdown hint to the generated splits.
+    ///
+    /// Iterates through splits and accumulates `merged_row_count()` until the
+    /// limit hint is reached. Returns only the splits likely needed to satisfy
+    /// that hint.
+    ///
+    /// This does not guarantee an exact final row count. If a split's
+    /// `merged_row_count()` is `None` (for example because of unknown deletion
+    /// cardinality), that split is kept even though its contribution to the
+    /// limit is unknown. Planning may still stop early later if the
+    /// accumulated known `merged_row_count()` reaches the limit, and the
+    /// caller or query engine must enforce the final LIMIT.
+    fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
+        let limit = match self.limit {
+            Some(l) => l,
+            None => return splits,
+        };
+
+        if splits.is_empty() {
+            return splits;
+        }
+
+        let mut limited_splits = Vec::new();
+        let mut scanned_row_count: i64 = 0;
+
+        for split in splits {
+            match split.merged_row_count() {
+                Some(merged_count) => {
+                    limited_splits.push(split);
+                    scanned_row_count += merged_count;
+                    if scanned_row_count >= limit as i64 {
+                        // We likely have enough rows for the limit hint.
+                        return limited_splits;
+                    }
+                }
+                None => {
+                    // Can't compute merged row count, so keep this split and
+                    // rely on the caller or query engine to enforce the final
+                    // LIMIT.
+                    limited_splits.push(split);
+                }
+            }
+        }
+
+        limited_splits
     }
 
     async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
@@ -425,6 +479,10 @@ impl<'a> TableScan<'a> {
                 splits.push(builder.build()?);
             }
         }
+
+        // Apply limit pushdown to reduce the number of splits if possible
+        let splits = self.apply_limit_pushdown(splits);
+
         Ok(Plan::new(splits))
     }
 }

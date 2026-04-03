@@ -22,8 +22,8 @@
 #![allow(dead_code)]
 
 use crate::spec::{BinaryRow, DataFileMeta};
+use crate::table::table_scan::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
-
 // ======================= DeletionFile ===============================
 
 /// Deletion file for a data file: describes a region in a file that stores deletion vector bitmap.
@@ -183,6 +183,90 @@ impl DataSplit {
     /// Total row count of all data files in this split.
     pub fn row_count(&self) -> i64 {
         self.data_files.iter().map(|f| f.row_count).sum()
+    }
+
+    /// Returns the merged row count if it can be computed.
+    ///
+    /// This method tries two approaches in order:
+    ///
+    /// 1. **Raw merged row count** (`raw_convertible = true`):
+    ///    - row_count() - total deleted rows (if deletion files have cardinality)
+    ///    - row_count() (if no deletion files)
+    ///
+    /// 2. **Data evolution merged row count** (`raw_convertible = false`):
+    ///    - Requires all files to have `first_row_id` set
+    ///    - Merges overlapping row ID ranges and takes max row count per group
+    ///
+    /// Returns `None` if:
+    /// - `raw_convertible = false` and not all files have `first_row_id`
+    /// - Deletion files exist but cardinality is unknown
+    ///
+    /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
+    pub fn merged_row_count(&self) -> Option<i64> {
+        // Try raw merged row count first (for raw_convertible splits)
+        if let Some(count) = self.raw_merged_row_count() {
+            return Some(count);
+        }
+
+        // Try data evolution merged row count
+        self.data_evolution_merged_row_count()
+    }
+
+    /// Check if raw merged row count is available and compute it.
+    ///
+    /// Available when:
+    /// - `raw_convertible = true`
+    /// - All deletion files have known cardinality (or no deletion files)
+    fn raw_merged_row_count(&self) -> Option<i64> {
+        if !self.raw_convertible {
+            return None;
+        }
+
+        match &self.data_deletion_files {
+            None => {
+                // No deletion files, merged count = row count
+                Some(self.row_count())
+            }
+            Some(deletion_files) => {
+                let mut total = 0i64;
+                for (i, file) in self.data_files.iter().enumerate() {
+                    let deleted_count = match deletion_files.get(i).and_then(|df| df.as_ref()) {
+                        None => 0,
+                        Some(df) => df.cardinality()?,
+                    };
+                    total += file.row_count - deleted_count;
+                }
+                Some(total)
+            }
+        }
+    }
+
+    /// Check if data evolution merged row count is available and compute it.
+    ///
+    /// Available when all files have `first_row_id` set. This is used for
+    /// data evolution mode where files may have overlapping row ID ranges.
+    ///
+    /// The algorithm merges overlapping ranges and takes the max row count
+    /// from each group (since overlapping files share some rows).
+    ///
+    /// Reference: [DataSplit.dataEvolutionMergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L174)
+    fn data_evolution_merged_row_count(&self) -> Option<i64> {
+        // Check all files have first_row_id
+        if self.data_files.iter().any(|f| f.first_row_id.is_none()) {
+            return None;
+        }
+
+        if self.data_files.is_empty() {
+            return Some(0);
+        }
+
+        // Merge overlapping row ID ranges and compute max row_count per group
+        let groups = group_by_overlapping_row_id(self.data_files.to_vec());
+        let sum: i64 = groups
+            .iter()
+            .map(|group| group.iter().map(|f| f.row_count).max().unwrap_or(0))
+            .sum();
+        Some(sum)
     }
 
     pub fn builder() -> DataSplitBuilder {
