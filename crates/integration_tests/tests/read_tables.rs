@@ -1552,7 +1552,10 @@ async fn test_read_data_evolution_table_with_row_ranges() {
         "filtered={filtered_row_count}, full={full_row_count}"
     );
     for row in &filtered_rows {
-        assert!(full_rows.contains(row), "Filtered row {row:?} not in full result");
+        assert!(
+            full_rows.contains(row),
+            "Filtered row {row:?} not in full result"
+        );
     }
     assert!(filtered_plan.splits().len() <= full_plan.splits().len());
 }

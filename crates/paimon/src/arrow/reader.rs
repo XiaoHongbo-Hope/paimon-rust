@@ -21,8 +21,8 @@ use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::{FileIO, FileRead, FileStatus};
 use crate::spec::{DataField, DataFileMeta};
 use crate::table::schema_manager::SchemaManager;
-use crate::table::RowRange;
 use crate::table::ArrowRecordBatchStream;
+use crate::table::RowRange;
 use crate::{DataSplit, Error};
 use arrow_array::RecordBatch;
 use arrow_cast::cast;
@@ -939,11 +939,7 @@ mod tests {
     fn test_row_ranges_selection_multiple_ranges() {
         // File: 10 rows, first_row_id=0, ranges [1,2] and [7,8]
         let rgs = fake_row_groups(&[10]);
-        let sel = build_row_ranges_selection(
-            &rgs,
-            &[RowRange::new(1, 2), RowRange::new(7, 8)],
-            0,
-        );
+        let sel = build_row_ranges_selection(&rgs, &[RowRange::new(1, 2), RowRange::new(7, 8)], 0);
         let v = selection_to_vec(&sel);
         assert_eq!(
             v,

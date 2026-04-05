@@ -63,7 +63,11 @@ impl RowRange {
     }
 
     /// Intersect with an inclusive file range `[file_start, file_end]`.
-    pub fn intersect_inclusive(&self, file_start: i64, file_end_inclusive: i64) -> Option<RowRange> {
+    pub fn intersect_inclusive(
+        &self,
+        file_start: i64,
+        file_end_inclusive: i64,
+    ) -> Option<RowRange> {
         let from = self.from.max(file_start);
         let to = self.to.min(file_end_inclusive);
         if from <= to {
@@ -78,9 +82,9 @@ impl RowRange {
 pub fn any_range_overlaps_file(ranges: &[RowRange], file: &DataFileMeta) -> bool {
     match file.row_id_range() {
         None => true,
-        Some((file_start, file_end)) => {
-            ranges.iter().any(|r| r.overlaps_inclusive(file_start, file_end))
-        }
+        Some((file_start, file_end)) => ranges
+            .iter()
+            .any(|r| r.overlaps_inclusive(file_start, file_end)),
     }
 }
 
@@ -125,8 +129,16 @@ mod row_range_tests {
             row_count,
             min_key: Vec::new(),
             max_key: Vec::new(),
-            key_stats: crate::spec::stats::BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
-            value_stats: crate::spec::stats::BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            key_stats: crate::spec::stats::BinaryTableStats::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            value_stats: crate::spec::stats::BinaryTableStats::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
             min_sequence_number: 0,
             max_sequence_number: 0,
             schema_id: 0,
@@ -194,22 +206,34 @@ mod row_range_tests {
 
     #[test]
     fn test_row_range_intersect_inclusive_partial() {
-        assert_eq!(RowRange::new(8, 12).intersect_inclusive(10, 15), Some(RowRange::new(10, 12)));
+        assert_eq!(
+            RowRange::new(8, 12).intersect_inclusive(10, 15),
+            Some(RowRange::new(10, 12))
+        );
     }
 
     #[test]
     fn test_row_range_intersect_inclusive_subset() {
-        assert_eq!(RowRange::new(11, 14).intersect_inclusive(10, 15), Some(RowRange::new(11, 14)));
+        assert_eq!(
+            RowRange::new(11, 14).intersect_inclusive(10, 15),
+            Some(RowRange::new(11, 14))
+        );
     }
 
     #[test]
     fn test_row_range_intersect_inclusive_superset() {
-        assert_eq!(RowRange::new(5, 20).intersect_inclusive(10, 15), Some(RowRange::new(10, 15)));
+        assert_eq!(
+            RowRange::new(5, 20).intersect_inclusive(10, 15),
+            Some(RowRange::new(10, 15))
+        );
     }
 
     #[test]
     fn test_row_range_intersect_inclusive_touching_end() {
-        assert_eq!(RowRange::new(5, 10).intersect_inclusive(10, 15), Some(RowRange::new(10, 10)));
+        assert_eq!(
+            RowRange::new(5, 10).intersect_inclusive(10, 15),
+            Some(RowRange::new(10, 10))
+        );
     }
 
     #[test]
@@ -233,13 +257,20 @@ mod row_range_tests {
 
     #[test]
     fn test_merge_row_ranges_unsorted() {
-        let merged = merge_row_ranges(vec![RowRange::new(10, 20), RowRange::new(0, 5), RowRange::new(3, 12)]);
+        let merged = merge_row_ranges(vec![
+            RowRange::new(10, 20),
+            RowRange::new(0, 5),
+            RowRange::new(3, 12),
+        ]);
         assert_eq!(merged, vec![RowRange::new(0, 20)]);
     }
 
     #[test]
     fn test_merge_row_ranges_single() {
-        assert_eq!(merge_row_ranges(vec![RowRange::new(5, 10)]), vec![RowRange::new(5, 10)]);
+        assert_eq!(
+            merge_row_ranges(vec![RowRange::new(5, 10)]),
+            vec![RowRange::new(5, 10)]
+        );
     }
 
     #[test]
@@ -251,14 +282,20 @@ mod row_range_tests {
     fn test_any_range_overlaps_file_with_overlap() {
         // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
-        assert!(any_range_overlaps_file(&[RowRange::new(0, 5), RowRange::new(12, 20)], &file));
+        assert!(any_range_overlaps_file(
+            &[RowRange::new(0, 5), RowRange::new(12, 20)],
+            &file
+        ));
     }
 
     #[test]
     fn test_any_range_overlaps_file_no_overlap() {
         // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
-        assert!(!any_range_overlaps_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file));
+        assert!(!any_range_overlaps_file(
+            &[RowRange::new(0, 5), RowRange::new(20, 30)],
+            &file
+        ));
     }
 
     #[test]
@@ -271,7 +308,8 @@ mod row_range_tests {
     fn test_intersect_ranges_with_file_partial_overlap() {
         // file row_id_range = [10, 19]
         let file = file_meta_with_row_id(Some(10), 10);
-        let result = intersect_ranges_with_file(&[RowRange::new(5, 14), RowRange::new(18, 25)], &file);
+        let result =
+            intersect_ranges_with_file(&[RowRange::new(5, 14), RowRange::new(18, 25)], &file);
         assert_eq!(result, vec![RowRange::new(10, 14), RowRange::new(18, 19)]);
     }
 
@@ -279,14 +317,20 @@ mod row_range_tests {
     fn test_intersect_ranges_with_file_no_overlap() {
         // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
-        assert!(intersect_ranges_with_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file).is_empty());
+        assert!(
+            intersect_ranges_with_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file)
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_intersect_ranges_with_file_full_overlap() {
         // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
-        assert_eq!(intersect_ranges_with_file(&[RowRange::new(0, 100)], &file), vec![RowRange::new(10, 14)]);
+        assert_eq!(
+            intersect_ranges_with_file(&[RowRange::new(0, 100)], &file),
+            vec![RowRange::new(10, 14)]
+        );
     }
 
     #[test]

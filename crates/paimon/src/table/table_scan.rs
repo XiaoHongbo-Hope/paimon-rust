@@ -908,11 +908,7 @@ impl<'a> TableScan<'a> {
                 let row_id_groups = if let Some(ref ranges) = self.row_ranges {
                     row_id_groups
                         .into_iter()
-                        .filter(|group| {
-                            group
-                                .iter()
-                                .any(|f| any_range_overlaps_file(ranges, f))
-                        })
+                        .filter(|group| group.iter().any(|f| any_range_overlaps_file(ranges, f)))
                         .collect()
                 } else {
                     row_id_groups
