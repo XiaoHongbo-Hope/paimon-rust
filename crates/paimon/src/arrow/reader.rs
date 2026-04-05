@@ -228,6 +228,7 @@ impl ArrowReader {
 /// - Columns whose Arrow type differs from the target type are cast (type promotion).
 ///
 /// Reference: [RawFileSplitRead.createFileReader](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/operation/RawFileSplitRead.java)
+#[allow(clippy::too_many_arguments)]
 fn read_single_file_stream(
     file_io: FileIO,
     split: DataSplit,
@@ -436,6 +437,7 @@ fn read_single_file_stream(
 /// per file. Each poll slices up to `batch_size` rows from each file's current batch,
 /// assembles columns from the winning files, and yields the merged batch. When a file's
 /// current batch is exhausted, the next batch is read from its stream on demand.
+#[allow(clippy::too_many_arguments)]
 fn merge_files_by_columns(
     file_io: &FileIO,
     split: &DataSplit,
@@ -690,7 +692,7 @@ fn build_row_ranges_selection(
 ) -> RowSelection {
     let total_rows: i64 = row_group_metadata_list
         .iter()
-        .map(|rg| rg.num_rows() as i64)
+        .map(|rg| rg.num_rows())
         .sum();
 
     // Convert global [from, to] ranges to file-local [start, end) offsets, sorted.
