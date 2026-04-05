@@ -31,7 +31,7 @@ use futures::stream::BoxStream;
 pub use read_builder::{ReadBuilder, TableRead};
 pub use schema_manager::SchemaManager;
 pub use snapshot_manager::SnapshotManager;
-pub use source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
+pub use source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange};
 pub use table_scan::TableScan;
 pub use tag_manager::TagManager;
 

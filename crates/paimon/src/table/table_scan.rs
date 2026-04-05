@@ -29,7 +29,10 @@ use crate::spec::{
     Predicate, PredicateOperator, Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
-use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
+use crate::table::source::{
+    any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
+    DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
+};
 use crate::table::SnapshotManager;
 use crate::table::TagManager;
 use crate::Error;
@@ -643,14 +646,21 @@ pub struct TableScan<'a> {
     /// Optional limit on the number of rows to return.
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl<'a> TableScan<'a> {
-    pub fn new(table: &'a Table, filter: Option<Predicate>, limit: Option<usize>) -> Self {
+    pub fn new(
+        table: &'a Table,
+        filter: Option<Predicate>,
+        limit: Option<usize>,
+        row_ranges: Option<Vec<RowRange>>,
+    ) -> Self {
         Self {
             table,
             filter,
             limit,
+            row_ranges,
         }
     }
 
@@ -894,6 +904,20 @@ impl<'a> TableScan<'a> {
             // Keep that split boundary intact and only bin-pack single-file groups.
             let file_groups_with_raw: Vec<(Vec<DataFileMeta>, bool)> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
+
+                let row_id_groups = if let Some(ref ranges) = self.row_ranges {
+                    row_id_groups
+                        .into_iter()
+                        .filter(|group| {
+                            group
+                                .iter()
+                                .any(|f| any_range_overlaps_file(ranges, f))
+                        })
+                        .collect()
+                } else {
+                    row_id_groups
+                };
+
                 let (singles, multis): (Vec<_>, Vec<_>) = row_id_groups
                     .into_iter()
                     .partition(|group| group.len() == 1);
@@ -930,10 +954,20 @@ impl<'a> TableScan<'a> {
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
-                    .with_data_files(file_group)
+                    .with_data_files(file_group.clone())
                     .with_raw_convertible(raw_convertible);
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);
+                }
+                if let Some(ref ranges) = self.row_ranges {
+                    let mut split_ranges = Vec::new();
+                    for file in &file_group {
+                        split_ranges.extend(intersect_ranges_with_file(ranges, file));
+                    }
+                    let split_ranges = merge_row_ranges(split_ranges);
+                    if !split_ranges.is_empty() {
+                        builder = builder.with_row_ranges(split_ranges);
+                    }
                 }
                 splits.push(builder.build()?);
             }
