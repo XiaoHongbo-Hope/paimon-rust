@@ -690,10 +690,7 @@ fn build_row_ranges_selection(
     row_ranges: &[RowRange],
     file_first_row_id: i64,
 ) -> RowSelection {
-    let total_rows: i64 = row_group_metadata_list
-        .iter()
-        .map(|rg| rg.num_rows())
-        .sum();
+    let total_rows: i64 = row_group_metadata_list.iter().map(|rg| rg.num_rows()).sum();
 
     // Convert global [from, to] ranges to file-local [start, end) offsets, sorted.
     let mut local_ranges: Vec<(usize, usize)> = row_ranges
