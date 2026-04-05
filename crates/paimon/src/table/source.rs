@@ -22,6 +22,281 @@
 use crate::spec::{BinaryRow, DataFileMeta};
 use crate::table::table_scan::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
+// ======================= RowRange ===============================
+
+/// A half-open row ID range `[start, end)` for filtering reads in data evolution mode.
+///
+/// Reference: pypaimon's `IndexedSplit` with `row_ranges`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowRange {
+    start: i64,
+    end: i64,
+}
+
+impl RowRange {
+    pub fn new(start: i64, end: i64) -> Self {
+        debug_assert!(start <= end, "RowRange start ({start}) must be <= end ({end})");
+        Self { start, end }
+    }
+
+    pub fn start(&self) -> i64 {
+        self.start
+    }
+
+    pub fn end(&self) -> i64 {
+        self.end
+    }
+
+    pub fn len(&self) -> i64 {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+
+    /// Check overlap with an inclusive file range `[file_start, file_end]`.
+    pub fn overlaps_inclusive(&self, file_start: i64, file_end_inclusive: i64) -> bool {
+        self.start <= file_end_inclusive && self.end > file_start
+    }
+
+    /// Intersect with an inclusive file range `[file_start, file_end]`.
+    pub fn intersect_inclusive(&self, file_start: i64, file_end_inclusive: i64) -> Option<RowRange> {
+        let start = self.start.max(file_start);
+        let end = self.end.min(file_end_inclusive + 1);
+        if start < end {
+            Some(RowRange::new(start, end))
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns `true` (fail-open) if the file has no `first_row_id`.
+pub fn any_range_overlaps_file(ranges: &[RowRange], file: &DataFileMeta) -> bool {
+    match file.row_id_range() {
+        None => true,
+        Some((file_start, file_end)) => {
+            ranges.iter().any(|r| r.overlaps_inclusive(file_start, file_end))
+        }
+    }
+}
+
+pub fn intersect_ranges_with_file(ranges: &[RowRange], file: &DataFileMeta) -> Vec<RowRange> {
+    match file.row_id_range() {
+        None => Vec::new(),
+        Some((file_start, file_end)) => ranges
+            .iter()
+            .filter_map(|r| r.intersect_inclusive(file_start, file_end))
+            .collect(),
+    }
+}
+
+pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<RowRange> = Vec::with_capacity(ranges.len());
+    let mut current = ranges[0].clone();
+    for r in &ranges[1..] {
+        if r.start <= current.end {
+            current.end = current.end.max(r.end);
+        } else {
+            merged.push(current);
+            current = r.clone();
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+#[cfg(test)]
+mod row_range_tests {
+    use super::*;
+
+    fn file_meta_with_row_id(first_row_id: Option<i64>, row_count: i64) -> DataFileMeta {
+        DataFileMeta {
+            file_name: "test.parquet".into(),
+            file_size: 128,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: crate::spec::stats::BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: crate::spec::stats::BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: chrono::Utc::now(),
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id,
+            write_cols: None,
+            external_path: None,
+        }
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_touching() {
+        let r = RowRange::new(5, 11);
+        assert!(r.overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_adjacent_no_overlap() {
+        // [5, 10) does NOT include row 10
+        let r = RowRange::new(5, 10);
+        assert!(!r.overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_disjoint_before() {
+        let r = RowRange::new(5, 9);
+        assert!(!r.overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_disjoint_after() {
+        let r = RowRange::new(20, 30);
+        assert!(!r.overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_subset() {
+        assert!(RowRange::new(12, 14).overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_superset() {
+        assert!(RowRange::new(5, 20).overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_partial_left() {
+        assert!(RowRange::new(8, 12).overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_overlaps_inclusive_partial_right() {
+        assert!(RowRange::new(14, 20).overlaps_inclusive(10, 15));
+    }
+
+    #[test]
+    fn test_row_range_intersect_inclusive_no_overlap() {
+        assert_eq!(RowRange::new(0, 5).intersect_inclusive(10, 15), None);
+    }
+
+    #[test]
+    fn test_row_range_intersect_inclusive_partial() {
+        assert_eq!(RowRange::new(8, 12).intersect_inclusive(10, 15), Some(RowRange::new(10, 12)));
+    }
+
+    #[test]
+    fn test_row_range_intersect_inclusive_subset() {
+        assert_eq!(RowRange::new(11, 14).intersect_inclusive(10, 15), Some(RowRange::new(11, 14)));
+    }
+
+    #[test]
+    fn test_row_range_intersect_inclusive_superset() {
+        assert_eq!(RowRange::new(5, 20).intersect_inclusive(10, 15), Some(RowRange::new(10, 16)));
+    }
+
+    #[test]
+    fn test_row_range_intersect_inclusive_touching_end() {
+        assert_eq!(RowRange::new(5, 11).intersect_inclusive(10, 15), Some(RowRange::new(10, 11)));
+    }
+
+    #[test]
+    fn test_merge_row_ranges_non_overlapping() {
+        let merged = merge_row_ranges(vec![RowRange::new(0, 5), RowRange::new(10, 15)]);
+        assert_eq!(merged, vec![RowRange::new(0, 5), RowRange::new(10, 15)]);
+    }
+
+    #[test]
+    fn test_merge_row_ranges_overlapping() {
+        let merged = merge_row_ranges(vec![RowRange::new(0, 10), RowRange::new(5, 15)]);
+        assert_eq!(merged, vec![RowRange::new(0, 15)]);
+    }
+
+    #[test]
+    fn test_merge_row_ranges_adjacent() {
+        let merged = merge_row_ranges(vec![RowRange::new(0, 5), RowRange::new(5, 10)]);
+        assert_eq!(merged, vec![RowRange::new(0, 10)]);
+    }
+
+    #[test]
+    fn test_merge_row_ranges_unsorted() {
+        let merged = merge_row_ranges(vec![RowRange::new(10, 20), RowRange::new(0, 5), RowRange::new(3, 12)]);
+        assert_eq!(merged, vec![RowRange::new(0, 20)]);
+    }
+
+    #[test]
+    fn test_merge_row_ranges_single() {
+        assert_eq!(merge_row_ranges(vec![RowRange::new(5, 10)]), vec![RowRange::new(5, 10)]);
+    }
+
+    #[test]
+    fn test_merge_row_ranges_empty() {
+        assert!(merge_row_ranges(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_any_range_overlaps_file_with_overlap() {
+        let file = file_meta_with_row_id(Some(10), 5);
+        assert!(any_range_overlaps_file(&[RowRange::new(0, 5), RowRange::new(12, 20)], &file));
+    }
+
+    #[test]
+    fn test_any_range_overlaps_file_no_overlap() {
+        let file = file_meta_with_row_id(Some(10), 5);
+        assert!(!any_range_overlaps_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file));
+    }
+
+    #[test]
+    fn test_any_range_overlaps_file_no_first_row_id() {
+        let file = file_meta_with_row_id(None, 5);
+        assert!(any_range_overlaps_file(&[RowRange::new(0, 5)], &file));
+    }
+
+    #[test]
+    fn test_intersect_ranges_with_file_partial_overlap() {
+        let file = file_meta_with_row_id(Some(10), 10);
+        let result = intersect_ranges_with_file(&[RowRange::new(5, 15), RowRange::new(18, 25)], &file);
+        assert_eq!(result, vec![RowRange::new(10, 15), RowRange::new(18, 20)]);
+    }
+
+    #[test]
+    fn test_intersect_ranges_with_file_no_overlap() {
+        let file = file_meta_with_row_id(Some(10), 5);
+        assert!(intersect_ranges_with_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file).is_empty());
+    }
+
+    #[test]
+    fn test_intersect_ranges_with_file_full_overlap() {
+        let file = file_meta_with_row_id(Some(10), 5);
+        assert_eq!(intersect_ranges_with_file(&[RowRange::new(0, 100)], &file), vec![RowRange::new(10, 15)]);
+    }
+
+    #[test]
+    fn test_intersect_ranges_with_file_no_first_row_id() {
+        let file = file_meta_with_row_id(None, 5);
+        assert!(intersect_ranges_with_file(&[RowRange::new(0, 100)], &file).is_empty());
+    }
+
+    #[test]
+    fn test_row_range_len_and_empty() {
+        let r = RowRange::new(5, 10);
+        assert_eq!(r.len(), 5);
+        assert!(!r.is_empty());
+
+        let empty = RowRange::new(5, 5);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+    }
+}
+
 // ======================= DeletionFile ===============================
 
 /// Deletion file for a data file: describes a region in a file that stores deletion vector bitmap.
@@ -110,6 +385,7 @@ pub struct DataSplit {
     /// `false` when files need column-wise merge (e.g. data evolution) or
     /// key-value merge (e.g. primary key tables without deletion vectors).
     raw_convertible: bool,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl DataSplit {
@@ -141,6 +417,10 @@ impl DataSplit {
     /// Whether this split can be read without column-wise merging.
     pub fn raw_convertible(&self) -> bool {
         self.raw_convertible
+    }
+
+    pub fn row_ranges(&self) -> Option<&[RowRange]> {
+        self.row_ranges.as_deref()
     }
 
     /// Returns the deletion file for the data file at the given index, if any. `None` at that index means no deletion file.
@@ -274,6 +554,7 @@ pub struct DataSplitBuilder {
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     raw_convertible: bool,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl DataSplitBuilder {
@@ -287,6 +568,7 @@ impl DataSplitBuilder {
             data_files: None,
             data_deletion_files: None,
             raw_convertible: false,
+            row_ranges: None,
         }
     }
 
@@ -326,6 +608,11 @@ impl DataSplitBuilder {
 
     pub fn with_raw_convertible(mut self, raw_convertible: bool) -> Self {
         self.raw_convertible = raw_convertible;
+        self
+    }
+
+    pub fn with_row_ranges(mut self, row_ranges: Vec<RowRange>) -> Self {
+        self.row_ranges = Some(row_ranges);
         self
     }
 
@@ -381,6 +668,7 @@ impl DataSplitBuilder {
             data_files,
             data_deletion_files: self.data_deletion_files,
             raw_convertible: self.raw_convertible,
+            row_ranges: self.row_ranges,
         })
     }
 }

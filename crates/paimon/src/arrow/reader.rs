@@ -21,6 +21,7 @@ use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::{FileIO, FileRead, FileStatus};
 use crate::spec::{DataField, DataFileMeta};
 use crate::table::schema_manager::SchemaManager;
+use crate::table::RowRange;
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
 use arrow_array::RecordBatch;
@@ -176,6 +177,8 @@ impl ArrowReader {
 
         Ok(try_stream! {
             for split in splits {
+                let row_ranges = split.row_ranges().map(|r| r.to_vec());
+
                 if split.raw_convertible() || split.data_files().len() == 1 {
                     for file_meta in split.data_files().to_vec() {
                         let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != table_schema_id {
@@ -185,16 +188,36 @@ impl ArrowReader {
                             None
                         };
 
+                        let file_base_row_id = file_meta.first_row_id.unwrap_or(0);
+                        let mut current_row_id = file_base_row_id;
+
                         let mut stream = read_single_file_stream(
                             file_io.clone(), split.clone(), file_meta, read_type.clone(),
                             data_fields, batch_size, None,
                         )?;
                         while let Some(batch) = stream.next().await {
-                            yield batch?;
+                            let batch = batch?;
+                            let num_rows = batch.num_rows() as i64;
+                            if let Some(ref ranges) = row_ranges {
+                                let filtered = filter_batch_by_row_ranges(&batch, current_row_id, ranges)?;
+                                if filtered.num_rows() > 0 {
+                                    yield filtered;
+                                }
+                            } else {
+                                yield batch;
+                            }
+                            current_row_id += num_rows;
                         }
                     }
                 } else {
-                    // Multiple files need column-wise merge.
+                    let group_base_row_id = split
+                        .data_files()
+                        .iter()
+                        .filter_map(|f| f.first_row_id)
+                        .min()
+                        .unwrap_or(0);
+                    let mut current_row_id = group_base_row_id;
+
                     let mut merge_stream = merge_files_by_columns(
                         &file_io,
                         &split,
@@ -205,7 +228,17 @@ impl ArrowReader {
                         batch_size,
                     )?;
                     while let Some(batch) = merge_stream.next().await {
-                        yield batch?;
+                        let batch = batch?;
+                        let num_rows = batch.num_rows() as i64;
+                        if let Some(ref ranges) = row_ranges {
+                            let filtered = filter_batch_by_row_ranges(&batch, current_row_id, ranges)?;
+                            if filtered.num_rows() > 0 {
+                                yield filtered;
+                            }
+                        } else {
+                            yield batch;
+                        }
+                        current_row_id += num_rows;
                     }
                 }
             }
@@ -647,6 +680,57 @@ fn merge_files_by_columns(
     .boxed())
 }
 
+/// Filter a `RecordBatch` to keep only rows whose global row ID falls within the given `[start, end)` ranges.
+fn filter_batch_by_row_ranges(
+    batch: &RecordBatch,
+    batch_start_row_id: i64,
+    row_ranges: &[RowRange],
+) -> crate::Result<RecordBatch> {
+    let num_rows = batch.num_rows() as i64;
+    let batch_end_row_id = batch_start_row_id + num_rows;
+
+    let mut slices: Vec<(usize, usize)> = Vec::new();
+    for range in row_ranges {
+        let local_start = (range.start() - batch_start_row_id).max(0i64) as usize;
+        let local_end = (range.end() - batch_start_row_id).min(num_rows) as usize;
+        if local_start < local_end && (range.start() < batch_end_row_id) && (range.end() > batch_start_row_id) {
+            slices.push((local_start, local_end - local_start));
+        }
+    }
+
+    if slices.is_empty() {
+        return RecordBatch::try_new_with_options(
+            batch.schema(),
+            batch
+                .columns()
+                .iter()
+                .map(|c| c.slice(0, 0))
+                .collect(),
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(0)),
+        )
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to build empty filtered RecordBatch: {e}"),
+            source: Some(Box::new(e)),
+        });
+    }
+
+    if slices.len() == 1 {
+        let (offset, length) = slices[0];
+        return Ok(batch.slice(offset, length));
+    }
+
+    let sub_batches: Vec<RecordBatch> = slices
+        .iter()
+        .map(|&(offset, length)| batch.slice(offset, length))
+        .collect();
+    arrow_select::concat::concat_batches(&batch.schema(), &sub_batches).map_err(|e| {
+        Error::UnexpectedError {
+            message: format!("Failed to concat filtered RecordBatch slices: {e}"),
+            source: Some(Box::new(e)),
+        }
+    })
+}
+
 /// Builds a Parquet [RowSelection] from deletion vector.
 /// Only rows not in the deletion vector are selected; deleted rows are skipped at read time.
 /// todo: Uses [DeletionVectorIterator] with [advance_to](DeletionVectorIterator::advance_to) when skipping row groups similar to iceberg-rust
@@ -770,5 +854,122 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
                 .await?;
             Ok(Arc::new(metadata))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::table::RowRange;
+    use arrow_array::{Int32Array, StringArray};
+    use arrow_schema::{Field, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    fn make_test_batch(ids: &[i32]) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", arrow_schema::DataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn make_test_batch_with_names(ids: &[i32], names: &[&str]) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", arrow_schema::DataType::Int32, false),
+            Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn extract_ids(batch: &RecordBatch) -> Vec<i32> {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_full_overlap() {
+        let batch = make_test_batch(&[1, 2, 3, 4, 5]);
+        let ranges = vec![RowRange::new(100, 105)];
+        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 5);
+        assert_eq!(extract_ids(&result), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_no_overlap() {
+        let batch = make_test_batch(&[1, 2, 3, 4, 5]);
+        let ranges = vec![RowRange::new(200, 300)];
+        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_partial() {
+        let batch = make_test_batch(&[10, 20, 30, 40, 50]);
+        let ranges = vec![RowRange::new(102, 104)];
+        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(extract_ids(&result), vec![30, 40]);
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_multiple_ranges() {
+        let batch = make_test_batch(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let ranges = vec![RowRange::new(1, 3), RowRange::new(7, 9)];
+        let result = filter_batch_by_row_ranges(&batch, 0, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 4);
+        assert_eq!(extract_ids(&result), vec![1, 2, 7, 8]);
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_range_extends_beyond_batch() {
+        let batch = make_test_batch(&[10, 20, 30, 40, 50]);
+        let ranges = vec![RowRange::new(98, 103)];
+        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(extract_ids(&result), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_preserves_multiple_columns() {
+        let batch = make_test_batch_with_names(
+            &[1, 2, 3, 4, 5],
+            &["a", "b", "c", "d", "e"],
+        );
+        let ranges = vec![RowRange::new(1, 4)];
+        let result = filter_batch_by_row_ranges(&batch, 0, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 3);
+        let names: Vec<&str> = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(names, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_filter_batch_by_row_ranges_empty_ranges() {
+        let batch = make_test_batch(&[1, 2, 3]);
+        let ranges: Vec<RowRange> = vec![];
+        let result = filter_batch_by_row_ranges(&batch, 0, &ranges).unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 }

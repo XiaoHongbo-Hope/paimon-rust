@@ -38,6 +38,6 @@ pub use catalog::CatalogFactory;
 pub use catalog::FileSystemCatalog;
 
 pub use table::{
-    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, ReadBuilder, SnapshotManager,
-    Table, TableRead, TableScan, TagManager,
+    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, ReadBuilder, RowRange,
+    SnapshotManager, Table, TableRead, TableScan, TagManager,
 };

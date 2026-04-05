@@ -1467,3 +1467,124 @@ async fn test_read_complex_type_table() {
         "Complex type table should return correct ARRAY, MAP, and STRUCT values"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Data Evolution Row ID Range Filter integration tests
+// ---------------------------------------------------------------------------
+
+async fn scan_and_read_with_row_ranges(
+    table: &paimon::Table,
+    row_ranges: Vec<paimon::RowRange>,
+) -> (Plan, Vec<RecordBatch>) {
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_row_ranges(row_ranges);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<_> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    (plan, batches)
+}
+
+fn extract_id_name_value(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string(), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+    rows
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let (full_plan, full_batches) = scan_and_read(&catalog, "data_evolution_table", None).await;
+    let full_rows = extract_id_name_value(&full_batches);
+    let full_row_count: usize = full_batches.iter().map(|b| b.num_rows()).sum();
+    assert!(full_row_count > 0);
+
+    let mut min_row_id = i64::MAX;
+    let mut max_row_id_exclusive = i64::MIN;
+    for split in full_plan.splits() {
+        for file in split.data_files() {
+            if let Some(fid) = file.first_row_id {
+                min_row_id = min_row_id.min(fid);
+                max_row_id_exclusive = max_row_id_exclusive.max(fid + file.row_count);
+            }
+        }
+    }
+    assert!(min_row_id < max_row_id_exclusive);
+
+    let mid = min_row_id + (max_row_id_exclusive - min_row_id) / 2;
+    let (filtered_plan, filtered_batches) =
+        scan_and_read_with_row_ranges(&table, vec![RowRange::new(min_row_id, mid)]).await;
+
+    let filtered_row_count: usize = filtered_batches.iter().map(|b| b.num_rows()).sum();
+    let filtered_rows = extract_id_name_value(&filtered_batches);
+
+    assert!(
+        filtered_row_count < full_row_count || mid >= max_row_id_exclusive,
+        "filtered={filtered_row_count}, full={full_row_count}"
+    );
+    for row in &filtered_rows {
+        assert!(full_rows.contains(row), "Filtered row {row:?} not in full result");
+    }
+    assert!(filtered_plan.splits().len() <= full_plan.splits().len());
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_empty_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let (plan, batches) =
+        scan_and_read_with_row_ranges(&table, vec![RowRange::new(999_999, 1_000_000)]).await;
+
+    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(row_count, 0);
+    assert!(plan.splits().is_empty());
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_full_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let (_, full_batches) = scan_and_read(&catalog, "data_evolution_table", None).await;
+    let full_rows = extract_id_name_value(&full_batches);
+
+    let (_, filtered_batches) =
+        scan_and_read_with_row_ranges(&table, vec![RowRange::new(0, i64::MAX)]).await;
+    let filtered_rows = extract_id_name_value(&filtered_batches);
+
+    assert_eq!(filtered_rows, full_rows);
+}

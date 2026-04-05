@@ -23,6 +23,7 @@
 use super::{ArrowRecordBatchStream, Table, TableScan};
 use crate::arrow::ArrowReaderBuilder;
 use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::table::source::RowRange;
 use crate::Result;
 use crate::{DataSplit, Error};
 use std::collections::{HashMap, HashSet};
@@ -37,6 +38,7 @@ pub struct ReadBuilder<'a> {
     projected_fields: Option<Vec<String>>,
     filter: Option<Predicate>,
     limit: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -46,6 +48,7 @@ impl<'a> ReadBuilder<'a> {
             projected_fields: None,
             filter: None,
             limit: None,
+            row_ranges: None,
         }
     }
 
@@ -74,6 +77,12 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Set row ID ranges `[start, end)` for filtering in data evolution mode.
+    pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
+        self.row_ranges = Some(ranges);
+        self
+    }
+
     /// Push a row-limit hint down to scan planning.
     ///
     /// This allows the scan to generate fewer splits when possible. The hint is
@@ -89,7 +98,12 @@ impl<'a> ReadBuilder<'a> {
 
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
-        TableScan::new(self.table, self.filter.clone(), self.limit)
+        TableScan::new(
+            self.table,
+            self.filter.clone(),
+            self.limit,
+            self.row_ranges.clone(),
+        )
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
