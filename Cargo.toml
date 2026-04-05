@@ -29,7 +29,6 @@ rust-version = "1.86.0"
 
 [workspace.dependencies]
 arrow-array = { version = "57.0", features = ["ffi"] }
-arrow-select = "57.0"
 arrow-schema = "57.0"
 arrow-cast = "57.0"
 parquet = "57.0"

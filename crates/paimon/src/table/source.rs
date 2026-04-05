@@ -24,48 +24,50 @@ use crate::table::table_scan::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
 // ======================= RowRange ===============================
 
-/// A half-open row ID range `[start, end)` for filtering reads in data evolution mode.
+/// An inclusive row ID range `[from, to]` for filtering reads in data evolution mode.
 ///
-/// Reference: pypaimon's `IndexedSplit` with `row_ranges`.
+/// Both `from` and `to` are inclusive, aligned with Java's `Range` class.
+///
+/// Reference: Java's `org.apache.paimon.utils.Range` and pypaimon's `IndexedSplit` with `row_ranges`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowRange {
-    start: i64,
-    end: i64,
+    from: i64,
+    to: i64,
 }
 
 impl RowRange {
-    pub fn new(start: i64, end: i64) -> Self {
-        debug_assert!(start <= end, "RowRange start ({start}) must be <= end ({end})");
-        Self { start, end }
+    pub fn new(from: i64, to: i64) -> Self {
+        debug_assert!(from <= to, "RowRange from ({from}) must be <= to ({to})");
+        Self { from, to }
     }
 
-    pub fn start(&self) -> i64 {
-        self.start
+    pub fn from(&self) -> i64 {
+        self.from
     }
 
-    pub fn end(&self) -> i64 {
-        self.end
+    pub fn to(&self) -> i64 {
+        self.to
     }
 
-    pub fn len(&self) -> i64 {
-        self.end - self.start
+    pub fn count(&self) -> i64 {
+        self.to - self.from + 1
     }
 
     pub fn is_empty(&self) -> bool {
-        self.start >= self.end
+        self.from > self.to
     }
 
     /// Check overlap with an inclusive file range `[file_start, file_end]`.
     pub fn overlaps_inclusive(&self, file_start: i64, file_end_inclusive: i64) -> bool {
-        self.start <= file_end_inclusive && self.end > file_start
+        self.from <= file_end_inclusive && self.to >= file_start
     }
 
     /// Intersect with an inclusive file range `[file_start, file_end]`.
     pub fn intersect_inclusive(&self, file_start: i64, file_end_inclusive: i64) -> Option<RowRange> {
-        let start = self.start.max(file_start);
-        let end = self.end.min(file_end_inclusive + 1);
-        if start < end {
-            Some(RowRange::new(start, end))
+        let from = self.from.max(file_start);
+        let to = self.to.min(file_end_inclusive);
+        if from <= to {
+            Some(RowRange::new(from, to))
         } else {
             None
         }
@@ -96,12 +98,13 @@ pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
     if ranges.len() <= 1 {
         return ranges;
     }
-    ranges.sort_by_key(|r| r.start);
+    ranges.sort_by_key(|r| r.from);
     let mut merged: Vec<RowRange> = Vec::with_capacity(ranges.len());
     let mut current = ranges[0].clone();
     for r in &ranges[1..] {
-        if r.start <= current.end {
-            current.end = current.end.max(r.end);
+        // Adjacent or overlapping: [0,5] and [6,10] should merge to [0,10]
+        if r.from <= current.to + 1 {
+            current.to = current.to.max(r.to);
         } else {
             merged.push(current);
             current = r.clone();
@@ -140,20 +143,21 @@ mod row_range_tests {
 
     #[test]
     fn test_row_range_overlaps_inclusive_touching() {
-        let r = RowRange::new(5, 11);
+        // [5, 10] overlaps [10, 15] because row 10 is in both
+        let r = RowRange::new(5, 10);
         assert!(r.overlaps_inclusive(10, 15));
     }
 
     #[test]
     fn test_row_range_overlaps_inclusive_adjacent_no_overlap() {
-        // [5, 10) does NOT include row 10
-        let r = RowRange::new(5, 10);
+        // [5, 9] does NOT overlap [10, 15]
+        let r = RowRange::new(5, 9);
         assert!(!r.overlaps_inclusive(10, 15));
     }
 
     #[test]
     fn test_row_range_overlaps_inclusive_disjoint_before() {
-        let r = RowRange::new(5, 9);
+        let r = RowRange::new(5, 8);
         assert!(!r.overlaps_inclusive(10, 15));
     }
 
@@ -200,18 +204,18 @@ mod row_range_tests {
 
     #[test]
     fn test_row_range_intersect_inclusive_superset() {
-        assert_eq!(RowRange::new(5, 20).intersect_inclusive(10, 15), Some(RowRange::new(10, 16)));
+        assert_eq!(RowRange::new(5, 20).intersect_inclusive(10, 15), Some(RowRange::new(10, 15)));
     }
 
     #[test]
     fn test_row_range_intersect_inclusive_touching_end() {
-        assert_eq!(RowRange::new(5, 11).intersect_inclusive(10, 15), Some(RowRange::new(10, 11)));
+        assert_eq!(RowRange::new(5, 10).intersect_inclusive(10, 15), Some(RowRange::new(10, 10)));
     }
 
     #[test]
     fn test_merge_row_ranges_non_overlapping() {
-        let merged = merge_row_ranges(vec![RowRange::new(0, 5), RowRange::new(10, 15)]);
-        assert_eq!(merged, vec![RowRange::new(0, 5), RowRange::new(10, 15)]);
+        let merged = merge_row_ranges(vec![RowRange::new(0, 4), RowRange::new(10, 15)]);
+        assert_eq!(merged, vec![RowRange::new(0, 4), RowRange::new(10, 15)]);
     }
 
     #[test]
@@ -222,7 +226,8 @@ mod row_range_tests {
 
     #[test]
     fn test_merge_row_ranges_adjacent() {
-        let merged = merge_row_ranges(vec![RowRange::new(0, 5), RowRange::new(5, 10)]);
+        // [0,5] and [6,10] are adjacent and should merge to [0,10]
+        let merged = merge_row_ranges(vec![RowRange::new(0, 5), RowRange::new(6, 10)]);
         assert_eq!(merged, vec![RowRange::new(0, 10)]);
     }
 
@@ -244,12 +249,14 @@ mod row_range_tests {
 
     #[test]
     fn test_any_range_overlaps_file_with_overlap() {
+        // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
         assert!(any_range_overlaps_file(&[RowRange::new(0, 5), RowRange::new(12, 20)], &file));
     }
 
     #[test]
     fn test_any_range_overlaps_file_no_overlap() {
+        // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
         assert!(!any_range_overlaps_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file));
     }
@@ -262,21 +269,24 @@ mod row_range_tests {
 
     #[test]
     fn test_intersect_ranges_with_file_partial_overlap() {
+        // file row_id_range = [10, 19]
         let file = file_meta_with_row_id(Some(10), 10);
-        let result = intersect_ranges_with_file(&[RowRange::new(5, 15), RowRange::new(18, 25)], &file);
-        assert_eq!(result, vec![RowRange::new(10, 15), RowRange::new(18, 20)]);
+        let result = intersect_ranges_with_file(&[RowRange::new(5, 14), RowRange::new(18, 25)], &file);
+        assert_eq!(result, vec![RowRange::new(10, 14), RowRange::new(18, 19)]);
     }
 
     #[test]
     fn test_intersect_ranges_with_file_no_overlap() {
+        // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
         assert!(intersect_ranges_with_file(&[RowRange::new(0, 5), RowRange::new(20, 30)], &file).is_empty());
     }
 
     #[test]
     fn test_intersect_ranges_with_file_full_overlap() {
+        // file row_id_range = [10, 14]
         let file = file_meta_with_row_id(Some(10), 5);
-        assert_eq!(intersect_ranges_with_file(&[RowRange::new(0, 100)], &file), vec![RowRange::new(10, 15)]);
+        assert_eq!(intersect_ranges_with_file(&[RowRange::new(0, 100)], &file), vec![RowRange::new(10, 14)]);
     }
 
     #[test]
@@ -286,14 +296,10 @@ mod row_range_tests {
     }
 
     #[test]
-    fn test_row_range_len_and_empty() {
+    fn test_row_range_count_and_empty() {
         let r = RowRange::new(5, 10);
-        assert_eq!(r.len(), 5);
+        assert_eq!(r.count(), 6); // rows 5,6,7,8,9,10
         assert!(!r.is_empty());
-
-        let empty = RowRange::new(5, 5);
-        assert_eq!(empty.len(), 0);
-        assert!(empty.is_empty());
     }
 }
 

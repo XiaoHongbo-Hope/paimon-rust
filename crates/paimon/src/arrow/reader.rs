@@ -144,6 +144,7 @@ impl ArrowReader {
                         data_fields,
                         batch_size,
                         dv,
+                        None,
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
@@ -188,36 +189,15 @@ impl ArrowReader {
                             None
                         };
 
-                        let file_base_row_id = file_meta.first_row_id.unwrap_or(0);
-                        let mut current_row_id = file_base_row_id;
-
                         let mut stream = read_single_file_stream(
                             file_io.clone(), split.clone(), file_meta, read_type.clone(),
-                            data_fields, batch_size, None,
+                            data_fields, batch_size, None, row_ranges.clone(),
                         )?;
                         while let Some(batch) = stream.next().await {
-                            let batch = batch?;
-                            let num_rows = batch.num_rows() as i64;
-                            if let Some(ref ranges) = row_ranges {
-                                let filtered = filter_batch_by_row_ranges(&batch, current_row_id, ranges)?;
-                                if filtered.num_rows() > 0 {
-                                    yield filtered;
-                                }
-                            } else {
-                                yield batch;
-                            }
-                            current_row_id += num_rows;
+                            yield batch?;
                         }
                     }
                 } else {
-                    let group_base_row_id = split
-                        .data_files()
-                        .iter()
-                        .filter_map(|f| f.first_row_id)
-                        .min()
-                        .unwrap_or(0);
-                    let mut current_row_id = group_base_row_id;
-
                     let mut merge_stream = merge_files_by_columns(
                         &file_io,
                         &split,
@@ -226,19 +206,10 @@ impl ArrowReader {
                         schema_manager.clone(),
                         table_schema_id,
                         batch_size,
+                        row_ranges.clone(),
                     )?;
                     while let Some(batch) = merge_stream.next().await {
-                        let batch = batch?;
-                        let num_rows = batch.num_rows() as i64;
-                        if let Some(ref ranges) = row_ranges {
-                            let filtered = filter_batch_by_row_ranges(&batch, current_row_id, ranges)?;
-                            if filtered.num_rows() > 0 {
-                                yield filtered;
-                            }
-                        } else {
-                            yield batch;
-                        }
-                        current_row_id += num_rows;
+                        yield batch?;
                     }
                 }
             }
@@ -265,6 +236,7 @@ fn read_single_file_stream(
     data_fields: Option<Vec<DataField>>,
     batch_size: Option<usize>,
     dv: Option<Arc<DeletionVector>>,
+    row_ranges: Option<Vec<RowRange>>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let target_schema = build_target_arrow_schema(&read_type)?;
 
@@ -335,12 +307,36 @@ fn read_single_file_stream(
         let mask = ProjectionMask::roots(&parquet_schema, root_indices);
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
-        if let Some(ref dv) = dv {
+        // Build RowSelection from deletion vector and/or row ranges, then intersect if both present.
+        let dv_selection = if let Some(ref dv) = dv {
             if !dv.is_empty() {
-                let row_selection =
-                    build_deletes_row_selection(batch_stream_builder.metadata().row_groups(), dv)?;
-                batch_stream_builder = batch_stream_builder.with_row_selection(row_selection);
+                Some(build_deletes_row_selection(batch_stream_builder.metadata().row_groups(), dv)?)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        let range_selection = if let Some(ref ranges) = row_ranges {
+            let first_row_id = file_meta.first_row_id.unwrap_or(0);
+            Some(build_row_ranges_selection(
+                batch_stream_builder.metadata().row_groups(),
+                ranges,
+                first_row_id,
+            ))
+        } else {
+            None
+        };
+
+        let combined_selection = match (dv_selection, range_selection) {
+            (Some(dv_sel), Some(range_sel)) => Some(dv_sel.intersection(&range_sel)),
+            (Some(sel), None) | (None, Some(sel)) => Some(sel),
+            (None, None) => None,
+        };
+
+        if let Some(selection) = combined_selection {
+            batch_stream_builder = batch_stream_builder.with_row_selection(selection);
         }
         if let Some(size) = batch_size {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
@@ -448,6 +444,7 @@ fn merge_files_by_columns(
     schema_manager: SchemaManager,
     table_schema_id: i64,
     batch_size: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let data_files = split.data_files();
     if data_files.is_empty() {
@@ -590,6 +587,7 @@ fn merge_files_by_columns(
                 data_fields.clone(),
                 batch_size,
                 None,
+                row_ranges.clone(),
             )?;
             file_streams.insert(file_idx, stream);
         }
@@ -680,55 +678,54 @@ fn merge_files_by_columns(
     .boxed())
 }
 
-/// Filter a `RecordBatch` to keep only rows whose global row ID falls within the given `[start, end)` ranges.
-fn filter_batch_by_row_ranges(
-    batch: &RecordBatch,
-    batch_start_row_id: i64,
+/// Builds a Parquet [RowSelection] from inclusive `[from, to]` row ranges.
+///
+/// Converts global row ID ranges into file-local row offsets, then generates
+/// select/skip selectors. This allows Parquet to skip rows at the IO level,
+/// aligned with Java's `DataFileMeta.toFileSelection()`.
+fn build_row_ranges_selection(
+    row_group_metadata_list: &[RowGroupMetaData],
     row_ranges: &[RowRange],
-) -> crate::Result<RecordBatch> {
-    let num_rows = batch.num_rows() as i64;
-    let batch_end_row_id = batch_start_row_id + num_rows;
-
-    let mut slices: Vec<(usize, usize)> = Vec::new();
-    for range in row_ranges {
-        let local_start = (range.start() - batch_start_row_id).max(0i64) as usize;
-        let local_end = (range.end() - batch_start_row_id).min(num_rows) as usize;
-        if local_start < local_end && (range.start() < batch_end_row_id) && (range.end() > batch_start_row_id) {
-            slices.push((local_start, local_end - local_start));
-        }
-    }
-
-    if slices.is_empty() {
-        return RecordBatch::try_new_with_options(
-            batch.schema(),
-            batch
-                .columns()
-                .iter()
-                .map(|c| c.slice(0, 0))
-                .collect(),
-            &arrow_array::RecordBatchOptions::new().with_row_count(Some(0)),
-        )
-        .map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to build empty filtered RecordBatch: {e}"),
-            source: Some(Box::new(e)),
-        });
-    }
-
-    if slices.len() == 1 {
-        let (offset, length) = slices[0];
-        return Ok(batch.slice(offset, length));
-    }
-
-    let sub_batches: Vec<RecordBatch> = slices
+    file_first_row_id: i64,
+) -> RowSelection {
+    let total_rows: i64 = row_group_metadata_list
         .iter()
-        .map(|&(offset, length)| batch.slice(offset, length))
+        .map(|rg| rg.num_rows() as i64)
+        .sum();
+
+    // Convert global [from, to] ranges to file-local [start, end) offsets, sorted.
+    let mut local_ranges: Vec<(usize, usize)> = row_ranges
+        .iter()
+        .filter_map(|r| {
+            let local_start = (r.from() - file_first_row_id).max(0) as usize;
+            // r.to() is inclusive, +1 to make exclusive
+            let local_end = ((r.to() + 1 - file_first_row_id).min(total_rows)) as usize;
+            if local_start < local_end {
+                Some((local_start, local_end))
+            } else {
+                None
+            }
+        })
         .collect();
-    arrow_select::concat::concat_batches(&batch.schema(), &sub_batches).map_err(|e| {
-        Error::UnexpectedError {
-            message: format!("Failed to concat filtered RecordBatch slices: {e}"),
-            source: Some(Box::new(e)),
+    local_ranges.sort_by_key(|&(s, _)| s);
+
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut cursor: usize = 0;
+    for (start, end) in &local_ranges {
+        if *start > cursor {
+            selectors.push(RowSelector::skip(*start - cursor));
         }
-    })
+        let select_start = (*start).max(cursor);
+        if *end > select_start {
+            selectors.push(RowSelector::select(*end - select_start));
+        }
+        cursor = cursor.max(*end);
+    }
+    let total = total_rows as usize;
+    if cursor < total {
+        selectors.push(RowSelector::skip(total - cursor));
+    }
+    selectors.into()
 }
 
 /// Builds a Parquet [RowSelection] from deletion vector.
@@ -861,115 +858,114 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
 mod tests {
     use super::*;
     use crate::table::RowRange;
-    use arrow_array::{Int32Array, StringArray};
-    use arrow_schema::{Field, Schema as ArrowSchema};
-    use std::sync::Arc;
 
-    fn make_test_batch(ids: &[i32]) -> RecordBatch {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", arrow_schema::DataType::Int32, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(ids.to_vec()))],
-        )
-        .unwrap()
-    }
+    /// Helper: create fake row group metadata with a given row count.
+    fn fake_row_groups(row_counts: &[i64]) -> Vec<RowGroupMetaData> {
+        use parquet::basic::{Encoding, Type as PhysicalType};
+        use parquet::file::metadata::ColumnChunkMetaData;
+        use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor, Type};
+        use std::sync::Arc;
 
-    fn make_test_batch_with_names(ids: &[i32], names: &[&str]) -> RecordBatch {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", arrow_schema::DataType::Int32, false),
-            Field::new("name", arrow_schema::DataType::Utf8, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(ids.to_vec())),
-                Arc::new(StringArray::from(names.to_vec())),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn extract_ids(batch: &RecordBatch) -> Vec<i32> {
-        batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values()
-            .to_vec()
-    }
-
-    #[test]
-    fn test_filter_batch_by_row_ranges_full_overlap() {
-        let batch = make_test_batch(&[1, 2, 3, 4, 5]);
-        let ranges = vec![RowRange::new(100, 105)];
-        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 5);
-        assert_eq!(extract_ids(&result), vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_filter_batch_by_row_ranges_no_overlap() {
-        let batch = make_test_batch(&[1, 2, 3, 4, 5]);
-        let ranges = vec![RowRange::new(200, 300)];
-        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 0);
-    }
-
-    #[test]
-    fn test_filter_batch_by_row_ranges_partial() {
-        let batch = make_test_batch(&[10, 20, 30, 40, 50]);
-        let ranges = vec![RowRange::new(102, 104)];
-        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 2);
-        assert_eq!(extract_ids(&result), vec![30, 40]);
-    }
-
-    #[test]
-    fn test_filter_batch_by_row_ranges_multiple_ranges() {
-        let batch = make_test_batch(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        let ranges = vec![RowRange::new(1, 3), RowRange::new(7, 9)];
-        let result = filter_batch_by_row_ranges(&batch, 0, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 4);
-        assert_eq!(extract_ids(&result), vec![1, 2, 7, 8]);
-    }
-
-    #[test]
-    fn test_filter_batch_by_row_ranges_range_extends_beyond_batch() {
-        let batch = make_test_batch(&[10, 20, 30, 40, 50]);
-        let ranges = vec![RowRange::new(98, 103)];
-        let result = filter_batch_by_row_ranges(&batch, 100, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 3);
-        assert_eq!(extract_ids(&result), vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn test_filter_batch_by_row_ranges_preserves_multiple_columns() {
-        let batch = make_test_batch_with_names(
-            &[1, 2, 3, 4, 5],
-            &["a", "b", "c", "d", "e"],
+        let schema = Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    Type::primitive_type_builder("dummy", PhysicalType::INT32)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
         );
-        let ranges = vec![RowRange::new(1, 4)];
-        let result = filter_batch_by_row_ranges(&batch, 0, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 3);
-        let names: Vec<&str> = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
+        let schema_desc: SchemaDescPtr = Arc::new(SchemaDescriptor::new(schema));
+
+        row_counts
             .iter()
-            .map(|v| v.unwrap())
-            .collect();
-        assert_eq!(names, vec!["b", "c", "d"]);
+            .map(|&count| {
+                let col_desc = schema_desc.column(0);
+                let col_chunk = ColumnChunkMetaData::builder(col_desc)
+                    .set_encodings(vec![Encoding::PLAIN])
+                    .set_total_compressed_size(0)
+                    .set_total_uncompressed_size(0)
+                    .set_num_values(count)
+                    .build()
+                    .unwrap();
+                RowGroupMetaData::builder(schema_desc.clone())
+                    .set_num_rows(count)
+                    .set_column_metadata(vec![col_chunk])
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn selection_to_vec(sel: &RowSelection) -> Vec<bool> {
+        let mut result = Vec::new();
+        for selector in sel.iter() {
+            for _ in 0..selector.row_count {
+                result.push(!selector.skip);
+            }
+        }
+        result
     }
 
     #[test]
-    fn test_filter_batch_by_row_ranges_empty_ranges() {
-        let batch = make_test_batch(&[1, 2, 3]);
-        let ranges: Vec<RowRange> = vec![];
-        let result = filter_batch_by_row_ranges(&batch, 0, &ranges).unwrap();
-        assert_eq!(result.num_rows(), 0);
+    fn test_row_ranges_selection_full_overlap() {
+        // File: 10 rows, first_row_id=100, range [100,109] → select all
+        let rgs = fake_row_groups(&[10]);
+        let sel = build_row_ranges_selection(&rgs, &[RowRange::new(100, 109)], 100);
+        let v = selection_to_vec(&sel);
+        assert_eq!(v, vec![true; 10]);
+    }
+
+    #[test]
+    fn test_row_ranges_selection_no_overlap() {
+        // File: 10 rows, first_row_id=100, range [200,300] → skip all
+        let rgs = fake_row_groups(&[10]);
+        let sel = build_row_ranges_selection(&rgs, &[RowRange::new(200, 300)], 100);
+        let v = selection_to_vec(&sel);
+        assert_eq!(v, vec![false; 10]);
+    }
+
+    #[test]
+    fn test_row_ranges_selection_partial() {
+        // File: 5 rows, first_row_id=100, range [102,103] → skip 2, select 2, skip 1
+        let rgs = fake_row_groups(&[5]);
+        let sel = build_row_ranges_selection(&rgs, &[RowRange::new(102, 103)], 100);
+        let v = selection_to_vec(&sel);
+        assert_eq!(v, vec![false, false, true, true, false]);
+    }
+
+    #[test]
+    fn test_row_ranges_selection_multiple_ranges() {
+        // File: 10 rows, first_row_id=0, ranges [1,2] and [7,8]
+        let rgs = fake_row_groups(&[10]);
+        let sel = build_row_ranges_selection(
+            &rgs,
+            &[RowRange::new(1, 2), RowRange::new(7, 8)],
+            0,
+        );
+        let v = selection_to_vec(&sel);
+        assert_eq!(
+            v,
+            vec![false, true, true, false, false, false, false, true, true, false]
+        );
+    }
+
+    #[test]
+    fn test_row_ranges_selection_extends_beyond() {
+        // File: 5 rows, first_row_id=100, range [98,102] → select first 3
+        let rgs = fake_row_groups(&[5]);
+        let sel = build_row_ranges_selection(&rgs, &[RowRange::new(98, 102)], 100);
+        let v = selection_to_vec(&sel);
+        assert_eq!(v, vec![true, true, true, false, false]);
+    }
+
+    #[test]
+    fn test_row_ranges_selection_empty_ranges() {
+        // Empty ranges → skip all
+        let rgs = fake_row_groups(&[5]);
+        let sel = build_row_ranges_selection(&rgs, &[], 0);
+        let v = selection_to_vec(&sel);
+        assert_eq!(v, vec![false; 5]);
     }
 }
