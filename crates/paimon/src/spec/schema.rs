@@ -110,6 +110,14 @@ impl TableSchema {
     }
 }
 
+/// Name of the virtual `_ROW_ID` column.
+///
+/// Reference: Java's `SpecialFields.ROW_ID` (field id = `Integer.MAX_VALUE - 5`).
+pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
+
+/// Field id for the virtual `_ROW_ID` column, matching Java's `Integer.MAX_VALUE - 5`.
+pub const ROW_ID_FIELD_ID: i32 = i32::MAX - 5;
+
 /// Data field for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataField.java#L40>
@@ -158,6 +166,10 @@ impl DataField {
     pub fn with_name(mut self, new_name: String) -> Self {
         self.name = new_name;
         self
+    }
+
+    pub fn is_row_id_field(&self) -> bool {
+        self.name == ROW_ID_FIELD_NAME
     }
 
     pub fn with_description(mut self, new_description: Option<String>) -> Self {
