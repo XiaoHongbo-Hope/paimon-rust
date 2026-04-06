@@ -292,13 +292,26 @@ impl ArrowReader {
                         }
                     }
                 } else {
-                    let group_base_row_id = split
-                        .data_files()
+                    let files = split.data_files();
+                    debug_assert!(
+                        files.iter().all(|f| f.first_row_id.is_some()),
+                        "All files in a field merge split should have first_row_id"
+                    );
+                    debug_assert!(
+                        files.iter().all(|f| f.row_count == files[0].row_count),
+                        "All files in a field merge split should have the same row count"
+                    );
+                    debug_assert!(
+                        files.iter().all(|f| f.first_row_id == files[0].first_row_id),
+                        "All files in a field merge split should have the same first row id"
+                    );
+
+                    let group_base_row_id = files
                         .iter()
                         .filter_map(|f| f.first_row_id)
                         .min();
                     let has_group_row_id = group_base_row_id.is_some();
-                    let group_row_count = split.data_files().iter().map(|f| f.row_count).max().unwrap_or(0);
+                    let group_row_count = files.iter().map(|f| f.row_count).max().unwrap_or(0);
                     let effective_row_ranges = if has_group_row_id { row_ranges.clone() } else { None };
 
                     let selected_row_ids = if row_id_index.is_some() && has_group_row_id {
