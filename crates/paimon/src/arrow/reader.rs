@@ -27,7 +27,7 @@ use crate::spec::{
 };
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
-use crate::table::RowRange;
+use crate::table::{merge_row_ranges, RowRange};
 use crate::{DataSplit, Error};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
@@ -1464,8 +1464,9 @@ fn exact_parquet_value<'a, T>(
 /// Expand row_ranges into a flat sequence of selected row IDs for a file.
 fn expand_selected_row_ids(first_row_id: i64, row_count: i64, row_ranges: &[RowRange]) -> Vec<i64> {
     let file_end = first_row_id + row_count - 1;
+    let merged = merge_row_ranges(row_ranges.to_vec());
     let mut ids = Vec::new();
-    for r in row_ranges {
+    for r in &merged {
         let from = r.from().max(first_row_id);
         let to = r.to().min(file_end);
         for id in from..=to {
