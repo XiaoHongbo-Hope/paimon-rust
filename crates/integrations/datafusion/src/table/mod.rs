@@ -103,7 +103,6 @@ impl TableProvider for PaimonTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Convert projection indices to column names and compute projected schema
         let (projected_schema, projected_columns) = if let Some(indices) = projection {
             let fields: Vec<Field> = indices
                 .iter()
@@ -112,7 +111,13 @@ impl TableProvider for PaimonTableProvider {
             let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
             (Arc::new(Schema::new(fields)), Some(column_names))
         } else {
-            (self.schema.clone(), None)
+            let column_names: Vec<String> = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            (self.schema.clone(), Some(column_names))
         };
 
         // Plan splits eagerly so we know partition count upfront.
