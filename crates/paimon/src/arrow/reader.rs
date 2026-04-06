@@ -232,6 +232,10 @@ impl ArrowReader {
         Ok(try_stream! {
             for split in splits {
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
+                // When _ROW_ID is requested, skip Parquet-level row_ranges filtering
+                // because RowSelection changes which rows appear in the output,
+                // making positional _ROW_ID tracking incorrect.
+                let file_row_ranges = if row_id_index.is_some() { None } else { row_ranges.clone() };
 
                 if split.raw_convertible() || split.data_files().len() == 1 {
                     for file_meta in split.data_files().to_vec() {
@@ -256,7 +260,7 @@ impl ArrowReader {
                                 predicates: Vec::new(),
                                 batch_size,
                                 dv: None,
-                                row_ranges: row_ranges.clone(),
+                                row_ranges: file_row_ranges.clone(),
                             },
                         )?;
                         while let Some(batch) = stream.next().await {
@@ -289,7 +293,7 @@ impl ArrowReader {
                         schema_manager.clone(),
                         table_schema_id,
                         batch_size,
-                        row_ranges.clone(),
+                        file_row_ranges.clone(),
                     )?;
                     while let Some(batch) = merge_stream.next().await {
                         let batch = batch?;
