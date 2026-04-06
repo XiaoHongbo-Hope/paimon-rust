@@ -1458,7 +1458,9 @@ fn build_row_ranges_selection(
         .iter()
         .filter_map(|r| {
             let local_start = (r.from() - file_first_row_id).max(0) as usize;
-            let local_end = (r.to() + 1 - file_first_row_id).max(0).min(total_rows) as usize;
+            // Clamp to() to file boundary before +1 to avoid i64 overflow when to() == i64::MAX
+            let clamped_to = r.to().min(file_first_row_id + total_rows - 1);
+            let local_end = (clamped_to + 1 - file_first_row_id) as usize;
             if local_start < local_end {
                 Some((local_start, local_end))
             } else {

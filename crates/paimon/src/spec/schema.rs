@@ -110,12 +110,8 @@ impl TableSchema {
     }
 }
 
-/// Name of the virtual `_ROW_ID` column.
-///
-/// Reference: Java's `SpecialFields.ROW_ID` (field id = `Integer.MAX_VALUE - 5`).
 pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
 
-/// Field id for the virtual `_ROW_ID` column, matching Java's `Integer.MAX_VALUE - 5`.
 pub const ROW_ID_FIELD_ID: i32 = i32::MAX - 5;
 
 /// Data field for paimon table.

@@ -222,7 +222,7 @@ impl<'a> ReadBuilder<'a> {
                 resolved.push(DataField::new(
                     crate::spec::ROW_ID_FIELD_ID,
                     crate::spec::ROW_ID_FIELD_NAME.to_string(),
-                    crate::spec::DataType::BigInt(Default::default()),
+                    crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(false)),
                 ));
                 continue;
             }

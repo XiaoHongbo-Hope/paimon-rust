@@ -2124,3 +2124,55 @@ async fn test_read_data_evolution_table_with_full_row_ranges() {
 
     assert_eq!(filtered_rows, full_rows);
 }
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_row_id_projection() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    // Project _ROW_ID along with regular columns
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["_ROW_ID", "id", "name"]);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "Should have rows");
+
+    // Verify _ROW_ID column exists and contains non-negative values
+    let mut row_ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let row_id_col = batch
+            .column_by_name("_ROW_ID")
+            .expect("_ROW_ID column should exist");
+        let row_id_array = row_id_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_ROW_ID should be Int64");
+        for i in 0..batch.num_rows() {
+            row_ids.push(row_id_array.value(i));
+        }
+    }
+
+    assert_eq!(row_ids.len(), total_rows);
+    assert!(
+        row_ids.iter().all(|&id| id >= 0),
+        "All _ROW_ID values should be non-negative"
+    );
+    // _ROW_ID values should be unique
+    let unique: std::collections::HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "_ROW_ID values should be unique"
+    );
+}
