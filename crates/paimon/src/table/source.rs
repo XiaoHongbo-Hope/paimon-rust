@@ -33,7 +33,7 @@ pub struct RowRange {
 
 impl RowRange {
     pub fn new(from: i64, to: i64) -> Self {
-        debug_assert!(from <= to, "RowRange from ({from}) must be <= to ({to})");
+        assert!(from <= to, "RowRange from ({from}) must be <= to ({to})");
         Self { from, to }
     }
 
@@ -96,13 +96,14 @@ pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
     }
     ranges.sort_by_key(|r| r.from);
     let mut merged: Vec<RowRange> = Vec::with_capacity(ranges.len());
-    let mut current = ranges[0].clone();
-    for r in &ranges[1..] {
+    let mut iter = ranges.into_iter();
+    let mut current = iter.next().unwrap();
+    for r in iter {
         if r.from <= current.to.saturating_add(1) {
             current.to = current.to.max(r.to);
         } else {
             merged.push(current);
-            current = r.clone();
+            current = r;
         }
     }
     merged.push(current);

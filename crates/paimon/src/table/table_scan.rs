@@ -701,9 +701,8 @@ impl<'a> TableScan<'a> {
             }
         }
 
-        // Apply limit pushdown only when there are no data predicates.
-        // With data predicates, merged_row_count() reflects pre-filter row counts,
-        // so stopping early could return fewer rows than the limit after filtering.
+        // With data predicates or row_ranges, merged_row_count() reflects pre-filter
+        // row counts, so stopping early could return fewer rows than the limit.
         let splits = if self.data_predicates.is_empty() && self.row_ranges.is_none() {
             self.apply_limit_pushdown(splits)
         } else {
