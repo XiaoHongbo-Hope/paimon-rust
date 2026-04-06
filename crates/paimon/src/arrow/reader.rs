@@ -293,15 +293,15 @@ impl ArrowReader {
                     }
                 } else {
                     let files = split.data_files();
-                    debug_assert!(
+                    assert!(
                         files.iter().all(|f| f.first_row_id.is_some()),
                         "All files in a field merge split should have first_row_id"
                     );
-                    debug_assert!(
+                    assert!(
                         files.iter().all(|f| f.row_count == files[0].row_count),
                         "All files in a field merge split should have the same row count"
                     );
-                    debug_assert!(
+                    assert!(
                         files.iter().all(|f| f.first_row_id == files[0].first_row_id),
                         "All files in a field merge split should have the same first row id"
                     );
