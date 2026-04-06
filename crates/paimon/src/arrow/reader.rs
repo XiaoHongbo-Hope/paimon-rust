@@ -270,16 +270,8 @@ impl ArrowReader {
                         )?;
                         while let Some(batch) = stream.next().await {
                             let batch = batch?;
-                            let num_rows = batch.num_rows();
                             if let Some(idx) = row_id_index {
-                                if let Some(ref ids) = selected_row_ids {
-                                    let batch_ids = &ids[row_id_offset..row_id_offset + num_rows];
-                                    row_id_offset += num_rows;
-                                    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(batch_ids.to_vec()));
-                                    yield insert_column_at(batch, array, idx, &output_schema)?;
-                                } else {
-                                    yield append_null_row_id_column(batch, idx, &output_schema)?;
-                                }
+                                yield attach_row_id(batch, idx, &selected_row_ids, &mut row_id_offset, &output_schema)?;
                             } else {
                                 yield batch;
                             }
@@ -1471,6 +1463,24 @@ fn expand_selected_row_ids(
 }
 
 /// Insert a column into a RecordBatch at the given position.
+fn attach_row_id(
+    batch: RecordBatch,
+    row_id_index: usize,
+    selected_row_ids: &Option<Vec<i64>>,
+    row_id_offset: &mut usize,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    if let Some(ref ids) = selected_row_ids {
+        let num_rows = batch.num_rows();
+        let batch_ids = &ids[*row_id_offset..*row_id_offset + num_rows];
+        *row_id_offset += num_rows;
+        let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(batch_ids.to_vec()));
+        insert_column_at(batch, array, row_id_index, output_schema)
+    } else {
+        append_null_row_id_column(batch, row_id_index, output_schema)
+    }
+}
+
 fn insert_column_at(
     batch: RecordBatch,
     column: Arc<dyn arrow_array::Array>,
@@ -1514,17 +1524,17 @@ fn build_row_ranges_selection(
         return vec![].into();
     }
 
+    let file_end_row_id = file_first_row_id.saturating_add(total_rows - 1);
     let mut local_ranges: Vec<(usize, usize)> = row_ranges
         .iter()
         .filter_map(|r| {
-            let local_start = (r.from() - file_first_row_id).max(0) as usize;
-            let clamped_to = r.to().min(file_first_row_id.saturating_add(total_rows - 1));
-            let local_end = (clamped_to + 1 - file_first_row_id) as usize;
-            if local_start < local_end {
-                Some((local_start, local_end))
-            } else {
-                None
+            if r.to() < file_first_row_id || r.from() > file_end_row_id {
+                return None;
             }
+            let local_start = (r.from() - file_first_row_id).max(0) as usize;
+            let clamped_to = r.to().min(file_end_row_id);
+            let local_end = (clamped_to + 1 - file_first_row_id) as usize;
+            Some((local_start, local_end))
         })
         .collect();
     local_ranges.sort_by_key(|&(s, _)| s);
