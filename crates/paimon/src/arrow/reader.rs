@@ -270,13 +270,15 @@ impl ArrowReader {
                             let batch = batch?;
                             let num_rows = batch.num_rows();
                             if let Some(idx) = row_id_index {
-                                let batch = append_row_id_column(batch, current_row_id, idx, &output_schema)?;
                                 if has_row_id {
+                                    let batch = append_row_id_column(batch, current_row_id, idx, &output_schema)?;
                                     let batch = filter_batch_by_row_id_ranges(&batch, idx, &row_ranges)?;
                                     if batch.num_rows() > 0 {
                                         yield batch;
                                     }
                                 } else {
+                                    // No first_row_id: fill _ROW_ID with nulls
+                                    let batch = append_null_row_id_column(batch, idx, &output_schema)?;
                                     yield batch;
                                 }
                             } else {
@@ -290,9 +292,9 @@ impl ArrowReader {
                         .data_files()
                         .iter()
                         .filter_map(|f| f.first_row_id)
-                        .min()
-                        .unwrap_or(0);
-                    let mut current_row_id = group_base_row_id;
+                        .min();
+                    let has_group_row_id = group_base_row_id.is_some();
+                    let mut current_row_id = group_base_row_id.unwrap_or(0);
 
                     // Multiple files need column-wise merge.
                     let mut merge_stream = merge_files_by_columns(
@@ -303,15 +305,20 @@ impl ArrowReader {
                         schema_manager.clone(),
                         table_schema_id,
                         batch_size,
-                        file_row_ranges.clone(),
+                        if has_group_row_id { file_row_ranges.clone() } else { None },
                     )?;
                     while let Some(batch) = merge_stream.next().await {
                         let batch = batch?;
                         let num_rows = batch.num_rows();
                         if let Some(idx) = row_id_index {
-                            let batch = append_row_id_column(batch, current_row_id, idx, &output_schema)?;
-                            let batch = filter_batch_by_row_id_ranges(&batch, idx, &row_ranges)?;
-                            if batch.num_rows() > 0 {
+                            if has_group_row_id {
+                                let batch = append_row_id_column(batch, current_row_id, idx, &output_schema)?;
+                                let batch = filter_batch_by_row_id_ranges(&batch, idx, &row_ranges)?;
+                                if batch.num_rows() > 0 {
+                                    yield batch;
+                                }
+                            } else {
+                                let batch = append_null_row_id_column(batch, idx, &output_schema)?;
                                 yield batch;
                             }
                         } else {
@@ -1472,6 +1479,34 @@ fn filter_batch_by_row_id_ranges(
         }
     })?;
     Ok(filtered)
+}
+
+/// Append a null `_ROW_ID` column for files without `first_row_id`.
+fn append_null_row_id_column(
+    batch: RecordBatch,
+    insert_index: usize,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+    let null_array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::new_null(num_rows));
+
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns() + 1);
+    let batch_cols: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
+
+    for (i, col) in batch_cols.iter().enumerate() {
+        if i == insert_index {
+            columns.push(null_array.clone());
+        }
+        columns.push(col.clone());
+    }
+    if insert_index >= batch.num_columns() {
+        columns.push(null_array);
+    }
+
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build RecordBatch with null _ROW_ID column: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 /// Append a computed `_ROW_ID` column at the given position. Each row's value is `base_row_id + offset`.
