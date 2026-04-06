@@ -33,6 +33,7 @@ arrow-array = { version = "57.0", features = ["ffi"] }
 arrow-schema = "57.0"
 arrow-cast = "57.0"
 arrow-ord = "57.0"
+arrow-select = "57.0"
 datafusion = "52.3.0"
 datafusion-ffi = "52.3.0"
 parquet = "57.0"

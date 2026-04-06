@@ -268,7 +268,12 @@ impl ArrowReader {
                             let num_rows = batch.num_rows();
                             if let Some(idx) = row_id_index {
                                 let batch = append_row_id_column(batch, current_row_id, idx, &output_schema)?;
-                                yield batch;
+                                // Post-read row_ranges filter: _ROW_ID disables Parquet-level
+                                // filtering, so filter here using the computed _ROW_ID values.
+                                let batch = filter_batch_by_row_id_ranges(&batch, idx, &row_ranges)?;
+                                if batch.num_rows() > 0 {
+                                    yield batch;
+                                }
                             } else {
                                 yield batch;
                             }
@@ -300,7 +305,10 @@ impl ArrowReader {
                         let num_rows = batch.num_rows();
                         if let Some(idx) = row_id_index {
                             let batch = append_row_id_column(batch, current_row_id, idx, &output_schema)?;
-                            yield batch;
+                            let batch = filter_batch_by_row_id_ranges(&batch, idx, &row_ranges)?;
+                            if batch.num_rows() > 0 {
+                                yield batch;
+                            }
                         } else {
                             yield batch;
                         }
@@ -1418,6 +1426,47 @@ fn exact_parquet_value<'a, T>(
     } else {
         max
     }
+}
+
+/// Filter a batch by row_ranges using the _ROW_ID column values.
+/// Keeps only rows whose _ROW_ID falls within any of the given ranges.
+fn filter_batch_by_row_id_ranges(
+    batch: &RecordBatch,
+    row_id_col_index: usize,
+    row_ranges: &Option<Vec<RowRange>>,
+) -> crate::Result<RecordBatch> {
+    let ranges = match row_ranges {
+        Some(r) => r,
+        None => return Ok(batch.clone()),
+    };
+
+    let row_id_array = batch
+        .column(row_id_col_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::UnexpectedError {
+            message: "_ROW_ID column is not Int64".to_string(),
+            source: None,
+        })?;
+
+    let mut mask = vec![false; batch.num_rows()];
+    for (i, &row_id) in row_id_array.values().iter().enumerate() {
+        if ranges
+            .iter()
+            .any(|r| row_id >= r.from() && row_id <= r.to())
+        {
+            mask[i] = true;
+        }
+    }
+
+    let filter = BooleanArray::from(mask);
+    let filtered = arrow_select::filter::filter_record_batch(batch, &filter).map_err(|e| {
+        Error::UnexpectedError {
+            message: format!("Failed to filter batch by _ROW_ID ranges: {e}"),
+            source: Some(Box::new(e)),
+        }
+    })?;
+    Ok(filtered)
 }
 
 /// Append a computed `_ROW_ID` column at the given position. Each row's value is `base_row_id + offset`.
