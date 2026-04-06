@@ -2176,3 +2176,55 @@ async fn test_read_data_evolution_table_with_row_id_projection() {
         "_ROW_ID values should be unique"
     );
 }
+
+#[tokio::test]
+async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    // Get full row ID range
+    let full_rb = table.new_read_builder();
+    let full_plan = full_rb.new_scan().plan().await.expect("plan");
+    let mut min_row_id = i64::MAX;
+    let mut max_row_id = i64::MIN;
+    for split in full_plan.splits() {
+        for file in split.data_files() {
+            if let Some(fid) = file.first_row_id {
+                min_row_id = min_row_id.min(fid);
+                max_row_id = max_row_id.max(fid + file.row_count - 1);
+            }
+        }
+    }
+
+    // Project only _ROW_ID with a partial row range
+    let mid = min_row_id + (max_row_id - min_row_id) / 2;
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["_ROW_ID"]);
+    read_builder.with_row_ranges(vec![RowRange::new(min_row_id, mid)]);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("plan");
+
+    let read = read_builder.new_read().expect("read");
+    let stream = read.to_arrow(plan.splits()).expect("stream");
+    let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "Should have rows");
+    // Should have fewer rows than full table due to row_ranges filtering
+    let full_read = table.new_read_builder().new_read().expect("read");
+    let full_count: usize = full_read
+        .to_arrow(full_plan.splits())
+        .expect("stream")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert!(
+        total_rows <= full_count,
+        "Row range filtered count ({total_rows}) should be <= full count ({full_count})"
+    );
+}

@@ -679,8 +679,12 @@ fn merge_files_by_columns(
         // column that no file contains yet), we still need to emit NULL-filled rows to
         // preserve the correct row count.
         if active_file_indices.is_empty() {
-            // All files in a merge group cover the same rows; use the first file's row_count.
-            let total_rows = data_files[0].row_count as usize;
+            let first_row_id = data_files[0].first_row_id.unwrap_or(0);
+            let file_row_count = data_files[0].row_count;
+            let total_rows = match &row_ranges {
+                Some(ranges) => expand_selected_row_ids(first_row_id, file_row_count, &Some(ranges.clone())).len(),
+                None => file_row_count as usize,
+            };
             let mut emitted = 0;
             while emitted < total_rows {
                 let rows_to_emit = (total_rows - emitted).min(output_batch_size);
