@@ -110,6 +110,10 @@ impl TableSchema {
     }
 }
 
+pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
+
+pub const ROW_ID_FIELD_ID: i32 = i32::MAX - 5;
+
 /// Data field for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataField.java#L40>
