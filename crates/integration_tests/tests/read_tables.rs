@@ -2000,3 +2000,231 @@ async fn test_bucket_predicate_filtering_long_string_key() {
         actual.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Data Evolution Row ID Range Filter integration tests
+// ---------------------------------------------------------------------------
+
+async fn scan_and_read_with_row_ranges(
+    table: &paimon::Table,
+    row_ranges: Vec<paimon::RowRange>,
+) -> (Plan, Vec<RecordBatch>) {
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_row_ranges(row_ranges);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<_> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    (plan, batches)
+}
+
+fn extract_id_name_value(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string(), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+    rows
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let (full_plan, full_batches) = scan_and_read(&catalog, "data_evolution_table", None).await;
+    let full_rows = extract_id_name_value(&full_batches);
+    let full_row_count: usize = full_batches.iter().map(|b| b.num_rows()).sum();
+    assert!(full_row_count > 0);
+
+    let mut min_row_id = i64::MAX;
+    let mut max_row_id_exclusive = i64::MIN;
+    for split in full_plan.splits() {
+        for file in split.data_files() {
+            if let Some(fid) = file.first_row_id {
+                min_row_id = min_row_id.min(fid);
+                max_row_id_exclusive = max_row_id_exclusive.max(fid + file.row_count);
+            }
+        }
+    }
+    assert!(min_row_id < max_row_id_exclusive);
+
+    let mid = min_row_id + (max_row_id_exclusive - min_row_id) / 2;
+    let (filtered_plan, filtered_batches) =
+        scan_and_read_with_row_ranges(&table, vec![RowRange::new(min_row_id, mid)]).await;
+
+    let filtered_row_count: usize = filtered_batches.iter().map(|b| b.num_rows()).sum();
+    let filtered_rows = extract_id_name_value(&filtered_batches);
+
+    assert!(
+        filtered_row_count < full_row_count || mid >= max_row_id_exclusive,
+        "filtered={filtered_row_count}, full={full_row_count}"
+    );
+    for row in &filtered_rows {
+        assert!(
+            full_rows.contains(row),
+            "Filtered row {row:?} not in full result"
+        );
+    }
+    assert!(filtered_plan.splits().len() <= full_plan.splits().len());
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_empty_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let (plan, batches) =
+        scan_and_read_with_row_ranges(&table, vec![RowRange::new(999_999, 1_000_000)]).await;
+
+    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(row_count, 0);
+    assert!(plan.splits().is_empty());
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_full_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let (_, full_batches) = scan_and_read(&catalog, "data_evolution_table", None).await;
+    let full_rows = extract_id_name_value(&full_batches);
+
+    let (_, filtered_batches) =
+        scan_and_read_with_row_ranges(&table, vec![RowRange::new(0, i64::MAX)]).await;
+    let filtered_rows = extract_id_name_value(&filtered_batches);
+
+    assert_eq!(filtered_rows, full_rows);
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_with_row_id_projection() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    // Project _ROW_ID along with regular columns
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["_ROW_ID", "id", "name"]);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "Should have rows");
+
+    // Verify _ROW_ID column exists and contains non-negative values
+    let mut row_ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let row_id_col = batch
+            .column_by_name("_ROW_ID")
+            .expect("_ROW_ID column should exist");
+        let row_id_array = row_id_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_ROW_ID should be Int64");
+        for i in 0..batch.num_rows() {
+            row_ids.push(row_id_array.value(i));
+        }
+    }
+
+    assert_eq!(row_ids.len(), total_rows);
+    assert!(
+        row_ids.iter().all(|&id| id >= 0),
+        "All _ROW_ID values should be non-negative"
+    );
+    // _ROW_ID values should be unique
+    let unique: std::collections::HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "_ROW_ID values should be unique"
+    );
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    // Get full row ID range
+    let full_rb = table.new_read_builder();
+    let full_plan = full_rb.new_scan().plan().await.expect("plan");
+    let mut min_row_id = i64::MAX;
+    let mut max_row_id = i64::MIN;
+    for split in full_plan.splits() {
+        for file in split.data_files() {
+            if let Some(fid) = file.first_row_id {
+                min_row_id = min_row_id.min(fid);
+                max_row_id = max_row_id.max(fid + file.row_count - 1);
+            }
+        }
+    }
+
+    // Project only _ROW_ID with a partial row range
+    let mid = min_row_id + (max_row_id - min_row_id) / 2;
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["_ROW_ID"]);
+    read_builder.with_row_ranges(vec![RowRange::new(min_row_id, mid)]);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("plan");
+
+    let read = read_builder.new_read().expect("read");
+    let stream = read.to_arrow(plan.splits()).expect("stream");
+    let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "Should have rows");
+    // Should have fewer rows than full table due to row_ranges filtering
+    let full_read = table.new_read_builder().new_read().expect("read");
+    let full_count: usize = full_read
+        .to_arrow(full_plan.splits())
+        .expect("stream")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect")
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert!(
+        total_rows <= full_count,
+        "Row range filtered count ({total_rows}) should be <= full count ({full_count})"
+    );
+}

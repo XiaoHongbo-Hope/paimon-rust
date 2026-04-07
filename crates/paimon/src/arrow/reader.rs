@@ -22,9 +22,12 @@ use crate::arrow::filtering::{
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::{FileIO, FileRead, FileStatus};
-use crate::spec::{DataField, DataFileMeta, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{
+    DataField, DataFileMeta, DataType, Datum, Predicate, PredicateOperator, ROW_ID_FIELD_NAME,
+};
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
+use crate::table::RowRange;
 use crate::{DataSplit, Error};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
@@ -183,6 +186,7 @@ impl ArrowReader {
                             predicates: predicates.clone(),
                             batch_size,
                             dv,
+                            row_ranges: None,
                         },
                     )?;
                     while let Some(batch) = stream.next().await {
@@ -215,8 +219,18 @@ impl ArrowReader {
         let schema_manager = self.schema_manager;
         let table_schema_id = self.table_schema_id;
 
+        let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
+        let file_read_type: Vec<DataField> = read_type
+            .iter()
+            .filter(|f| f.name() != ROW_ID_FIELD_NAME)
+            .cloned()
+            .collect();
+        let output_schema = build_target_arrow_schema(&read_type)?;
+
         Ok(try_stream! {
             for split in splits {
+                let row_ranges = split.row_ranges().map(|r| r.to_vec());
+
                 if split.raw_convertible() || split.data_files().len() == 1 {
                     for file_meta in split.data_files().to_vec() {
                         let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != table_schema_id {
@@ -226,36 +240,121 @@ impl ArrowReader {
                             None
                         };
 
+                        let has_row_id = file_meta.first_row_id.is_some();
+                        let effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+
+                        let selected_row_ids = if row_id_index.is_some() && has_row_id {
+                            effective_row_ranges.as_ref().map(|ranges| {
+                                expand_selected_row_ids(
+                                    file_meta.first_row_id.unwrap(),
+                                    file_meta.row_count,
+                                    ranges,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        let file_base_row_id = file_meta.first_row_id.unwrap_or(0);
+                        let mut row_id_cursor = file_base_row_id;
+                        let mut row_id_offset: usize = 0;
+
                         let mut stream = read_single_file_stream(
                             file_io.clone(),
                             SingleFileReadRequest {
                                 split: split.clone(),
                                 file_meta,
-                                read_type: read_type.clone(),
+                                read_type: file_read_type.clone(),
                                 table_fields: table_fields.clone(),
                                 data_fields,
                                 predicates: Vec::new(),
                                 batch_size,
                                 dv: None,
+                                row_ranges: effective_row_ranges,
                             },
                         )?;
                         while let Some(batch) = stream.next().await {
-                            yield batch?;
+                            let batch = batch?;
+                            let num_rows = batch.num_rows();
+                            if let Some(idx) = row_id_index {
+                                if !has_row_id {
+                                    yield append_null_row_id_column(batch, idx, &output_schema)?;
+                                } else if let Some(ref ids) = selected_row_ids {
+                                    yield attach_row_id(batch, idx, ids, &mut row_id_offset, &output_schema)?;
+                                } else {
+                                    let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
+                                    row_id_cursor += num_rows as i64;
+                                    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
+                                    yield insert_column_at(batch, array, idx, &output_schema)?;
+                                }
+                            } else {
+                                yield batch;
+                            }
                         }
                     }
                 } else {
-                    // Multiple files need column-wise merge.
+                    let files = split.data_files();
+                    assert!(
+                        files.iter().all(|f| f.first_row_id.is_some()),
+                        "All files in a field merge split should have first_row_id"
+                    );
+                    assert!(
+                        files.iter().all(|f| f.row_count == files[0].row_count),
+                        "All files in a field merge split should have the same row count"
+                    );
+                    assert!(
+                        files.iter().all(|f| f.first_row_id == files[0].first_row_id),
+                        "All files in a field merge split should have the same first row id"
+                    );
+
+                    let group_base_row_id = files
+                        .iter()
+                        .filter_map(|f| f.first_row_id)
+                        .min();
+                    let has_group_row_id = group_base_row_id.is_some();
+                    let group_row_count = files.iter().map(|f| f.row_count).max().unwrap_or(0);
+                    let effective_row_ranges = if has_group_row_id { row_ranges.clone() } else { None };
+
+                    let selected_row_ids = if row_id_index.is_some() && has_group_row_id {
+                        effective_row_ranges.as_ref().map(|ranges| {
+                            expand_selected_row_ids(
+                                group_base_row_id.unwrap(),
+                                group_row_count,
+                                ranges,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    let mut row_id_cursor = group_base_row_id.unwrap_or(0);
+                    let mut row_id_offset: usize = 0;
+
                     let mut merge_stream = merge_files_by_columns(
                         &file_io,
                         &split,
-                        &read_type,
+                        &file_read_type,
                         &table_fields,
                         schema_manager.clone(),
                         table_schema_id,
                         batch_size,
+                        effective_row_ranges,
                     )?;
                     while let Some(batch) = merge_stream.next().await {
-                        yield batch?;
+                        let batch = batch?;
+                        let num_rows = batch.num_rows();
+                        if let Some(idx) = row_id_index {
+                            if !has_group_row_id {
+                                yield append_null_row_id_column(batch, idx, &output_schema)?;
+                            } else if let Some(ref ids) = selected_row_ids {
+                                yield attach_row_id(batch, idx, ids, &mut row_id_offset, &output_schema)?;
+                            } else {
+                                let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
+                                row_id_cursor += num_rows as i64;
+                                let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
+                                yield insert_column_at(batch, array, idx, &output_schema)?;
+                            }
+                        } else {
+                            yield batch;
+                        }
                     }
                 }
             }
@@ -273,6 +372,7 @@ struct SingleFileReadRequest {
     predicates: Vec<Predicate>,
     batch_size: Option<usize>,
     dv: Option<Arc<DeletionVector>>,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 /// Read a single parquet file from a split, returning a lazy stream of batches.
@@ -298,6 +398,7 @@ fn read_single_file_stream(
         predicates,
         batch_size,
         dv,
+        row_ranges,
     } = request;
 
     let target_schema = build_target_arrow_schema(&read_type)?;
@@ -392,6 +493,17 @@ fn read_single_file_stream(
                     Some(delete_row_selection),
                 );
             }
+        }
+        if let Some(ref ranges) = row_ranges {
+            let range_selection = build_row_ranges_selection(
+                batch_stream_builder.metadata().row_groups(),
+                ranges,
+                file_meta.first_row_id.unwrap_or(0),
+            );
+            row_selection = intersect_optional_row_selections(
+                row_selection,
+                Some(range_selection),
+            );
         }
         if let Some(row_selection) = row_selection {
             batch_stream_builder = batch_stream_builder.with_row_selection(row_selection);
@@ -494,6 +606,7 @@ fn read_single_file_stream(
 /// per file. Each poll slices up to `batch_size` rows from each file's current batch,
 /// assembles columns from the winning files, and yields the merged batch. When a file's
 /// current batch is exhausted, the next batch is read from its stream on demand.
+#[allow(clippy::too_many_arguments)]
 fn merge_files_by_columns(
     file_io: &FileIO,
     split: &DataSplit,
@@ -502,6 +615,7 @@ fn merge_files_by_columns(
     schema_manager: SchemaManager,
     table_schema_id: i64,
     batch_size: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let data_files = split.data_files();
     if data_files.is_empty() {
@@ -596,8 +710,12 @@ fn merge_files_by_columns(
         // column that no file contains yet), we still need to emit NULL-filled rows to
         // preserve the correct row count.
         if active_file_indices.is_empty() {
-            // All files in a merge group cover the same rows; use the first file's row_count.
-            let total_rows = data_files[0].row_count as usize;
+            let first_row_id = data_files[0].first_row_id.unwrap_or(0);
+            let file_row_count = data_files[0].row_count;
+            let total_rows = match &row_ranges {
+                Some(ranges) => expand_selected_row_ids(first_row_id, file_row_count, ranges).len(),
+                None => file_row_count as usize,
+            };
             let mut emitted = 0;
             while emitted < total_rows {
                 let rows_to_emit = (total_rows - emitted).min(output_batch_size);
@@ -647,6 +765,7 @@ fn merge_files_by_columns(
                     predicates: Vec::new(),
                     batch_size,
                     dv: None,
+                    row_ranges: row_ranges.clone(),
                 },
             )?;
             file_streams.insert(file_idx, stream);
@@ -1353,6 +1472,114 @@ fn exact_parquet_value<'a, T>(
     } else {
         max
     }
+}
+
+/// Expand row_ranges into a flat sequence of selected row IDs for a file.
+fn expand_selected_row_ids(first_row_id: i64, row_count: i64, row_ranges: &[RowRange]) -> Vec<i64> {
+    if row_count == 0 {
+        return Vec::new();
+    }
+    let file_end = first_row_id + row_count - 1;
+    let mut ids = Vec::new();
+    for r in row_ranges {
+        let from = r.from().max(first_row_id);
+        let to = r.to().min(file_end);
+        for id in from..=to {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn attach_row_id(
+    batch: RecordBatch,
+    row_id_index: usize,
+    selected_row_ids: &[i64],
+    row_id_offset: &mut usize,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+    let batch_ids = &selected_row_ids[*row_id_offset..*row_id_offset + num_rows];
+    *row_id_offset += num_rows;
+    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(batch_ids.to_vec()));
+    insert_column_at(batch, array, row_id_index, output_schema)
+}
+
+fn insert_column_at(
+    batch: RecordBatch,
+    column: Arc<dyn arrow_array::Array>,
+    insert_index: usize,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns() + 1);
+    for (i, col) in batch.columns().iter().enumerate() {
+        if i == insert_index {
+            columns.push(column.clone());
+        }
+        columns.push(col.clone());
+    }
+    if insert_index >= batch.num_columns() {
+        columns.push(column);
+    }
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to insert column into RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })
+}
+
+/// Append a null `_ROW_ID` column for files without `first_row_id`.
+fn append_null_row_id_column(
+    batch: RecordBatch,
+    insert_index: usize,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::new_null(batch.num_rows()));
+    insert_column_at(batch, array, insert_index, output_schema)
+}
+
+/// Build a Parquet [RowSelection] from inclusive `[from, to]` row ranges.
+fn build_row_ranges_selection(
+    row_group_metadata_list: &[RowGroupMetaData],
+    row_ranges: &[RowRange],
+    file_first_row_id: i64,
+) -> RowSelection {
+    let total_rows: i64 = row_group_metadata_list.iter().map(|rg| rg.num_rows()).sum();
+    if total_rows == 0 {
+        return vec![].into();
+    }
+
+    let file_end_row_id = file_first_row_id.saturating_add(total_rows - 1);
+    let mut local_ranges: Vec<(usize, usize)> = row_ranges
+        .iter()
+        .filter_map(|r| {
+            if r.to() < file_first_row_id || r.from() > file_end_row_id {
+                return None;
+            }
+            let local_start = (r.from() - file_first_row_id).max(0) as usize;
+            let clamped_to = r.to().min(file_end_row_id);
+            let local_end = (clamped_to + 1 - file_first_row_id) as usize;
+            Some((local_start, local_end))
+        })
+        .collect();
+    local_ranges.sort_by_key(|&(s, _)| s);
+
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut cursor: usize = 0;
+    for (start, end) in &local_ranges {
+        if *start > cursor {
+            selectors.push(RowSelector::skip(*start - cursor));
+        }
+        let select_start = (*start).max(cursor);
+        if *end > select_start {
+            selectors.push(RowSelector::select(*end - select_start));
+        }
+        cursor = cursor.max(*end);
+    }
+    let total = total_rows as usize;
+    if cursor < total {
+        selectors.push(RowSelector::skip(total - cursor));
+    }
+    selectors.into()
 }
 
 /// Builds a Parquet [RowSelection] from deletion vector.

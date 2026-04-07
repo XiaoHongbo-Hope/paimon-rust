@@ -25,6 +25,7 @@ use super::{ArrowRecordBatchStream, Table, TableScan};
 use crate::arrow::filtering::reader_pruning_predicates;
 use crate::arrow::ArrowReaderBuilder;
 use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::table::source::RowRange;
 use crate::Result;
 use crate::{DataSplit, Error};
 use std::collections::{HashMap, HashSet};
@@ -105,6 +106,7 @@ pub struct ReadBuilder<'a> {
     projected_fields: Option<Vec<String>>,
     filter: NormalizedFilter,
     limit: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -114,6 +116,7 @@ impl<'a> ReadBuilder<'a> {
             projected_fields: None,
             filter: NormalizedFilter::default(),
             limit: None,
+            row_ranges: None,
         }
     }
 
@@ -145,6 +148,16 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
+        self.row_ranges = if ranges.is_empty() {
+            None
+        } else {
+            Some(ranges)
+        };
+        self
+    }
+
     /// Push a row-limit hint down to scan planning.
     ///
     /// This allows the scan to generate fewer splits when possible. The hint is
@@ -166,6 +179,7 @@ impl<'a> ReadBuilder<'a> {
             self.filter.data_predicates.clone(),
             self.filter.bucket_predicate.clone(),
             self.limit,
+            self.row_ranges.clone(),
         )
     }
 
@@ -205,6 +219,15 @@ impl<'a> ReadBuilder<'a> {
                 return Err(Error::ConfigInvalid {
                     message: format!("Duplicate projection column '{name}' for table {full_name}"),
                 });
+            }
+
+            if name == crate::spec::ROW_ID_FIELD_NAME {
+                resolved.push(DataField::new(
+                    crate::spec::ROW_ID_FIELD_ID,
+                    crate::spec::ROW_ID_FIELD_NAME.to_string(),
+                    crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
+                ));
+                continue;
             }
 
             let field = field_map

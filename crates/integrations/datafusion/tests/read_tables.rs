@@ -599,3 +599,77 @@ async fn test_read_complex_type_table_via_datafusion() {
     assert_eq!(rows[2].2, "{}");
     assert_eq!(rows[2].3, "{name: carol, value: 300}");
 }
+
+#[tokio::test]
+async fn test_select_row_id_from_data_evolution_table() {
+    use datafusion::arrow::array::Int64Array;
+
+    let ctx = create_context("data_evolution_table").await;
+
+    let batches = ctx
+        .sql(r#"SELECT "_ROW_ID", id, name FROM data_evolution_table"#)
+        .await
+        .expect("SQL should parse")
+        .collect()
+        .await
+        .expect("query should execute");
+
+    assert!(!batches.is_empty());
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0);
+
+    for batch in &batches {
+        let row_id_col = batch
+            .column_by_name("_ROW_ID")
+            .expect("_ROW_ID column should exist");
+        let row_id_array = row_id_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_ROW_ID should be Int64");
+        for i in 0..batch.num_rows() {
+            assert!(
+                row_id_array.is_valid(i),
+                "_ROW_ID should not be null for data evolution table"
+            );
+            assert!(row_id_array.value(i) >= 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_filter_row_id_from_data_evolution_table() {
+    use datafusion::arrow::array::Int64Array;
+
+    let ctx = create_context("data_evolution_table").await;
+
+    let all_batches = ctx
+        .sql(r#"SELECT "_ROW_ID" FROM data_evolution_table"#)
+        .await
+        .expect("SQL")
+        .collect()
+        .await
+        .expect("collect");
+    let all_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+
+    let filtered_batches = ctx
+        .sql(r#"SELECT "_ROW_ID", id FROM data_evolution_table WHERE "_ROW_ID" = 0"#)
+        .await
+        .expect("SQL")
+        .collect()
+        .await
+        .expect("collect");
+    let filtered_count: usize = filtered_batches.iter().map(|b| b.num_rows()).sum();
+
+    assert!(filtered_count <= all_count);
+    for batch in &filtered_batches {
+        let row_id_array = batch
+            .column_by_name("_ROW_ID")
+            .expect("_ROW_ID")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64");
+        for i in 0..batch.num_rows() {
+            assert_eq!(row_id_array.value(i), 0);
+        }
+    }
+}

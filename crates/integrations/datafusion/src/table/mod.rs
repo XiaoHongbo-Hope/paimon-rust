@@ -54,9 +54,17 @@ impl PaimonTableProvider {
     ///
     /// Loads the table schema and converts it to Arrow for DataFusion.
     pub fn try_new(table: Table) -> DFResult<Self> {
-        let fields = table.schema().fields();
+        let mut fields = table.schema().fields().to_vec();
+        let core_options = paimon::spec::CoreOptions::new(table.schema().options());
+        if core_options.data_evolution_enabled() {
+            fields.push(paimon::spec::DataField::new(
+                paimon::spec::ROW_ID_FIELD_ID,
+                paimon::spec::ROW_ID_FIELD_NAME.to_string(),
+                paimon::spec::DataType::BigInt(paimon::spec::BigIntType::with_nullable(true)),
+            ));
+        }
         let schema =
-            paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
+            paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
         Ok(Self { table, schema })
     }
 
@@ -95,7 +103,6 @@ impl TableProvider for PaimonTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Convert projection indices to column names and compute projected schema
         let (projected_schema, projected_columns) = if let Some(indices) = projection {
             let fields: Vec<Field> = indices
                 .iter()
@@ -104,7 +111,13 @@ impl TableProvider for PaimonTableProvider {
             let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
             (Arc::new(Schema::new(fields)), Some(column_names))
         } else {
-            (self.schema.clone(), None)
+            let column_names: Vec<String> = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            (self.schema.clone(), Some(column_names))
         };
 
         // Plan splits eagerly so we know partition count upfront.

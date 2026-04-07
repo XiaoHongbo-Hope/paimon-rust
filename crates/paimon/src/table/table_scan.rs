@@ -34,7 +34,10 @@ use crate::spec::{
     ManifestEntry, ManifestFileMeta, PartitionComputer, Predicate, Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
-use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
+use crate::table::source::{
+    any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
+    DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
+};
 use crate::table::SnapshotManager;
 use crate::table::TagManager;
 use crate::Error;
@@ -304,6 +307,7 @@ pub struct TableScan<'a> {
     /// Optional limit on the number of rows to return.
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl<'a> TableScan<'a> {
@@ -313,6 +317,7 @@ impl<'a> TableScan<'a> {
         data_predicates: Vec<Predicate>,
         bucket_predicate: Option<Predicate>,
         limit: Option<usize>,
+        row_ranges: Option<Vec<RowRange>>,
     ) -> Self {
         Self {
             table,
@@ -320,6 +325,7 @@ impl<'a> TableScan<'a> {
             data_predicates,
             bucket_predicate,
             limit,
+            row_ranges,
         }
     }
 
@@ -621,6 +627,16 @@ impl<'a> TableScan<'a> {
                         .collect()
                 };
 
+                // Filter groups by row ID ranges.
+                let row_id_groups = if let Some(ref ranges) = self.row_ranges {
+                    row_id_groups
+                        .into_iter()
+                        .filter(|group| group.iter().any(|f| any_range_overlaps_file(ranges, f)))
+                        .collect()
+                } else {
+                    row_id_groups
+                };
+
                 let (singles, multis): (Vec<_>, Vec<_>) = row_id_groups
                     .into_iter()
                     .partition(|group| group.len() == 1);
@@ -651,6 +667,22 @@ impl<'a> TableScan<'a> {
                         .collect::<Vec<Option<DeletionFile>>>()
                 });
 
+                // Compute row_ranges before moving file_group to avoid clone
+                let split_row_ranges = if let Some(ref ranges) = self.row_ranges {
+                    let mut split_ranges = Vec::new();
+                    for file in &file_group {
+                        split_ranges.extend(intersect_ranges_with_file(ranges, file));
+                    }
+                    let split_ranges = merge_row_ranges(split_ranges);
+                    if split_ranges.is_empty() {
+                        None
+                    } else {
+                        Some(split_ranges)
+                    }
+                } else {
+                    None
+                };
+
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
                     .with_partition(partition_row.clone())
@@ -662,14 +694,16 @@ impl<'a> TableScan<'a> {
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);
                 }
+                if let Some(row_ranges) = split_row_ranges {
+                    builder = builder.with_row_ranges(row_ranges);
+                }
                 splits.push(builder.build()?);
             }
         }
 
-        // Apply limit pushdown only when there are no data predicates.
-        // With data predicates, merged_row_count() reflects pre-filter row counts,
-        // so stopping early could return fewer rows than the limit after filtering.
-        let splits = if self.data_predicates.is_empty() {
+        // With data predicates or row_ranges, merged_row_count() reflects pre-filter
+        // row counts, so stopping early could return fewer rows than the limit.
+        let splits = if self.data_predicates.is_empty() && self.row_ranges.is_none() {
             self.apply_limit_pushdown(splits)
         } else {
             splits
