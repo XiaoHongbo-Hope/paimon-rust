@@ -272,6 +272,11 @@ impl<'a> TableRead<'a> {
         &self.read_type
     }
 
+    /// Data predicates for read-side pruning.
+    pub fn data_predicates(&self) -> &[Predicate] {
+        &self.data_predicates
+    }
+
     /// Table for this read.
     pub fn table(&self) -> &Table {
         self.table

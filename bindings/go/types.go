@@ -120,6 +120,34 @@ var (
 		}[0],
 	}
 
+	// paimon_result_predicate { predicate: *paimon_predicate, error: *paimon_error }
+	typeResultPredicate = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	// paimon_datum { tag: i32, int_val: i64, double_val: f64, str_data: *u8, str_len: usize,
+	//                int_val2: i64, uint_val: u32, uint_val2: u32 }
+	typePaimonDatum = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypeSint32,  // tag
+			&ffi.TypeSint32,  // padding
+			&ffi.TypeSint64,  // int_val
+			&ffi.TypeDouble,  // double_val
+			&ffi.TypePointer, // str_data
+			&ffi.TypePointer, // str_len (usize)
+			&ffi.TypeSint64,  // int_val2
+			&ffi.TypeUint32,  // uint_val
+			&ffi.TypeUint32,  // uint_val2
+			nil,
+		}[0],
+	}
+
 	// paimon_result_next_batch { batch: paimon_arrow_batch, error: *paimon_error }
 	typeResultNextBatch = ffi.Type{
 		Type: ffi.Struct,
@@ -153,6 +181,7 @@ type paimonTableScan struct{}
 type paimonTableRead struct{}
 type paimonPlan struct{}
 type paimonRecordBatchReader struct{}
+type paimonPredicate struct{}
 
 // Result types matching the C repr structs
 type resultCatalogNew struct {
@@ -193,6 +222,24 @@ type resultPlan struct {
 type resultRecordBatchReader struct {
 	reader *paimonRecordBatchReader
 	error  *paimonError
+}
+
+type resultPredicate struct {
+	predicate *paimonPredicate
+	error     *paimonError
+}
+
+// paimonDatumC mirrors the C paimon_datum struct.
+type paimonDatumC struct {
+	tag      int32
+	_pad0    [4]byte // padding for alignment
+	intVal   int64
+	dblVal   float64
+	strData  *byte
+	strLen   uintptr
+	intVal2  int64
+	uintVal  uint32
+	uintVal2 uint32
 }
 
 // arrowBatch holds a single Arrow record batch via the Arrow C Data Interface.

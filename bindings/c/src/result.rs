@@ -67,6 +67,12 @@ pub struct paimon_result_record_batch_reader {
 }
 
 #[repr(C)]
+pub struct paimon_result_predicate {
+    pub predicate: *mut paimon_predicate,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_next_batch {
     pub batch: paimon_arrow_batch,
     pub error: *mut paimon_error,

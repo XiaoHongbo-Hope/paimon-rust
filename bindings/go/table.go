@@ -44,6 +44,11 @@ func (t *Table) Close() {
 	})
 }
 
+// PredicateBuilder returns a builder for creating filter predicates on this table.
+func (t *Table) PredicateBuilder() *PredicateBuilder {
+	return &PredicateBuilder{table: t}
+}
+
 // NewReadBuilder creates a ReadBuilder for this table.
 func (t *Table) NewReadBuilder() (*ReadBuilder, error) {
 	if t.inner == nil {

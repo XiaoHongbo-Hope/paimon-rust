@@ -56,6 +56,47 @@ func (rb *ReadBuilder) WithProjection(columns []string) error {
 	return projFn(rb.inner, columns)
 }
 
+// WithFilter sets a filter predicate for scan planning and read-side pruning.
+//
+// The predicate is used in two phases:
+//   - Scan planning: prunes partitions, buckets, and data files based on
+//     file-level statistics (min/max). This is conservative — files whose
+//     statistics are inconclusive are kept.
+//   - Read-side: applies row-level filtering via Parquet native row filters
+//     for supported leaf predicates (Eq, NotEq, Lt, Le, Gt, Ge, IsNull,
+//     IsNotNull, In, NotIn).
+//
+// Row-level filtering is exact for most common types (Bool, Int, Long, Float,
+// Double, String, Date, Decimal, Binary). However, the following cases are NOT
+// filtered at the row level and may return non-matching rows:
+//   - Compound predicates (And/Or/Not) — not yet implemented for row-level filtering.
+//   - Time, Timestamp, and LocalZonedTimestamp columns (not yet implemented).
+//   - Schema-evolution: the predicate column does not exist in older data files.
+//   - Data-evolution mode (data-evolution.enabled = true).
+//
+// In these cases callers should apply residual filtering on the returned records.
+//
+// The predicate is consumed (ownership transferred to the read builder);
+// the caller must NOT close it after this call.
+// Passing nil is a no-op.
+func (rb *ReadBuilder) WithFilter(p *Predicate) error {
+	if rb.inner == nil {
+		return ErrClosed
+	}
+	if p == nil {
+		return nil
+	}
+	if p.inner == nil {
+		return errConsumedPredicate
+	}
+	filterFn := ffiReadBuilderWithFilter.symbol(rb.ctx)
+	err := filterFn(rb.inner, p.inner)
+	// Ownership transferred; prevent double-free.
+	p.inner = nil
+	p.lib.release()
+	return err
+}
+
 // NewScan creates a TableScan for planning which data files to read.
 func (rb *ReadBuilder) NewScan() (*TableScan, error) {
 	if rb.inner == nil {
@@ -129,6 +170,25 @@ var ffiReadBuilderWithProjection = newFFI(ffiOpts{
 		// Ensure Go-managed buffers stay alive for the full native call.
 		runtime.KeepAlive(cStrings)
 		runtime.KeepAlive(colPtrs)
+		if errPtr != nil {
+			return parseError(ctx, errPtr)
+		}
+		return nil
+	}
+})
+
+var ffiReadBuilderWithFilter = newFFI(ffiOpts{
+	sym:    "paimon_read_builder_with_filter",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(rb *paimonReadBuilder, p *paimonPredicate) error {
+	return func(rb *paimonReadBuilder, p *paimonPredicate) error {
+		var errPtr *paimonError
+		ffiCall(
+			unsafe.Pointer(&errPtr),
+			unsafe.Pointer(&rb),
+			unsafe.Pointer(&p),
+		)
 		if errPtr != nil {
 			return parseError(ctx, errPtr)
 		}

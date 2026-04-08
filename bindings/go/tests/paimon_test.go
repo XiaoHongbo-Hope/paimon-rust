@@ -30,41 +30,14 @@ import (
 	paimon "github.com/apache/paimon-rust/bindings/go"
 )
 
-// TestReadLogTable reads the test table and verifies the data matches expected values.
-//
-// The table was populated by Docker provisioning with:
-//
-//	(1, 'alice'), (2, 'bob'), (3, 'carol')
-func TestReadLogTable(t *testing.T) {
-	warehouse := os.Getenv("PAIMON_TEST_WAREHOUSE")
-	if warehouse == "" {
-		warehouse = "/tmp/paimon-warehouse"
-	}
+type row struct {
+	id   int32
+	name string
+}
 
-	if _, err := os.Stat(warehouse); os.IsNotExist(err) {
-		t.Skipf("Skipping: warehouse %s does not exist (run 'make docker-up' first)", warehouse)
-	}
-
-	// Use NewCatalog with options
-	catalog, err := paimon.NewCatalog(map[string]string{
-		"warehouse": warehouse,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create catalog: %v", err)
-	}
-	defer catalog.Close()
-
-	table, err := catalog.GetTable(paimon.NewIdentifier("default", "simple_log_table"))
-	if err != nil {
-		t.Fatalf("Failed to get table: %v", err)
-	}
-	defer table.Close()
-
-	rb, err := table.NewReadBuilder()
-	if err != nil {
-		t.Fatalf("Failed to create read builder: %v", err)
-	}
-	defer rb.Close()
+// readRows scans and reads all (id, name) rows from a ReadBuilder.
+func readRows(t *testing.T, rb *paimon.ReadBuilder) []row {
+	t.Helper()
 
 	scan, err := rb.NewScan()
 	if err != nil {
@@ -80,7 +53,7 @@ func TestReadLogTable(t *testing.T) {
 
 	splits := plan.Splits()
 	if len(splits) == 0 {
-		t.Fatal("Expected at least one split")
+		return nil
 	}
 
 	read, err := rb.NewRead()
@@ -95,13 +68,6 @@ func TestReadLogTable(t *testing.T) {
 	}
 	defer reader.Close()
 
-	// Import Arrow batches via C Data Interface and collect rows.
-	// Strings are copied before Release because arrow-go's String.Value()
-	// returns zero-copy references into the Arrow buffer.
-	type row struct {
-		id   int32
-		name string
-	}
 	var rows []row
 	batchIdx := 0
 	for {
@@ -132,58 +98,47 @@ func TestReadLogTable(t *testing.T) {
 		record.Release()
 		batchIdx++
 	}
-
-	if len(rows) == 0 {
-		t.Fatal("Expected at least one row, got 0")
-	}
-
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].id < rows[j].id
-	})
-
-	expected := []row{
-		{1, "alice"},
-		{2, "bob"},
-		{3, "carol"},
-	}
-
-	if len(rows) != len(expected) {
-		t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
-	}
-
-	for i, exp := range expected {
-		if rows[i] != exp {
-			t.Errorf("Row %d: expected %v, got %v", i, exp, rows[i])
-		}
-	}
+	return rows
 }
 
-// TestReadWithProjection reads only the "id" column via WithProjection and
-// verifies that only the projected column is returned with correct values.
-func TestReadWithProjection(t *testing.T) {
+// openTestTable creates a catalog, opens the simple_log_table, and returns
+// the table along with a cleanup function. Skips the test if the warehouse
+// does not exist.
+func openTestTable(t *testing.T) *paimon.Table {
+	t.Helper()
+
 	warehouse := os.Getenv("PAIMON_TEST_WAREHOUSE")
 	if warehouse == "" {
 		warehouse = "/tmp/paimon-warehouse"
 	}
-
 	if _, err := os.Stat(warehouse); os.IsNotExist(err) {
 		t.Skipf("Skipping: warehouse %s does not exist (run 'make docker-up' first)", warehouse)
 	}
 
-	// Use NewCatalog with options
 	catalog, err := paimon.NewCatalog(map[string]string{
 		"warehouse": warehouse,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create catalog: %v", err)
 	}
-	defer catalog.Close()
+	t.Cleanup(func() { catalog.Close() })
 
 	table, err := catalog.GetTable(paimon.NewIdentifier("default", "simple_log_table"))
 	if err != nil {
 		t.Fatalf("Failed to get table: %v", err)
 	}
-	defer table.Close()
+	t.Cleanup(func() { table.Close() })
+
+	return table
+}
+
+// TestReadLogTable reads the test table and verifies the data matches expected values.
+//
+// The table was populated by Docker provisioning with:
+//
+//	(1, 'alice'), (2, 'bob'), (3, 'carol')
+func TestReadLogTable(t *testing.T) {
+	table := openTestTable(t)
 
 	rb, err := table.NewReadBuilder()
 	if err != nil {
@@ -191,7 +146,89 @@ func TestReadWithProjection(t *testing.T) {
 	}
 	defer rb.Close()
 
-	// Set projection to only read "id" column
+	rows := readRows(t, rb)
+	if len(rows) == 0 {
+		t.Fatal("Expected at least one row, got 0")
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+
+	expected := []row{{1, "alice"}, {2, "bob"}, {3, "carol"}}
+	if len(rows) != len(expected) {
+		t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
+	}
+	for i, exp := range expected {
+		if rows[i] != exp {
+			t.Errorf("Row %d: expected %v, got %v", i, exp, rows[i])
+		}
+	}
+}
+
+// TestReadWithFilter exercises filter push-down through several sub-tests.
+func TestReadWithFilter(t *testing.T) {
+	table := openTestTable(t)
+
+	t.Run("EqualById", func(t *testing.T) {
+		rb, err := table.NewReadBuilder()
+		if err != nil {
+			t.Fatalf("Failed to create read builder: %v", err)
+		}
+		defer rb.Close()
+
+		// id = 1
+		pb := table.PredicateBuilder()
+		pred, err := pb.Eq("id", 1)
+		if err != nil {
+			t.Fatalf("Failed to create predicate: %v", err)
+		}
+		if err := rb.WithFilter(pred); err != nil {
+			t.Fatalf("Failed to set filter: %v", err)
+		}
+
+		rows := readRows(t, rb)
+		expected := []row{{1, "alice"}}
+		if len(rows) != len(expected) {
+			t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
+		}
+		if rows[0] != expected[0] {
+			t.Errorf("Expected %v, got %v", expected[0], rows[0])
+		}
+	})
+
+	t.Run("EmptyStringEqual", func(t *testing.T) {
+		rb, err := table.NewReadBuilder()
+		if err != nil {
+			t.Fatalf("Failed to create read builder: %v", err)
+		}
+		defer rb.Close()
+
+		pb := table.PredicateBuilder()
+		pred, err := pb.Eq("name", "")
+		if err != nil {
+			t.Fatalf("Eq with empty string failed: %v", err)
+		}
+		if err := rb.WithFilter(pred); err != nil {
+			t.Fatalf("WithFilter failed: %v", err)
+		}
+
+		rows := readRows(t, rb)
+		if len(rows) != 0 {
+			t.Fatalf("Expected 0 rows for empty string filter, got %d: %v", len(rows), rows)
+		}
+	})
+}
+
+// TestReadWithProjection reads only the "id" column via WithProjection and
+// verifies that only the projected column is returned with correct values.
+func TestReadWithProjection(t *testing.T) {
+	table := openTestTable(t)
+
+	rb, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rb.Close()
+
 	if err := rb.WithProjection([]string{"id"}); err != nil {
 		t.Fatalf("Failed to set projection: %v", err)
 	}
@@ -236,7 +273,6 @@ func TestReadWithProjection(t *testing.T) {
 			t.Fatalf("Batch %d: failed to read next record: %v", batchIdx, err)
 		}
 
-		// Verify schema only contains the projected column
 		schema := record.Schema()
 		if schema.NumFields() != 1 {
 			record.Release()

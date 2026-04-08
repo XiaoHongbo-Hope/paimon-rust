@@ -17,7 +17,7 @@
 
 use std::ffi::c_void;
 
-use paimon::spec::DataField;
+use paimon::spec::{DataField, Predicate};
 use paimon::table::Table;
 
 /// C-compatible key-value pair for options.
@@ -78,10 +78,17 @@ pub struct paimon_read_builder {
     pub inner: *mut c_void,
 }
 
-/// Internal state for ReadBuilder that stores table and projection columns.
+/// Internal state for ReadBuilder that stores table, projection columns, and filter.
 pub(crate) struct ReadBuilderState {
     pub table: Table,
     pub projected_columns: Option<Vec<String>>,
+    pub filter: Option<Predicate>,
+}
+
+/// Internal state for TableScan that stores table and filter.
+pub(crate) struct TableScanState {
+    pub table: Table,
+    pub filter: Option<Predicate>,
 }
 
 #[repr(C)]
@@ -94,10 +101,11 @@ pub struct paimon_table_read {
     pub inner: *mut c_void,
 }
 
-/// Internal state for TableRead that stores table and projected read type.
+/// Internal state for TableRead that stores table, projected read type, and data predicates.
 pub(crate) struct TableReadState {
     pub table: Table,
     pub read_type: Vec<DataField>,
+    pub data_predicates: Vec<Predicate>,
 }
 
 #[repr(C)]
@@ -108,6 +116,53 @@ pub struct paimon_plan {
 #[repr(C)]
 pub struct paimon_record_batch_reader {
     pub inner: *mut c_void,
+}
+
+/// Opaque wrapper around a Predicate.
+#[repr(C)]
+pub struct paimon_predicate {
+    pub inner: *mut c_void,
+}
+
+/// A typed literal value for predicate comparison, passed across FFI.
+///
+/// # Design
+///
+/// We use a tagged flat struct instead of opaque heap-allocated handles
+/// (like DuckDB's `duckdb_value`). The trade-off:
+///
+/// - **Pro**: Zero allocation — the entire datum is passed by value on the
+///   stack, with no heap round-trips or free calls needed. This keeps the
+///   FFI surface minimal and the Go/C caller simple.
+/// - **Con**: The struct is larger than any single variant needs, wasting
+///   some bytes per datum (currently ~56 bytes vs. ~16 for the largest
+///   single variant).
+///
+/// Since datums are only used for predicate construction (not a hot path),
+/// the extra size is acceptable.
+///
+/// # Tags
+///
+/// - 0: Bool, 1: TinyInt, 2: SmallInt, 3: Int, 4: Long
+/// - 5: Float, 6: Double, 7: String, 8: Date, 9: Time
+/// - 10: Timestamp, 11: LocalZonedTimestamp, 12: Decimal, 13: Bytes
+///
+/// `tag` determines which value fields are valid:
+/// - `Bool`/`TinyInt`/`SmallInt`/`Int`/`Long`/`Date`/`Time` → `int_val`
+/// - `Float`/`Double` → `double_val`
+/// - `String`/`Bytes` → `str_data` + `str_len`
+/// - `Timestamp`/`LocalZonedTimestamp` → `int_val` (millis) + `int_val2` (nanos)
+/// - `Decimal` → `int_val` + `int_val2` (unscaled i128) + `uint_val` (precision) + `uint_val2` (scale)
+#[repr(C)]
+pub struct paimon_datum {
+    pub tag: i32,
+    pub int_val: i64,
+    pub double_val: f64,
+    pub str_data: *const u8,
+    pub str_len: usize,
+    pub int_val2: i64,
+    pub uint_val: u32,
+    pub uint_val2: u32,
 }
 
 /// A single Arrow record batch exported via the Arrow C Data Interface.
