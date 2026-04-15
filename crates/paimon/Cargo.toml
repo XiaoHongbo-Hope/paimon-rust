@@ -37,11 +37,8 @@ storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3"]
-<<<<<<< HEAD
 storage-hdfs = ["opendal/services-hdfs-native"]
-=======
 lumina = ["libloading"]
->>>>>>> 4aa19c2 (feat: support Lumina vector index read path)
 
 [dependencies]
 url = "2.5.2"
@@ -87,12 +84,9 @@ md-5 = "0.10"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
-<<<<<<< HEAD
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
-=======
 libloading = { version = "0.8", optional = true }
->>>>>>> 4aa19c2 (feat: support Lumina vector index read path)
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
