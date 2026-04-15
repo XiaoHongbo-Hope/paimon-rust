@@ -23,6 +23,7 @@ header:
   paths-ignore:
     - "LICENSE"
     - "NOTICE"
+    - ".gitattributes"
     - ".github/PULL_REQUEST_TEMPLATE.md"
     - "crates/paimon/tests/**/*.json"
     - "**/go.sum"
