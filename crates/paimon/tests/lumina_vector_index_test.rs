@@ -91,8 +91,7 @@ mod lumina_tests {
         let meta_bytes = make_index_meta(&opts);
 
         let io_meta = GlobalIndexIOMeta::new(index_path_str.to_string(), file_size, meta_bytes);
-        let mut reader =
-            LuminaVectorGlobalIndexReader::new(vec![io_meta], HashMap::new()).unwrap();
+        let mut reader = LuminaVectorGlobalIndexReader::new(vec![io_meta], HashMap::new()).unwrap();
 
         // Query with the first vector
         let vectors = generate_vectors(N as usize, DIM as usize, 42);
@@ -128,8 +127,7 @@ mod lumina_tests {
         let meta_bytes = make_index_meta(&opts);
 
         let io_meta = GlobalIndexIOMeta::new(index_path_str.to_string(), file_size, meta_bytes);
-        let mut reader =
-            LuminaVectorGlobalIndexReader::new(vec![io_meta], HashMap::new()).unwrap();
+        let mut reader = LuminaVectorGlobalIndexReader::new(vec![io_meta], HashMap::new()).unwrap();
 
         // Only include even row IDs
         let mut include_ids = RoaringTreemap::new();

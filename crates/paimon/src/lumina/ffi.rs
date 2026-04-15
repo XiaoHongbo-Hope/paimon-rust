@@ -148,10 +148,7 @@ impl LuminaSearcher {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn open_stream<S: Read + Seek + Send + 'static>(
-        &mut self,
-        stream: S,
-    ) -> crate::Result<()> {
+    pub fn open_stream<S: Read + Seek + Send + 'static>(&mut self, stream: S) -> crate::Result<()> {
         let lib = load_library()?;
         let mut err_buf = [0u8; ERR_BUF_SIZE];
 

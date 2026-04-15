@@ -234,9 +234,18 @@ mod tests {
     fn test_convert_distance_to_score() {
         assert_eq!(convert_distance_to_score(0.0, LuminaVectorMetric::L2), 1.0);
         assert_eq!(convert_distance_to_score(1.0, LuminaVectorMetric::L2), 0.5);
-        assert_eq!(convert_distance_to_score(0.0, LuminaVectorMetric::Cosine), 1.0);
-        assert_eq!(convert_distance_to_score(1.0, LuminaVectorMetric::Cosine), 0.0);
-        assert_eq!(convert_distance_to_score(0.75, LuminaVectorMetric::InnerProduct), 0.75);
+        assert_eq!(
+            convert_distance_to_score(0.0, LuminaVectorMetric::Cosine),
+            1.0
+        );
+        assert_eq!(
+            convert_distance_to_score(1.0, LuminaVectorMetric::Cosine),
+            0.0
+        );
+        assert_eq!(
+            convert_distance_to_score(0.75, LuminaVectorMetric::InnerProduct),
+            0.75
+        );
     }
 
     #[test]

@@ -302,7 +302,10 @@ mod tests {
     fn test_strip_lumina_options() {
         let mut opts = HashMap::new();
         opts.insert("lumina.index.dimension".to_string(), "128".to_string());
-        opts.insert("lumina.diskann.search.beam_width".to_string(), "8".to_string());
+        opts.insert(
+            "lumina.diskann.search.beam_width".to_string(),
+            "8".to_string(),
+        );
         opts.insert("non_lumina_key".to_string(), "ignored".to_string());
         let result = strip_lumina_options(&opts);
         assert_eq!(result.get("index.dimension").unwrap(), "128");
