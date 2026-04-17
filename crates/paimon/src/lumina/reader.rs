@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 const MIN_SEARCH_LIST_SIZE: usize = 16;
-const SENTINEL: u64 = 0xFFFFFFFFFFFFFFFF;
+const SENTINEL: u64 = u64::MAX;
 
 fn ensure_search_list_size(search_options: &mut HashMap<String, String>, top_k: usize) {
     if !search_options.contains_key("diskann.search.list_size") {
@@ -61,25 +61,14 @@ pub struct LuminaVectorGlobalIndexReader {
 }
 
 impl LuminaVectorGlobalIndexReader {
-    pub fn new(
-        io_metas: Vec<GlobalIndexIOMeta>,
-        options: HashMap<String, String>,
-    ) -> crate::Result<Self> {
-        if io_metas.len() != 1 {
-            return Err(crate::Error::DataInvalid {
-                message: "Expected exactly one index file per shard".to_string(),
-                source: None,
-            });
-        }
-        let mut metas = io_metas;
-        let io_meta = metas.remove(0);
-        Ok(Self {
+    pub fn new(io_meta: GlobalIndexIOMeta, options: HashMap<String, String>) -> Self {
+        Self {
             io_meta,
             options,
             searcher: None,
             index_meta: None,
             search_options: None,
-        })
+        }
     }
 
     pub fn visit_vector_search<S: Read + Seek + Send + 'static>(
@@ -98,15 +87,24 @@ impl LuminaVectorGlobalIndexReader {
         let index_meta = self
             .index_meta
             .as_ref()
-            .expect("index_meta must be initialized via ensure_loaded()");
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "index_meta not initialized".to_string(),
+                source: None,
+            })?;
         let searcher = self
             .searcher
             .as_ref()
-            .expect("searcher must be initialized via ensure_loaded()");
-        let search_options_base = self
-            .search_options
-            .as_ref()
-            .expect("search_options must be initialized via ensure_loaded()");
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "searcher not initialized".to_string(),
+                source: None,
+            })?;
+        let search_options_base =
+            self.search_options
+                .as_ref()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "search_options not initialized".to_string(),
+                    source: None,
+                })?;
 
         let expected_dim = index_meta.dim()? as usize;
         if vector_search.vector.len() != expected_dim {
@@ -170,12 +168,11 @@ impl LuminaVectorGlobalIndexReader {
         };
 
         let mut id_to_scores: HashMap<u64, f32> = HashMap::new();
-        for i in 0..labels.len() {
-            let row_id = labels[i];
+        for (&row_id, &distance) in labels.iter().zip(distances.iter()) {
             if row_id == SENTINEL {
                 continue;
             }
-            let score = convert_distance_to_score(distances[i], index_metric);
+            let score = convert_distance_to_score(distance, index_metric);
             id_to_scores.insert(row_id, score);
         }
 
@@ -277,10 +274,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reader_requires_exactly_one_meta() {
-        assert!(LuminaVectorGlobalIndexReader::new(vec![], HashMap::new()).is_err());
-        let m1 = GlobalIndexIOMeta::new("a".into(), 100, vec![]);
-        let m2 = GlobalIndexIOMeta::new("b".into(), 200, vec![]);
-        assert!(LuminaVectorGlobalIndexReader::new(vec![m1, m2], HashMap::new()).is_err());
+    fn test_reader_new() {
+        let m = GlobalIndexIOMeta::new("a".into(), 100, vec![]);
+        let reader = LuminaVectorGlobalIndexReader::new(m, HashMap::new());
+        assert!(reader.searcher.is_none());
     }
 }

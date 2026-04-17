@@ -63,7 +63,7 @@ pub trait GlobalIndexResult: Send + Sync {
         Box::new(SimpleGlobalIndexResult::new_ready(result))
     }
 
-    fn or(&self, other: &dyn GlobalIndexResult) -> Box<dyn GlobalIndexResult> {
+    fn or(&self, other: &dyn GlobalIndexResult) -> crate::Result<Box<dyn GlobalIndexResult>> {
         match (self.as_scored(), other.as_scored()) {
             (Some(this), Some(other)) => {
                 let this_row_ids = self.results().clone();
@@ -71,7 +71,7 @@ pub trait GlobalIndexResult: Send + Sync {
                 let result_or = &this_row_ids | &other_row_ids;
                 let this_sg = this.clone_score_getter();
                 let other_sg = other.clone_score_getter();
-                return Box::new(SimpleScoredGlobalIndexResult::new(
+                return Ok(Box::new(SimpleScoredGlobalIndexResult::new(
                     result_or,
                     Arc::new(move |row_id| {
                         let in_this = this_row_ids.contains(row_id);
@@ -82,14 +82,19 @@ pub trait GlobalIndexResult: Send + Sync {
                             _ => other_sg(row_id),
                         }
                     }),
-                ));
+                )));
             }
             (None, None) => {}
-            _ => panic!("Cannot union scored and unscored global index results"),
+            _ => {
+                return Err(crate::Error::DataInvalid {
+                    message: "Cannot union scored and unscored global index results".to_string(),
+                    source: None,
+                });
+            }
         }
 
         let result = self.results() | other.results();
-        Box::new(SimpleGlobalIndexResult::new_ready(result))
+        Ok(Box::new(SimpleGlobalIndexResult::new_ready(result)))
     }
 
     fn is_empty(&self) -> bool {
@@ -257,7 +262,6 @@ impl ScoredGlobalIndexResult for SimpleScoredGlobalIndexResult {
 }
 
 pub struct DictBasedScoredIndexResult {
-    id_to_scores: Arc<std::collections::HashMap<u64, f32>>,
     bitmap: RoaringTreemap,
     score_getter_fn: ScoreGetter,
 }
@@ -269,11 +273,9 @@ impl DictBasedScoredIndexResult {
             bitmap.insert(row_id);
         }
         let map = Arc::new(id_to_scores);
-        let map_ref = map.clone();
         let score_getter_fn: ScoreGetter =
-            Arc::new(move |row_id| map_ref.get(&row_id).copied().unwrap_or(0.0));
+            Arc::new(move |row_id| map.get(&row_id).copied().unwrap_or(0.0));
         Self {
-            id_to_scores: map,
             bitmap,
             score_getter_fn,
         }
@@ -296,8 +298,7 @@ impl ScoredGlobalIndexResult for DictBasedScoredIndexResult {
     }
 
     fn clone_score_getter(&self) -> ScoreGetter {
-        let map = self.id_to_scores.clone();
-        Arc::new(move |row_id| map.get(&row_id).copied().unwrap_or(0.0))
+        self.score_getter_fn.clone()
     }
 }
 
@@ -344,7 +345,12 @@ impl VectorSearch {
     pub fn offset_range(&self, from: u64, to: u64) -> Self {
         if let Some(ref include_row_ids) = self.include_row_ids {
             let mut range_bitmap = RoaringTreemap::new();
-            range_bitmap.insert_range(from..to);
+            if to == u64::MAX {
+                range_bitmap.insert_range(from..u64::MAX);
+                range_bitmap.insert(u64::MAX);
+            } else {
+                range_bitmap.insert_range(from..to + 1);
+            }
             let and_result = include_row_ids & &range_bitmap;
             let mut offset_bitmap = RoaringTreemap::new();
             for row_id in and_result.iter() {
@@ -408,12 +414,13 @@ mod tests {
 
         let result = vs.offset_range(60, 150);
         let ids = result.include_row_ids.unwrap();
-        // [100,200) & [60,150) = [100,150), offset by -60 => [40,90)
-        assert_eq!(ids.len(), 50);
+        // [100,200) means row ids [100,199]. Inclusive [60,150] keeps [100,150].
+        assert_eq!(ids.len(), 51);
         assert!(ids.contains(40));
+        assert!(ids.contains(90));
         assert!(ids.contains(89));
         assert!(!ids.contains(39));
-        assert!(!ids.contains(90));
+        assert!(!ids.contains(91));
     }
 
     // Aligned with Java LuminaVectorGlobalIndexTest.testInvalidTopK
@@ -468,7 +475,7 @@ mod tests {
     fn test_base_or_preserves_scores() {
         let left = make_dict(vec![(1, 0.5), (2, 0.6)]);
         let right = make_dict(vec![(3, 0.7), (4, 0.8)]);
-        let merged = left.or(&right);
+        let merged = left.or(&right).unwrap();
         let scored = merged
             .as_scored()
             .expect("or should preserve scored results");
@@ -481,7 +488,7 @@ mod tests {
     fn test_or_overlapping_takes_max_score() {
         let left = make_dict(vec![(1, 0.3), (2, 0.9)]);
         let right = make_dict(vec![(1, 0.7), (2, 0.4)]);
-        let merged = left.or(&right);
+        let merged = left.or(&right).unwrap();
         let scored = merged
             .as_scored()
             .expect("or should preserve scored results");

@@ -33,6 +33,8 @@ fn load_library() -> crate::Result<&'static Library> {
     let lib_path = std::env::var("LUMINA_LIB_PATH").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "liblumina_py.dylib".to_string()
+        } else if cfg!(target_os = "windows") {
+            "lumina_py.dll".to_string()
         } else {
             "liblumina_py.so".to_string()
         }
@@ -51,11 +53,10 @@ fn load_library() -> crate::Result<&'static Library> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_library;
+    use super::{load_library, LIBRARY};
 
     #[test]
     fn test_load_library_failure_does_not_cache() {
-        // SAFETY: This test runs in isolation; env var mutation is acceptable here.
         unsafe {
             std::env::set_var(
                 "LUMINA_LIB_PATH",
@@ -63,13 +64,8 @@ mod tests {
             );
         }
         assert!(load_library().is_err());
-        unsafe {
-            std::env::set_var(
-                "LUMINA_LIB_PATH",
-                "/another/missing/liblumina_missing.dylib",
-            );
-        }
-        assert!(load_library().is_err());
+        // OnceLock must not be poisoned by a failed load
+        assert!(LIBRARY.get().is_none());
         unsafe {
             std::env::remove_var("LUMINA_LIB_PATH");
         }
@@ -101,13 +97,12 @@ fn options_to_json(options: &HashMap<String, String>) -> crate::Result<CString> 
 
 pub struct LuminaSearcher {
     handle: *mut c_void,
-    _stream_ctx: Option<Box<StreamContext>>,
+    /// Keeps the stream context alive while C-side holds a raw pointer to it.
+    stream_ctx_keepalive: Option<Box<StreamContext>>,
 }
 
-// SAFETY: The liblumina C API handles are not tied to a specific thread.
-// Each LuminaSearcher owns its handle exclusively and the C library
-// uses internal locking for thread safety. The handle is only accessed
-// through &self or &mut self, so no data races can occur.
+// SAFETY: Each LuminaSearcher owns its handle exclusively and is not Sync.
+// Send allows moving the searcher to another thread.
 unsafe impl Send for LuminaSearcher {}
 
 impl LuminaSearcher {
@@ -143,7 +138,7 @@ impl LuminaSearcher {
 
         Ok(Self {
             handle,
-            _stream_ctx: None,
+            stream_ctx_keepalive: None,
         })
     }
 
@@ -186,7 +181,7 @@ impl LuminaSearcher {
         };
 
         check_error(ret, &err_buf)?;
-        self._stream_ctx = Some(ctx);
+        self.stream_ctx_keepalive = Some(ctx);
         Ok(())
     }
 
@@ -340,8 +335,7 @@ pub struct LuminaBuilder {
     handle: *mut c_void,
 }
 
-// SAFETY: Same as LuminaSearcher — the builder handle is exclusively owned
-// and the C library is thread-safe for independent handles.
+// SAFETY: Same as LuminaSearcher — exclusively owned, not Sync.
 unsafe impl Send for LuminaBuilder {}
 
 impl LuminaBuilder {
@@ -545,9 +539,10 @@ unsafe extern "C" fn stream_read_cb(ctx: *mut c_void, buf: *mut c_char, size: u6
         Ok(g) => g,
         Err(_) => return -1,
     };
-    let slice = std::slice::from_raw_parts_mut(buf as *mut u8, size as usize);
+    let clamped_size = std::cmp::min(size, c_int::MAX as u64) as usize;
+    let slice = std::slice::from_raw_parts_mut(buf as *mut u8, clamped_size);
     let mut total_read = 0usize;
-    while total_read < size as usize {
+    while total_read < clamped_size {
         match guard.read(&mut slice[total_read..]) {
             Ok(0) => break,
             Ok(n) => total_read += n,

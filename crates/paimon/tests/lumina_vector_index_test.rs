@@ -79,9 +79,31 @@ mod lumina_tests {
         meta.serialize().expect("Failed to serialize meta")
     }
 
+    fn skip_if_lumina_library_missing() -> bool {
+        match LuminaBuilder::create(&build_options()) {
+            Ok(builder) => {
+                drop(builder);
+                false
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("Failed to load lumina library") {
+                    eprintln!("Skipping Lumina integration test: {}", message);
+                    true
+                } else {
+                    panic!("Failed to initialize LuminaBuilder: {}", message);
+                }
+            }
+        }
+    }
+
     /// Aligned with Python test_build_and_read
     #[test]
     fn test_build_and_read() {
+        if skip_if_lumina_library_missing() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("Failed to create temp dir");
         let index_path = dir.path().join("index.lmi");
         let index_path_str = index_path.to_str().unwrap();
@@ -91,7 +113,7 @@ mod lumina_tests {
         let meta_bytes = make_index_meta(&opts);
 
         let io_meta = GlobalIndexIOMeta::new(index_path_str.to_string(), file_size, meta_bytes);
-        let mut reader = LuminaVectorGlobalIndexReader::new(vec![io_meta], HashMap::new()).unwrap();
+        let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, HashMap::new());
 
         // Query with the first vector
         let vectors = generate_vectors(N as usize, DIM as usize, 42);
@@ -118,6 +140,10 @@ mod lumina_tests {
     /// Aligned with Python test_filtered_search
     #[test]
     fn test_filtered_search() {
+        if skip_if_lumina_library_missing() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("Failed to create temp dir");
         let index_path = dir.path().join("index.lmi");
         let index_path_str = index_path.to_str().unwrap();
@@ -127,7 +153,7 @@ mod lumina_tests {
         let meta_bytes = make_index_meta(&opts);
 
         let io_meta = GlobalIndexIOMeta::new(index_path_str.to_string(), file_size, meta_bytes);
-        let mut reader = LuminaVectorGlobalIndexReader::new(vec![io_meta], HashMap::new()).unwrap();
+        let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, HashMap::new());
 
         // Only include even row IDs
         let mut include_ids = RoaringTreemap::new();
