@@ -56,12 +56,15 @@ pub trait GlobalIndexResult: Send + Sync {
         Box::new(SimpleGlobalIndexResult::new_ready(offset_bitmap))
     }
 
-    fn and(&self, other: &dyn GlobalIndexResult) -> Box<dyn GlobalIndexResult> {
+    fn and(&self, other: &dyn GlobalIndexResult) -> crate::Result<Box<dyn GlobalIndexResult>> {
         if self.as_scored().is_some() || other.as_scored().is_some() {
-            panic!("and() is not supported for scored global index results");
+            return Err(crate::Error::DataInvalid {
+                message: "and() is not supported for scored global index results".to_string(),
+                source: None,
+            });
         }
         let result = self.results() & other.results();
-        Box::new(SimpleGlobalIndexResult::new_ready(result))
+        Ok(Box::new(SimpleGlobalIndexResult::new_ready(result)))
     }
 
     fn or(&self, other: &dyn GlobalIndexResult) -> crate::Result<Box<dyn GlobalIndexResult>> {
@@ -71,6 +74,7 @@ pub trait GlobalIndexResult: Send + Sync {
                 let result_or = &this_row_ids | other.results();
                 let this_sg = this.clone_score_getter();
                 let other_sg = that.clone_score_getter();
+                // For overlapping IDs, use left-side score (aligned with Java ScoredGlobalIndexResult.or)
                 return Ok(Box::new(SimpleScoredGlobalIndexResult::new(
                     result_or,
                     Arc::new(move |row_id| {
@@ -141,6 +145,7 @@ pub trait ScoredGlobalIndexResult: GlobalIndexResult {
         ))
     }
 
+    // For overlapping IDs, use left-side score (aligned with Java ScoredGlobalIndexResult.or)
     fn scored_or(&self, other: &dyn ScoredGlobalIndexResult) -> Box<dyn ScoredGlobalIndexResult> {
         let this_row_ids = self.results().clone();
         let result_or = &this_row_ids | other.results();
@@ -491,11 +496,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "and() is not supported for scored global index results")]
-    fn test_scored_and_panics() {
+    fn test_scored_and_returns_error() {
         let left = make_dict(vec![(1, 0.5), (2, 0.6)]);
         let right = make_dict(vec![(1, 0.7), (3, 0.8)]);
-        let _ = left.and(&right);
+        assert!(left.and(&right).is_err());
     }
 
     #[test]
