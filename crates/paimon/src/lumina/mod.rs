@@ -162,16 +162,18 @@ fn validate_and_cap_pq_m(
         return Ok(());
     }
     if let Some(pq_m_str) = opts.get("encoding.pq.m") {
-        if let Ok(pq_m) = pq_m_str.parse::<i32>() {
-            if pq_m <= 0 {
-                return Err(crate::Error::DataInvalid {
-                    message: format!("encoding.pq.m must be positive, got: {}", pq_m),
-                    source: None,
-                });
-            }
-            if pq_m > dimension {
-                opts.insert("encoding.pq.m".to_string(), dimension.to_string());
-            }
+        let pq_m: i32 = pq_m_str.parse().map_err(|_| crate::Error::DataInvalid {
+            message: format!("encoding.pq.m must be an integer, got: {}", pq_m_str),
+            source: None,
+        })?;
+        if pq_m <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!("encoding.pq.m must be positive, got: {}", pq_m),
+                source: None,
+            });
+        }
+        if pq_m > dimension {
+            opts.insert("encoding.pq.m".to_string(), dimension.to_string());
         }
     }
     Ok(())
@@ -401,6 +403,14 @@ mod tests {
         let mut opts = HashMap::new();
         opts.insert("lumina.index.dimension".to_string(), "128".to_string());
         opts.insert("lumina.encoding.pq.m".to_string(), "0".to_string());
+        assert!(LuminaVectorIndexOptions::new(&opts).is_err());
+    }
+
+    #[test]
+    fn test_pq_m_non_numeric_rejected() {
+        let mut opts = HashMap::new();
+        opts.insert("lumina.index.dimension".to_string(), "128".to_string());
+        opts.insert("lumina.encoding.pq.m".to_string(), "abc".to_string());
         assert!(LuminaVectorIndexOptions::new(&opts).is_err());
     }
 
