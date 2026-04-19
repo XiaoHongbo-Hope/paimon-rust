@@ -20,10 +20,12 @@ use crate::globalindex::{
 };
 use crate::lumina::ffi::LuminaSearcher;
 use crate::lumina::{strip_lumina_options, LuminaIndexMeta, LuminaVectorMetric};
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 const MIN_SEARCH_LIST_SIZE: usize = 16;
+// Java uses rowId < 0 (signed long, -1). C ABI returns int64_t -1 which casts to u64::MAX.
 const SENTINEL: u64 = u64::MAX;
 
 fn ensure_search_list_size(search_options: &mut HashMap<String, String>, top_k: usize) {
@@ -44,12 +46,51 @@ fn convert_distance_to_score(distance: f32, metric: LuminaVectorMetric) -> f32 {
     }
 }
 
-fn filter_search_options(options: &HashMap<String, String>) -> HashMap<String, String> {
-    options
-        .iter()
-        .filter(|(k, _)| k.starts_with("search.") || k.starts_with("diskann.search."))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+/// Post-filter search results to top_k, aligned with Java collectResults.
+fn collect_results(
+    labels: &[u64],
+    distances: &[f32],
+    top_k: usize,
+    metric: LuminaVectorMetric,
+) -> HashMap<u64, f32> {
+    #[derive(PartialEq)]
+    struct ScoredRow {
+        row_id: u64,
+        score: f32,
+    }
+    impl Eq for ScoredRow {}
+    impl PartialOrd for ScoredRow {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for ScoredRow {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            other.score.total_cmp(&self.score)
+        }
+    }
+
+    let mut min_heap: BinaryHeap<ScoredRow> = BinaryHeap::with_capacity(top_k + 1);
+    for (&row_id, &distance) in labels.iter().zip(distances.iter()) {
+        if row_id == SENTINEL {
+            continue;
+        }
+        let score = convert_distance_to_score(distance, metric);
+        if min_heap.len() < top_k {
+            min_heap.push(ScoredRow { row_id, score });
+        } else if let Some(peek) = min_heap.peek() {
+            if score > peek.score {
+                min_heap.pop();
+                min_heap.push(ScoredRow { row_id, score });
+            }
+        }
+    }
+
+    let mut result = HashMap::with_capacity(min_heap.len());
+    for entry in min_heap {
+        result.insert(entry.row_id, entry.score);
+    }
+    result
 }
 
 pub struct LuminaVectorGlobalIndexReader {
@@ -139,7 +180,6 @@ impl LuminaVectorGlobalIndexReader {
             let mut search_opts: HashMap<String, String> = search_options_base.clone();
             search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
             ensure_search_list_size(&mut search_opts, ek);
-            let filtered_opts = filter_search_options(&search_opts);
             searcher.search_with_filter(
                 &vector_search.vector,
                 1,
@@ -147,7 +187,7 @@ impl LuminaVectorGlobalIndexReader {
                 &mut distances,
                 &mut labels,
                 &filter_id_list,
-                &filtered_opts,
+                &search_opts,
             )?;
             (distances, labels)
         } else {
@@ -155,25 +195,20 @@ impl LuminaVectorGlobalIndexReader {
             let mut labels = vec![0u64; effective_k];
             let mut search_opts: HashMap<String, String> = search_options_base.clone();
             ensure_search_list_size(&mut search_opts, effective_k);
-            let filtered_opts = filter_search_options(&search_opts);
             searcher.search(
                 &vector_search.vector,
                 1,
                 effective_k as i32,
                 &mut distances,
                 &mut labels,
-                &filtered_opts,
+                &search_opts,
             )?;
             (distances, labels)
         };
 
-        let mut id_to_scores: HashMap<u64, f32> = HashMap::new();
-        for (&row_id, &distance) in labels.iter().zip(distances.iter()) {
-            if row_id == SENTINEL {
-                continue;
-            }
-            let score = convert_distance_to_score(distance, index_metric);
-            id_to_scores.insert(row_id, score);
+        let id_to_scores = collect_results(&labels, &distances, effective_k, index_metric);
+        if id_to_scores.is_empty() {
+            return Ok(None);
         }
 
         Ok(Some(Box::new(DictBasedScoredIndexResult::new(
@@ -262,14 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_search_options() {
-        let mut opts = HashMap::new();
-        opts.insert("search.beam_width".to_string(), "4".to_string());
-        opts.insert("diskann.search.list_size".to_string(), "16".to_string());
-        opts.insert("index.dimension".to_string(), "128".to_string());
-        let filtered = filter_search_options(&opts);
-        assert_eq!(filtered.len(), 2);
-        assert!(!filtered.contains_key("index.dimension"));
+    fn test_collect_results() {
+        let labels = vec![0, 1, 2, SENTINEL, 3];
+        let distances = vec![0.5, 0.3, 0.1, 0.0, 0.9];
+        let result = collect_results(&labels, &distances, 2, LuminaVectorMetric::InnerProduct);
+        assert_eq!(result.len(), 2);
+        // top 2 by score: row 3 (0.9) and row 0 (0.5)
+        assert!(result.contains_key(&3));
+        assert!(result.contains_key(&0));
+        assert!(!result.contains_key(&2)); // 0.1 is lowest
     }
 
     #[test]
