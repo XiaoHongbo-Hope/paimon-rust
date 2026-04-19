@@ -38,6 +38,7 @@ storage-fs = ["opendal/services-fs"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3"]
 storage-hdfs = ["opendal/services-hdfs-native"]
+lumina = ["libloading"]
 
 [dependencies]
 url = "2.5.2"
@@ -85,6 +86,7 @@ uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
