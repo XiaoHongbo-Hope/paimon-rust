@@ -167,7 +167,7 @@ pub trait ScoredGlobalIndexResult: GlobalIndexResult {
 
     fn top_k(&self, k: usize) -> Box<dyn ScoredGlobalIndexResult> {
         let row_ids = self.results();
-        if row_ids.len() as usize <= k {
+        if row_ids.len() <= k as u64 {
             let bitmap = row_ids.clone();
             let sg = self.clone_score_getter();
             return Box::new(SimpleScoredGlobalIndexResult::new(bitmap, sg));
@@ -188,10 +188,9 @@ pub trait ScoredGlobalIndexResult: GlobalIndexResult {
         }
         impl Ord for ScoredEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other
-                    .score
-                    .partial_cmp(&self.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                // Min-heap: reverse order so smallest score is at top.
+                // Use total_cmp to handle NaN deterministically.
+                other.score.total_cmp(&self.score)
             }
         }
 

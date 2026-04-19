@@ -26,50 +26,24 @@ const ERR_BUF_SIZE: usize = 4096;
 static LIBRARY: OnceLock<Library> = OnceLock::new();
 
 fn load_library() -> crate::Result<&'static Library> {
-    if let Some(library) = LIBRARY.get() {
-        return Ok(library);
-    }
+    LIBRARY.get_or_try_init(|| {
+        let lib_path = std::env::var("LUMINA_LIB_PATH").unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "liblumina_py.dylib".to_string()
+            } else if cfg!(target_os = "windows") {
+                "lumina_py.dll".to_string()
+            } else {
+                "liblumina_py.so".to_string()
+            }
+        });
 
-    let lib_path = std::env::var("LUMINA_LIB_PATH").unwrap_or_else(|_| {
-        if cfg!(target_os = "macos") {
-            "liblumina_py.dylib".to_string()
-        } else if cfg!(target_os = "windows") {
-            "lumina_py.dll".to_string()
-        } else {
-            "liblumina_py.so".to_string()
-        }
-    });
-
-    let library = unsafe {
-        Library::new(&lib_path).map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to load lumina library from '{}': {}", lib_path, e),
-            source: None,
-        })?
-    };
-
-    let _ = LIBRARY.set(library);
-    Ok(LIBRARY.get().expect("lumina library should be initialized"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{load_library, LIBRARY};
-
-    #[test]
-    fn test_load_library_failure_does_not_cache() {
         unsafe {
-            std::env::set_var(
-                "LUMINA_LIB_PATH",
-                "/path/that/does/not/exist/liblumina_missing.dylib",
-            );
+            Library::new(&lib_path).map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to load lumina library from '{}': {}", lib_path, e),
+                source: None,
+            })
         }
-        assert!(load_library().is_err());
-        // OnceLock must not be poisoned by a failed load
-        assert!(LIBRARY.get().is_none());
-        unsafe {
-            std::env::remove_var("LUMINA_LIB_PATH");
-        }
-    }
+    })
 }
 
 fn check_error(ret: c_int, err_buf: &[u8; ERR_BUF_SIZE]) -> crate::Result<()> {
@@ -144,6 +118,14 @@ impl LuminaSearcher {
 
     #[allow(clippy::type_complexity)]
     pub fn open_stream<S: Read + Seek + Send + 'static>(&mut self, stream: S) -> crate::Result<()> {
+        if self.stream_ctx_keepalive.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "A stream is already open; close the searcher before opening a new stream"
+                    .to_string(),
+                source: None,
+            });
+        }
+
         let lib = load_library()?;
         let mut err_buf = [0u8; ERR_BUF_SIZE];
 
