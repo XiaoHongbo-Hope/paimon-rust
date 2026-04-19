@@ -196,13 +196,12 @@ impl LuminaVectorGlobalIndexReader {
             searcher_options.insert(k.to_string(), v.to_string());
         }
 
-        let searcher_opts_map: HashMap<String, String> = searcher_options.into_iter().collect();
-        let mut searcher = LuminaSearcher::create(&searcher_opts_map)?;
+        let mut searcher = LuminaSearcher::create(&searcher_options)?;
 
         let stream = stream_fn(&self.io_meta.file_path)?;
         searcher.open_stream(stream)?;
 
-        self.search_options = Some(searcher_opts_map);
+        self.search_options = Some(searcher_options);
         self.index_meta = Some(index_meta);
         self.searcher = Some(searcher);
         Ok(())

@@ -57,29 +57,27 @@ pub trait GlobalIndexResult: Send + Sync {
     }
 
     fn and(&self, other: &dyn GlobalIndexResult) -> Box<dyn GlobalIndexResult> {
-        // Scored intersection has ambiguous score semantics, so we drop scores
-        // and return an unscored result.
+        if self.as_scored().is_some() || other.as_scored().is_some() {
+            panic!("and() is not supported for scored global index results");
+        }
         let result = self.results() & other.results();
         Box::new(SimpleGlobalIndexResult::new_ready(result))
     }
 
     fn or(&self, other: &dyn GlobalIndexResult) -> crate::Result<Box<dyn GlobalIndexResult>> {
         match (self.as_scored(), other.as_scored()) {
-            (Some(this), Some(other)) => {
+            (Some(this), Some(that)) => {
                 let this_row_ids = self.results().clone();
-                let other_row_ids = other.results().clone();
-                let result_or = &this_row_ids | &other_row_ids;
+                let result_or = &this_row_ids | other.results();
                 let this_sg = this.clone_score_getter();
-                let other_sg = other.clone_score_getter();
+                let other_sg = that.clone_score_getter();
                 return Ok(Box::new(SimpleScoredGlobalIndexResult::new(
                     result_or,
                     Arc::new(move |row_id| {
-                        let in_this = this_row_ids.contains(row_id);
-                        let in_other = other_row_ids.contains(row_id);
-                        match (in_this, in_other) {
-                            (true, true) => this_sg(row_id).max(other_sg(row_id)),
-                            (true, false) => this_sg(row_id),
-                            _ => other_sg(row_id),
+                        if this_row_ids.contains(row_id) {
+                            this_sg(row_id)
+                        } else {
+                            other_sg(row_id)
                         }
                     }),
                 )));
@@ -145,21 +143,16 @@ pub trait ScoredGlobalIndexResult: GlobalIndexResult {
 
     fn scored_or(&self, other: &dyn ScoredGlobalIndexResult) -> Box<dyn ScoredGlobalIndexResult> {
         let this_row_ids = self.results().clone();
-        let other_row_ids = other.results().clone();
-        let result_or = &this_row_ids | &other_row_ids;
+        let result_or = &this_row_ids | other.results();
         let this_sg = self.clone_score_getter();
         let other_sg = other.clone_score_getter();
-        let this_ids = this_row_ids;
-        let other_ids = other_row_ids;
         Box::new(SimpleScoredGlobalIndexResult::new(
             result_or,
             Arc::new(move |row_id| {
-                let in_this = this_ids.contains(row_id);
-                let in_other = other_ids.contains(row_id);
-                match (in_this, in_other) {
-                    (true, true) => this_sg(row_id).max(other_sg(row_id)),
-                    (true, false) => this_sg(row_id),
-                    _ => other_sg(row_id),
+                if this_row_ids.contains(row_id) {
+                    this_sg(row_id)
+                } else {
+                    other_sg(row_id)
                 }
             }),
         ))
@@ -484,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_or_overlapping_takes_max_score() {
+    fn test_or_overlapping_uses_left_score() {
         let left = make_dict(vec![(1, 0.3), (2, 0.9)]);
         let right = make_dict(vec![(1, 0.7), (2, 0.4)]);
         let merged = left.or(&right).unwrap();
@@ -492,21 +485,17 @@ mod tests {
             .as_scored()
             .expect("or should preserve scored results");
         assert_eq!(merged.results().len(), 2);
-        // row 1: max(0.3, 0.7) = 0.7
-        assert_eq!(scored.score_getter()(1), 0.7);
-        // row 2: max(0.9, 0.4) = 0.9
+        // Overlapping IDs use left-side score (Java semantics)
+        assert_eq!(scored.score_getter()(1), 0.3);
         assert_eq!(scored.score_getter()(2), 0.9);
     }
 
     #[test]
-    fn test_scored_and_drops_scores() {
+    #[should_panic(expected = "and() is not supported for scored global index results")]
+    fn test_scored_and_panics() {
         let left = make_dict(vec![(1, 0.5), (2, 0.6)]);
         let right = make_dict(vec![(1, 0.7), (3, 0.8)]);
-        let result = left.and(&right);
-        assert_eq!(result.results().len(), 1);
-        assert!(result.results().contains(1));
-        // Scores are dropped for intersection
-        assert!(result.as_scored().is_none());
+        let _ = left.and(&right);
     }
 
     #[test]

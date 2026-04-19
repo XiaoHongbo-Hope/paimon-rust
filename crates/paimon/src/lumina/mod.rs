@@ -65,8 +65,17 @@ impl LuminaVectorMetric {
 
 const LUMINA_PREFIX: &str = "lumina.";
 
-const SEARCH_OPTIONS_DEFAULTS: &[(&str, &str)] = &[
+const ALL_OPTIONS_DEFAULTS: &[(&str, &str)] = &[
+    ("lumina.index.dimension", "128"),
+    ("lumina.index.type", "diskann"),
+    ("lumina.distance.metric", "inner_product"),
+    ("lumina.encoding.type", "pq"),
+    ("lumina.pretrain.sample_ratio", "0.2"),
+    ("lumina.diskann.build.ef_construction", "1024"),
+    ("lumina.diskann.build.neighbor_count", "64"),
+    ("lumina.diskann.build.thread_count", "32"),
     ("lumina.diskann.search.beam_width", "4"),
+    ("lumina.encoding.pq.m", "64"),
     ("lumina.search.parallel_number", "5"),
 ];
 
@@ -106,12 +115,18 @@ impl LuminaVectorIndexOptions {
         let metric = LuminaVectorMetric::from_lumina_name(metric_str)
             .or_else(|_| LuminaVectorMetric::from_string(metric_str))?;
 
+        let encoding = paimon_options
+            .get("lumina.encoding.type")
+            .map(|s| s.as_str())
+            .unwrap_or("pq");
+        validate_encoding_metric(encoding, metric)?;
+
         let index_type = paimon_options
             .get("lumina.index.type")
             .cloned()
             .unwrap_or_else(|| "diskann".to_string());
 
-        let lumina_options = strip_lumina_options(paimon_options);
+        let lumina_options = build_lumina_options(paimon_options, dimension);
 
         Ok(Self {
             dimension,
@@ -126,20 +141,64 @@ impl LuminaVectorIndexOptions {
     }
 }
 
-pub fn strip_lumina_options(paimon_options: &HashMap<String, String>) -> HashMap<String, String> {
+fn validate_encoding_metric(encoding: &str, metric: LuminaVectorMetric) -> crate::Result<()> {
+    if encoding.eq_ignore_ascii_case("pq") && metric == LuminaVectorMetric::Cosine {
+        return Err(crate::Error::DataInvalid {
+            message: "Lumina does not support PQ encoding with cosine metric. \
+                Please use 'rawf32' or 'sq8' encoding, or switch to 'l2' or 'inner_product' metric."
+                .to_string(),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+fn cap_pq_m(opts: &mut HashMap<String, String>, dimension: i32) {
+    let encoding = opts.get("encoding.type").map(|s| s.as_str()).unwrap_or("");
+    if !encoding.eq_ignore_ascii_case("pq") {
+        return;
+    }
+    if let Some(pq_m_str) = opts.get("encoding.pq.m") {
+        if let Ok(pq_m) = pq_m_str.parse::<i32>() {
+            if pq_m > dimension {
+                opts.insert("encoding.pq.m".to_string(), dimension.to_string());
+            }
+        }
+    }
+}
+
+fn build_lumina_options(
+    paimon_options: &HashMap<String, String>,
+    dimension: i32,
+) -> HashMap<String, String> {
     let mut result = HashMap::new();
 
-    for &(paimon_key, default_value) in SEARCH_OPTIONS_DEFAULTS {
+    for &(paimon_key, default_value) in ALL_OPTIONS_DEFAULTS {
         let native_key = &paimon_key[LUMINA_PREFIX.len()..];
-        result.insert(native_key.to_string(), default_value.to_string());
+        let value = paimon_options
+            .get(paimon_key)
+            .map(|s| s.as_str())
+            .unwrap_or(default_value);
+        result.insert(native_key.to_string(), value.to_string());
     }
 
+    for (key, value) in paimon_options {
+        if let Some(native_key) = key.strip_prefix(LUMINA_PREFIX) {
+            result.entry(native_key.to_string()).or_insert_with(|| value.to_string());
+        }
+    }
+
+    cap_pq_m(&mut result, dimension);
+    result
+}
+
+pub fn strip_lumina_options(paimon_options: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut result = HashMap::new();
     for (key, value) in paimon_options {
         if let Some(native_key) = key.strip_prefix(LUMINA_PREFIX) {
             result.insert(native_key.to_string(), value.to_string());
         }
     }
-
     result
 }
 
@@ -309,7 +368,52 @@ mod tests {
         opts.insert("non_lumina_key".to_string(), "ignored".to_string());
         let result = strip_lumina_options(&opts);
         assert_eq!(result.get("index.dimension").unwrap(), "128");
-        assert_eq!(result.get("diskann.search.beam_width").unwrap(), "8"); // overrides default
+        assert_eq!(result.get("diskann.search.beam_width").unwrap(), "8");
         assert!(!result.contains_key("non_lumina_key"));
+    }
+
+    #[test]
+    fn test_pq_cosine_rejected() {
+        let mut opts = HashMap::new();
+        opts.insert("lumina.index.dimension".to_string(), "128".to_string());
+        opts.insert("lumina.distance.metric".to_string(), "cosine".to_string());
+        opts.insert("lumina.encoding.type".to_string(), "pq".to_string());
+        assert!(LuminaVectorIndexOptions::new(&opts).is_err());
+    }
+
+    #[test]
+    fn test_pq_l2_accepted() {
+        let mut opts = HashMap::new();
+        opts.insert("lumina.index.dimension".to_string(), "128".to_string());
+        opts.insert("lumina.distance.metric".to_string(), "l2".to_string());
+        opts.insert("lumina.encoding.type".to_string(), "pq".to_string());
+        assert!(LuminaVectorIndexOptions::new(&opts).is_ok());
+    }
+
+    #[test]
+    fn test_cap_pq_m() {
+        let mut opts = HashMap::new();
+        opts.insert("lumina.index.dimension".to_string(), "32".to_string());
+        opts.insert("lumina.encoding.pq.m".to_string(), "64".to_string());
+        let index_opts = LuminaVectorIndexOptions::new(&opts).unwrap();
+        let lumina_opts = index_opts.to_lumina_options();
+        assert_eq!(lumina_opts.get("encoding.pq.m").unwrap(), "32");
+    }
+
+    #[test]
+    fn test_build_lumina_options_defaults() {
+        let opts = HashMap::new();
+        let index_opts = LuminaVectorIndexOptions::new(&opts).unwrap();
+        let lumina_opts = index_opts.to_lumina_options();
+        assert_eq!(lumina_opts.get("index.dimension").unwrap(), "128");
+        assert_eq!(lumina_opts.get("distance.metric").unwrap(), "inner_product");
+        assert_eq!(lumina_opts.get("encoding.type").unwrap(), "pq");
+        assert_eq!(lumina_opts.get("pretrain.sample_ratio").unwrap(), "0.2");
+        assert_eq!(lumina_opts.get("diskann.build.ef_construction").unwrap(), "1024");
+        assert_eq!(lumina_opts.get("diskann.build.neighbor_count").unwrap(), "64");
+        assert_eq!(lumina_opts.get("diskann.build.thread_count").unwrap(), "32");
+        assert_eq!(lumina_opts.get("diskann.search.beam_width").unwrap(), "4");
+        assert_eq!(lumina_opts.get("encoding.pq.m").unwrap(), "64");
+        assert_eq!(lumina_opts.get("search.parallel_number").unwrap(), "5");
     }
 }
