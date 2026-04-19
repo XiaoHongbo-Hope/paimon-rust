@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 const MIN_SEARCH_LIST_SIZE: usize = 16;
-// Java uses rowId < 0 (signed long, -1). C ABI returns int64_t -1 which casts to u64::MAX.
+// C ABI returns int64_t -1 for invalid results, which casts to u64::MAX in Rust.
 const SENTINEL: u64 = u64::MAX;
 
 fn ensure_search_list_size(search_options: &mut HashMap<String, String>, top_k: usize) {
@@ -46,7 +46,7 @@ fn convert_distance_to_score(distance: f32, metric: LuminaVectorMetric) -> f32 {
     }
 }
 
-/// Post-filter search results to top_k, aligned with Java collectResults.
+/// Post-filter search results to top_k.
 fn collect_results(
     labels: &[u64],
     distances: &[f32],
@@ -260,7 +260,6 @@ mod tests {
     use super::*;
     use crate::globalindex::GlobalIndexIOMeta;
 
-    // Aligned with Java: testDifferentMetrics — score conversion per metric
     #[test]
     fn test_convert_distance_to_score() {
         assert_eq!(convert_distance_to_score(0.0, LuminaVectorMetric::L2), 1.0);

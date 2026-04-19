@@ -74,7 +74,7 @@ pub trait GlobalIndexResult: Send + Sync {
                 let result_or = &this_row_ids | other.results();
                 let this_sg = this.clone_score_getter();
                 let other_sg = that.clone_score_getter();
-                // For overlapping IDs, use left-side score (aligned with Java ScoredGlobalIndexResult.or)
+                // For overlapping IDs, use left-side score
                 return Ok(Box::new(SimpleScoredGlobalIndexResult::new(
                     result_or,
                     Arc::new(move |row_id| {
@@ -145,7 +145,7 @@ pub trait ScoredGlobalIndexResult: GlobalIndexResult {
         ))
     }
 
-    // For overlapping IDs, use left-side score (aligned with Java ScoredGlobalIndexResult.or)
+    // For overlapping IDs, use left-side score
     fn scored_or(&self, other: &dyn ScoredGlobalIndexResult) -> Box<dyn ScoredGlobalIndexResult> {
         let this_row_ids = self.results().clone();
         let result_or = &this_row_ids | other.results();
@@ -400,7 +400,6 @@ impl GlobalIndexIOMeta {
 mod tests {
     use super::*;
 
-    // Aligned with Java VectorSearchTest.testVectorSearchOffset
     #[test]
     fn test_vector_search_offset_range() {
         let mut bitmap = RoaringTreemap::new();
@@ -420,7 +419,6 @@ mod tests {
         assert!(!ids.contains(91));
     }
 
-    // Aligned with Java LuminaVectorGlobalIndexTest.testInvalidTopK
     #[test]
     fn test_invalid_top_k() {
         assert!(VectorSearch::new(vec![1.0], 0, "f".to_string()).is_err());
@@ -433,7 +431,6 @@ mod tests {
         assert!(result.include_row_ids.is_none());
     }
 
-    // Scored results: top_k, scored_offset, scored_or — exercised indirectly in Java integration tests
     fn make_dict(entries: Vec<(u64, f32)>) -> DictBasedScoredIndexResult {
         DictBasedScoredIndexResult::new(entries.into_iter().collect())
     }
@@ -490,7 +487,6 @@ mod tests {
             .as_scored()
             .expect("or should preserve scored results");
         assert_eq!(merged.results().len(), 2);
-        // Overlapping IDs use left-side score (Java semantics)
         assert_eq!(scored.score_getter()(1), 0.3);
         assert_eq!(scored.score_getter()(2), 0.9);
     }

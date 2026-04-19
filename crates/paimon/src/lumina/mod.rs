@@ -290,7 +290,6 @@ impl LuminaIndexMeta {
 mod tests {
     use super::*;
 
-    // Aligned with Java: metric conversions tested indirectly in testDifferentMetrics
     #[test]
     fn test_metric_roundtrip() {
         for metric in [
@@ -308,7 +307,6 @@ mod tests {
         assert!(LuminaVectorMetric::from_string("hamming").is_err());
     }
 
-    // Aligned with Java: testReaderMetaOptionsOverrideDefaultOptions
     #[test]
     fn test_index_meta_serialize_deserialize() {
         let mut options = HashMap::new();
@@ -340,7 +338,6 @@ mod tests {
         assert!(LuminaIndexMeta::deserialize(b"not json").is_err());
     }
 
-    // Aligned with Java: testDimensionMismatch (dim validation)
     #[test]
     fn test_dim_error_on_invalid() {
         let mut opts = HashMap::new();
@@ -349,7 +346,6 @@ mod tests {
         assert!(LuminaIndexMeta::new(opts).dim().is_err());
     }
 
-    // Aligned with Java: testPQWithCosineRejected (options validation)
     #[test]
     fn test_index_options_invalid_dimension() {
         let mut opts = HashMap::new();
