@@ -126,7 +126,7 @@ impl LuminaVectorIndexOptions {
             .cloned()
             .unwrap_or_else(|| "diskann".to_string());
 
-        let lumina_options = build_lumina_options(paimon_options, dimension);
+        let lumina_options = build_lumina_options(paimon_options, dimension)?;
 
         Ok(Self {
             dimension,
@@ -153,24 +153,34 @@ fn validate_encoding_metric(encoding: &str, metric: LuminaVectorMetric) -> crate
     Ok(())
 }
 
-fn cap_pq_m(opts: &mut HashMap<String, String>, dimension: i32) {
+fn validate_and_cap_pq_m(
+    opts: &mut HashMap<String, String>,
+    dimension: i32,
+) -> crate::Result<()> {
     let encoding = opts.get("encoding.type").map(|s| s.as_str()).unwrap_or("");
     if !encoding.eq_ignore_ascii_case("pq") {
-        return;
+        return Ok(());
     }
     if let Some(pq_m_str) = opts.get("encoding.pq.m") {
         if let Ok(pq_m) = pq_m_str.parse::<i32>() {
+            if pq_m <= 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("encoding.pq.m must be positive, got: {}", pq_m),
+                    source: None,
+                });
+            }
             if pq_m > dimension {
                 opts.insert("encoding.pq.m".to_string(), dimension.to_string());
             }
         }
     }
+    Ok(())
 }
 
 fn build_lumina_options(
     paimon_options: &HashMap<String, String>,
     dimension: i32,
-) -> HashMap<String, String> {
+) -> crate::Result<HashMap<String, String>> {
     let mut result = HashMap::new();
 
     for &(paimon_key, default_value) in ALL_OPTIONS_DEFAULTS {
@@ -188,8 +198,8 @@ fn build_lumina_options(
         }
     }
 
-    cap_pq_m(&mut result, dimension);
-    result
+    validate_and_cap_pq_m(&mut result, dimension)?;
+    Ok(result)
 }
 
 pub fn strip_lumina_options(paimon_options: &HashMap<String, String>) -> HashMap<String, String> {
@@ -384,6 +394,14 @@ mod tests {
         opts.insert("lumina.distance.metric".to_string(), "l2".to_string());
         opts.insert("lumina.encoding.type".to_string(), "pq".to_string());
         assert!(LuminaVectorIndexOptions::new(&opts).is_ok());
+    }
+
+    #[test]
+    fn test_pq_m_zero_rejected() {
+        let mut opts = HashMap::new();
+        opts.insert("lumina.index.dimension".to_string(), "128".to_string());
+        opts.insert("lumina.encoding.pq.m".to_string(), "0".to_string());
+        assert!(LuminaVectorIndexOptions::new(&opts).is_err());
     }
 
     #[test]

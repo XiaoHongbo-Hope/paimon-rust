@@ -314,9 +314,13 @@ impl VectorSearch {
                 source: None,
             });
         }
-        if limit == 0 {
+        if limit == 0 || limit > i32::MAX as usize {
             return Err(crate::Error::DataInvalid {
-                message: format!("Limit must be positive, got: {}", limit),
+                message: format!(
+                    "Limit must be between 1 and {}, got: {}",
+                    i32::MAX,
+                    limit
+                ),
                 source: None,
             });
         }
@@ -422,6 +426,7 @@ mod tests {
     #[test]
     fn test_invalid_top_k() {
         assert!(VectorSearch::new(vec![1.0], 0, "f".to_string()).is_err());
+        assert!(VectorSearch::new(vec![1.0], i32::MAX as usize + 1, "f".to_string()).is_err());
     }
 
     #[test]
