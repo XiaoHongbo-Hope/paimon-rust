@@ -26,24 +26,26 @@ const ERR_BUF_SIZE: usize = 4096;
 static LIBRARY: OnceLock<Library> = OnceLock::new();
 
 fn load_library() -> crate::Result<&'static Library> {
-    LIBRARY.get_or_try_init(|| {
-        let lib_path = std::env::var("LUMINA_LIB_PATH").unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                "liblumina_py.dylib".to_string()
-            } else if cfg!(target_os = "windows") {
-                "lumina_py.dll".to_string()
-            } else {
-                "liblumina_py.so".to_string()
-            }
-        });
-
-        unsafe {
-            Library::new(&lib_path).map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to load lumina library from '{}': {}", lib_path, e),
-                source: None,
-            })
+    if let Some(lib) = LIBRARY.get() {
+        return Ok(lib);
+    }
+    let lib_path = std::env::var("LUMINA_LIB_PATH").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "liblumina_py.dylib".to_string()
+        } else if cfg!(target_os = "windows") {
+            "lumina_py.dll".to_string()
+        } else {
+            "liblumina_py.so".to_string()
         }
-    })
+    });
+    let lib = unsafe {
+        Library::new(&lib_path).map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to load lumina library from '{}': {}", lib_path, e),
+            source: None,
+        })?
+    };
+    let _ = LIBRARY.set(lib);
+    Ok(LIBRARY.get().unwrap())
 }
 
 fn check_error(ret: c_int, err_buf: &[u8; ERR_BUF_SIZE]) -> crate::Result<()> {

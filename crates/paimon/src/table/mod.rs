@@ -49,8 +49,6 @@ mod table_read;
 mod table_scan;
 pub(crate) mod table_write;
 mod tag_manager;
-#[cfg(feature = "lumina")]
-pub mod vector_search_builder;
 mod write_builder;
 
 use crate::Result;
@@ -73,8 +71,6 @@ pub use table_read::TableRead;
 pub use table_scan::TableScan;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
-#[cfg(feature = "lumina")]
-pub use vector_search_builder::VectorSearchBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
@@ -151,14 +147,6 @@ impl Table {
     #[cfg(feature = "fulltext")]
     pub fn new_full_text_search_builder(&self) -> FullTextSearchBuilder<'_> {
         FullTextSearchBuilder::new(self)
-    }
-
-    /// Create a vector search builder.
-    ///
-    /// Reference: [VectorSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/VectorSearchBuilderImpl.java)
-    #[cfg(feature = "lumina")]
-    pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
-        VectorSearchBuilder::from_table(self)
     }
 
     /// Create a write builder for write/commit.
