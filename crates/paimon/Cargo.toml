@@ -87,12 +87,9 @@ uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
-<<<<<<< HEAD
 vortex = { version = "0.68", features = ["tokio"], optional = true }
 kanal = { version = "0.1.1", optional = true }
-=======
 libloading = { version = "0.8", optional = true }
->>>>>>> 2c6608c (feat: add Lumina vector index read infrastructure)
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
