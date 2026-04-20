@@ -30,7 +30,10 @@ pub mod btree;
 pub mod catalog;
 mod deletion_vector;
 pub mod file_index;
+pub mod globalindex;
 pub mod io;
+#[cfg(feature = "lumina")]
+pub mod lumina;
 mod predicate_stats;
 pub mod spec;
 pub mod table;
