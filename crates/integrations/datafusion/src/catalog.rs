@@ -66,7 +66,15 @@ impl CatalogProvider for PaimonCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         block_on_with_runtime(
-            async move { catalog.list_databases().await.unwrap_or_default() },
+            async move {
+                match catalog.list_databases().await {
+                    Ok(names) => names,
+                    Err(e) => {
+                        log::error!("failed to list databases: {e}");
+                        vec![]
+                    }
+                }
+            },
             "paimon catalog access thread panicked",
         )
     }
@@ -82,7 +90,10 @@ impl CatalogProvider for PaimonCatalogProvider {
                             as Arc<dyn SchemaProvider>,
                     ),
                     Err(paimon::Error::DatabaseNotExist { .. }) => None,
-                    Err(_) => None,
+                    Err(e) => {
+                        log::error!("failed to get database '{}': {e}", name);
+                        None
+                    }
                 }
             },
             "paimon catalog access thread panicked",
@@ -170,7 +181,15 @@ impl SchemaProvider for PaimonSchemaProvider {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();
         block_on_with_runtime(
-            async move { catalog.list_tables(&database).await.unwrap_or_default() },
+            async move {
+                match catalog.list_tables(&database).await {
+                    Ok(names) => names,
+                    Err(e) => {
+                        log::error!("failed to list tables in '{}': {e}", database);
+                        vec![]
+                    }
+                }
+            },
             "paimon catalog access thread panicked",
         )
     }
@@ -217,7 +236,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                 match catalog.get_table(&identifier).await {
                     Ok(_) => true,
                     Err(paimon::Error::TableNotExist { .. }) => false,
-                    Err(_) => false,
+                    Err(e) => {
+                        log::error!("failed to check table '{}': {e}", identifier);
+                        false
+                    }
                 }
             },
             "paimon catalog access thread panicked",
