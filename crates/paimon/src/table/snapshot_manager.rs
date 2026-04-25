@@ -20,6 +20,7 @@
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 use crate::io::FileIO;
 use crate::spec::Snapshot;
+use futures::future::try_join_all;
 use std::str;
 
 const SNAPSHOT_DIR: &str = "snapshot";
@@ -148,6 +149,37 @@ impl SnapshotManager {
             }
         }
         self.find_by_list_files(i64::min).await
+    }
+
+    /// List all snapshot ids sorted ascending. Returns an empty vector when
+    /// the snapshot directory does not exist.
+    pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
+        let snapshot_dir = self.snapshot_dir();
+        let statuses = match self.file_io.list_status(&snapshot_dir).await {
+            Ok(s) => s,
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut ids: Vec<i64> = statuses
+            .into_iter()
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                let name = s.path.rsplit('/').next().unwrap_or(&s.path);
+                name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<i64>().ok()
+            })
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// List all snapshots sorted by id ascending.
+    pub async fn list_all(&self) -> crate::Result<Vec<Snapshot>> {
+        let ids = self.list_all_ids().await?;
+        try_join_all(ids.into_iter().map(|id| self.get_snapshot(id))).await
     }
 
     /// Get a snapshot by id.
@@ -365,5 +397,39 @@ mod tests {
         sm.write_latest_hint(42).await.unwrap();
         let hint = sm.read_hint(&sm.latest_hint_path()).await;
         assert_eq!(hint, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_empty() {
+        let (_, sm) = setup("memory:/test_list_empty").await;
+        assert!(sm.list_all_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_missing_dir_returns_empty() {
+        let file_io = test_file_io();
+        let sm = SnapshotManager::new(file_io, "memory:/test_list_missing".to_string());
+        assert!(sm.list_all_ids().await.unwrap().is_empty());
+        assert!(sm.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_ids_sorted() {
+        let (_, sm) = setup("memory:/test_list_sorted").await;
+        for id in [3, 1, 2] {
+            sm.commit_snapshot(&test_snapshot(id)).await.unwrap();
+        }
+        assert_eq!(sm.list_all_ids().await.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_loads_in_order() {
+        let (_, sm) = setup("memory:/test_list_all").await;
+        for id in [2, 1, 3] {
+            sm.commit_snapshot(&test_snapshot(id)).await.unwrap();
+        }
+        let snaps = sm.list_all().await.unwrap();
+        let ids: Vec<i64> = snaps.iter().map(|s| s.id()).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
