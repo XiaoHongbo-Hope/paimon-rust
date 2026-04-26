@@ -1046,3 +1046,93 @@ mod fulltext_tests {
         assert!(ids.contains(&3), "Searching 'search' should match row 3");
     }
 }
+
+// ======================= Vector Search Tests =======================
+
+mod vector_search_tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::prelude::SessionContext;
+    use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+    use paimon_datafusion::{register_vector_search, PaimonCatalogProvider};
+
+    fn extract_test_warehouse() -> (tempfile::TempDir, String) {
+        let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/test_lumina_vector.tar.gz");
+        let file = std::fs::File::open(&archive_path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", archive_path.display()));
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+
+        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_dir = tmp.path().join("default.db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        archive.unpack(&db_dir).unwrap();
+
+        let warehouse = format!("file://{}", tmp.path().display());
+        (tmp, warehouse)
+    }
+
+    async fn create_vector_search_context() -> (SessionContext, tempfile::TempDir) {
+        let (tmp, warehouse) = extract_test_warehouse();
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "paimon",
+            Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
+        );
+        register_vector_search(&ctx, catalog, "default");
+        (ctx, tmp)
+    }
+
+    fn extract_ids(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for id");
+            for i in 0..batch.num_rows() {
+                ids.push(id_array.value(i));
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_top3() {
+        let (ctx, _tmp) = create_vector_search_context().await;
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let ids = extract_ids(&batches);
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&0), "exact match [1,0,0,0] should be in top 3");
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_top6_returns_all() {
+        let (ctx, _tmp) = create_vector_search_context().await;
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 6)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let ids = extract_ids(&batches);
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+    }
+}

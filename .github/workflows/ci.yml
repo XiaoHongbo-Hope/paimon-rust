@@ -110,6 +110,11 @@ jobs:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
 
+      - name: Install lumina native library
+        run: |
+          pip install lumina-data
+          echo "LUMINA_LIB_PATH=$(python3 -c 'import lumina_data; print(lumina_data.__path__[0])')/lib/liblumina_py.so" >> $GITHUB_ENV
+
       - name: DataFusion Integration Test
         run: cargo test -p paimon-datafusion --all-targets
         env:
