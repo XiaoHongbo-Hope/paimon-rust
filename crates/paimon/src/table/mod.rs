@@ -77,7 +77,7 @@ pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::TableSchema;
+use crate::spec::{DataField, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -177,3 +177,7 @@ impl Table {
 
 /// A stream of arrow [`RecordBatch`]es.
 pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
+
+pub(crate) fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
+    fields.iter().find(|f| f.name() == name).map(|f| f.id())
+}

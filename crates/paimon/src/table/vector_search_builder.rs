@@ -19,7 +19,7 @@ use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{GlobalIndexIOMeta, SearchResult, VectorSearch, LUMINA_VECTOR_ANN_IDENTIFIER};
 use crate::spec::{DataField, FileKind, IndexManifest};
 use crate::table::snapshot_manager::SnapshotManager;
-use crate::table::{RowRange, Table};
+use crate::table::{find_field_id_by_name, RowRange, Table};
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -184,11 +184,7 @@ async fn evaluate_vector_search(
         merged = merged.or(r);
     }
 
-    Ok(merged.top_k(vector_search.limit).to_row_ranges())
-}
-
-fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
-    fields.iter().find(|f| f.name() == name).map(|f| f.id())
+    merged.top_k(vector_search.limit).to_row_ranges()
 }
 
 #[cfg(test)]

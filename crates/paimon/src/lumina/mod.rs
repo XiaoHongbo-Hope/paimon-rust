@@ -448,19 +448,32 @@ impl SearchResult {
         Self { row_ids, scores }
     }
 
-    pub fn to_row_ranges(&self) -> Vec<crate::table::RowRange> {
+    pub fn to_row_ranges(&self) -> crate::Result<Vec<crate::table::RowRange>> {
         if self.row_ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let mut sorted: Vec<u64> = self.row_ids.clone();
+
+        let mut sorted = self
+            .row_ids
+            .iter()
+            .copied()
+            .map(|id| {
+                i64::try_from(id).map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "Lumina search row id {id} exceeds i64::MAX and cannot be converted to RowRange"
+                    ),
+                    source: None,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
         sorted.sort_unstable();
         sorted.dedup();
         let mut ranges = Vec::new();
-        let mut start = sorted[0] as i64;
+        let mut start = sorted[0];
         let mut end = start;
         for &id in &sorted[1..] {
-            let id = id as i64;
-            if id == end + 1 {
+            if end.checked_add(1) == Some(id) {
                 end = id;
             } else {
                 ranges.push(crate::table::RowRange::new(start, end));
@@ -469,7 +482,7 @@ impl SearchResult {
             }
         }
         ranges.push(crate::table::RowRange::new(start, end));
-        ranges
+        Ok(ranges)
     }
 }
 
@@ -676,7 +689,7 @@ mod tests {
     #[test]
     fn test_search_result_to_row_ranges() {
         let result = SearchResult::new(vec![5, 1, 2, 3, 10], vec![0.1; 5]);
-        let ranges = result.to_row_ranges();
+        let ranges = result.to_row_ranges().unwrap();
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].from(), 1);
         assert_eq!(ranges[0].to(), 3);
@@ -684,5 +697,15 @@ mod tests {
         assert_eq!(ranges[1].to(), 5);
         assert_eq!(ranges[2].from(), 10);
         assert_eq!(ranges[2].to(), 10);
+    }
+
+    #[test]
+    fn test_search_result_to_row_ranges_rejects_i64_overflow() {
+        let result = SearchResult::new(vec![i64::MAX as u64 + 1], vec![0.1]);
+        let err = result.to_row_ranges().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds i64::MAX"),
+            "unexpected error: {err}"
+        );
     }
 }
