@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::globalindex::{
-    DictBasedScoredIndexResult, GlobalIndexIOMeta, ScoredGlobalIndexResult, VectorSearch,
-};
 use crate::lumina::ffi::LuminaSearcher;
-use crate::lumina::{strip_lumina_options, LuminaIndexMeta, LuminaVectorMetric};
+use crate::lumina::{
+    strip_lumina_options, GlobalIndexIOMeta, LuminaIndexMeta, LuminaVectorMetric, VectorSearch,
+};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -116,15 +115,12 @@ impl LuminaVectorGlobalIndexReader {
         &mut self,
         vector_search: &VectorSearch,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
-    ) -> crate::Result<Option<Box<dyn ScoredGlobalIndexResult>>> {
+    ) -> crate::Result<Option<HashMap<u64, f32>>> {
         self.ensure_loaded(stream_fn)?;
         self.search(vector_search)
     }
 
-    fn search(
-        &self,
-        vector_search: &VectorSearch,
-    ) -> crate::Result<Option<Box<dyn ScoredGlobalIndexResult>>> {
+    fn search(&self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
         let index_meta = self
             .index_meta
             .as_ref()
@@ -211,9 +207,7 @@ impl LuminaVectorGlobalIndexReader {
             return Ok(None);
         }
 
-        Ok(Some(Box::new(DictBasedScoredIndexResult::new(
-            id_to_scores,
-        ))))
+        Ok(Some(id_to_scores))
     }
 
     fn ensure_loaded<S: Read + Seek + Send + 'static>(
@@ -226,9 +220,9 @@ impl LuminaVectorGlobalIndexReader {
 
         let index_meta = LuminaIndexMeta::deserialize(&self.io_meta.metadata)?;
 
-        let mut searcher_options = strip_lumina_options(&self.options);
-        for (k, v) in index_meta.options().iter() {
-            searcher_options.insert(k.to_string(), v.to_string());
+        let mut searcher_options = index_meta.options().clone();
+        for (k, v) in strip_lumina_options(&self.options) {
+            searcher_options.insert(k, v);
         }
 
         let mut searcher = LuminaSearcher::create(&searcher_options)?;
@@ -258,7 +252,7 @@ impl Drop for LuminaVectorGlobalIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::globalindex::GlobalIndexIOMeta;
+    use crate::lumina::GlobalIndexIOMeta;
 
     #[test]
     fn test_convert_distance_to_score() {

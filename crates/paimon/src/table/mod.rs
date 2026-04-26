@@ -49,6 +49,7 @@ mod table_read;
 mod table_scan;
 pub(crate) mod table_write;
 mod tag_manager;
+mod vector_search_builder;
 mod write_builder;
 
 use crate::Result;
@@ -71,6 +72,7 @@ pub use table_read::TableRead;
 pub use table_scan::TableScan;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
+pub use vector_search_builder::VectorSearchBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
@@ -147,6 +149,10 @@ impl Table {
     #[cfg(feature = "fulltext")]
     pub fn new_full_text_search_builder(&self) -> FullTextSearchBuilder<'_> {
         FullTextSearchBuilder::new(self)
+    }
+
+    pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
+        VectorSearchBuilder::new(self)
     }
 
     /// Create a write builder for write/commit.

@@ -39,7 +39,6 @@ storage-fs = ["opendal/services-fs"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3"]
 storage-hdfs = ["opendal/services-hdfs-native"]
-lumina = ["libloading"]
 
 [dependencies]
 url = "2.5.2"
@@ -89,7 +88,7 @@ tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
 vortex = { version = "0.68", features = ["tokio"], optional = true }
 kanal = { version = "0.1.1", optional = true }
-libloading = { version = "0.8", optional = true }
+libloading = "0.8"
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
