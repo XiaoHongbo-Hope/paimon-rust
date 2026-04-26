@@ -369,12 +369,10 @@ impl GlobalIndexScanner {
     }
 
     fn find_field_id_by_name(&self, column: &str) -> Result<Option<i32>> {
-        for field in &self.schema_fields {
-            if field.name() == column {
-                return Ok(Some(field.id()));
-            }
-        }
-        Ok(None)
+        Ok(crate::table::find_field_id_by_name(
+            &self.schema_fields,
+            column,
+        ))
     }
 
     fn entries_for_field(&self, field_id: i32) -> Option<&[GlobalIndexEntry]> {

@@ -49,7 +49,9 @@ pub mod runtime;
 mod sql_handler;
 mod system_tables;
 mod table;
+mod table_function_args;
 mod update;
+mod vector_search;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -68,3 +70,4 @@ pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
 pub use sql_handler::PaimonSqlHandler;
 pub use table::PaimonTableProvider;
+pub use vector_search::{register_vector_search, VectorSearchFunction};
