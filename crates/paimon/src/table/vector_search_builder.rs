@@ -151,11 +151,7 @@ async fn evaluate_vector_search(
             let file_size = entry.index_file.file_size as u64;
             let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
             let row_range_start = global_meta.row_range_start;
-            let vector_search_clone = VectorSearch::new(
-                vector_search.vector.clone(),
-                vector_search.limit,
-                vector_search.field_name.clone(),
-            );
+            let vector_search_clone = vector_search.clone();
             let options = table_options.clone();
             let input = file_io.new_input(&path);
             async move {
@@ -168,10 +164,9 @@ async fn evaluate_vector_search(
                 let io_meta =
                     GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
                 let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
-                let vs = vector_search_clone?;
-
                 let data = bytes.to_vec();
-                let result = reader.visit_vector_search(&vs, |_| Ok(Cursor::new(data)))?;
+                let result =
+                    reader.visit_vector_search(&vector_search_clone, |_| Ok(Cursor::new(data)))?;
 
                 match result {
                     Some(scored_map) => Ok::<_, crate::Error>(

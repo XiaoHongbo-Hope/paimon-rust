@@ -30,11 +30,16 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use paimon::catalog::{Catalog, Identifier};
+use paimon::catalog::Catalog;
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::table::{PaimonScanBuilder, PaimonTableProvider};
+use crate::table_function_args::{
+    extract_int_literal, extract_string_literal, parse_table_identifier,
+};
+
+const FUNCTION_NAME: &str = "vector_search";
 
 pub fn register_vector_search(
     ctx: &SessionContext,
@@ -77,10 +82,11 @@ impl TableFunctionImpl for VectorSearchFunction {
             ));
         }
 
-        let table_name = extract_string_literal(&args[0], "table_name")?;
-        let column_name = extract_string_literal(&args[1], "column_name")?;
-        let query_vector_json = extract_string_literal(&args[2], "query_vector_json")?;
-        let limit = extract_int_literal(&args[3], "limit")?;
+        let table_name = extract_string_literal(FUNCTION_NAME, &args[0], "table_name")?;
+        let column_name = extract_string_literal(FUNCTION_NAME, &args[1], "column_name")?;
+        let query_vector_json =
+            extract_string_literal(FUNCTION_NAME, &args[2], "query_vector_json")?;
+        let limit = extract_int_literal(FUNCTION_NAME, &args[3], "limit")?;
 
         if limit <= 0 {
             return Err(datafusion::error::DataFusionError::Plan(
@@ -101,7 +107,8 @@ impl TableFunctionImpl for VectorSearchFunction {
             ));
         }
 
-        let identifier = parse_table_identifier(&table_name, &self.default_database)?;
+        let identifier =
+            parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
 
         let catalog = Arc::clone(&self.catalog);
         let table = block_on_with_runtime(
@@ -198,59 +205,5 @@ impl TableProvider for VectorSearchTableProvider {
             TableProviderFilterPushDown::Unsupported;
             filters.len()
         ])
-    }
-}
-
-fn extract_string_literal(expr: &Expr, name: &str) -> DFResult<String> {
-    match expr {
-        Expr::Literal(scalar, _) => {
-            let s = scalar.try_as_str().flatten().ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(format!(
-                    "vector_search: {name} must be a string literal, got: {expr}"
-                ))
-            })?;
-            Ok(s.to_string())
-        }
-        _ => Err(datafusion::error::DataFusionError::Plan(format!(
-            "vector_search: {name} must be a literal, got: {expr}"
-        ))),
-    }
-}
-
-fn extract_int_literal(expr: &Expr, name: &str) -> DFResult<i64> {
-    use datafusion::common::ScalarValue;
-    match expr {
-        Expr::Literal(scalar, _) => match scalar {
-            ScalarValue::Int8(Some(v)) => Ok(*v as i64),
-            ScalarValue::Int16(Some(v)) => Ok(*v as i64),
-            ScalarValue::Int32(Some(v)) => Ok(*v as i64),
-            ScalarValue::Int64(Some(v)) => Ok(*v),
-            ScalarValue::UInt8(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt16(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt32(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt64(Some(v)) => i64::try_from(*v).map_err(|_| {
-                datafusion::error::DataFusionError::Plan(format!(
-                    "vector_search: {name} value {v} exceeds i64 range"
-                ))
-            }),
-            _ => Err(datafusion::error::DataFusionError::Plan(format!(
-                "vector_search: {name} must be an integer literal, got: {expr}"
-            ))),
-        },
-        _ => Err(datafusion::error::DataFusionError::Plan(format!(
-            "vector_search: {name} must be a literal, got: {expr}"
-        ))),
-    }
-}
-
-fn parse_table_identifier(name: &str, default_database: &str) -> DFResult<Identifier> {
-    let parts: Vec<&str> = name.split('.').collect();
-    match parts.len() {
-        1 => Ok(Identifier::new(default_database, parts[0])),
-        2 => Ok(Identifier::new(parts[0], parts[1])),
-        3 => Ok(Identifier::new(parts[1], parts[2])),
-        _ => Err(datafusion::error::DataFusionError::Plan(format!(
-            "vector_search: invalid table name '{name}', expected 'table', 'database.table', or 'catalog.database.table'"
-        ))),
     }
 }

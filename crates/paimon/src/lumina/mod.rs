@@ -214,6 +214,7 @@ pub fn strip_lumina_options(paimon_options: &HashMap<String, String>) -> HashMap
     result
 }
 
+#[derive(Clone)]
 pub struct VectorSearch {
     pub vector: Vec<f32>,
     pub limit: usize,
@@ -619,6 +620,23 @@ mod tests {
         assert_eq!(lumina_opts.get("diskann.search.beam_width").unwrap(), "4");
         assert_eq!(lumina_opts.get("encoding.pq.m").unwrap(), "64");
         assert_eq!(lumina_opts.get("search.parallel_number").unwrap(), "5");
+    }
+
+    #[test]
+    fn test_vector_search_clone_preserves_include_row_ids() {
+        let mut include_row_ids = roaring::RoaringTreemap::new();
+        include_row_ids.insert(1);
+        include_row_ids.insert(3);
+
+        let vector_search = VectorSearch::new(vec![1.0, 2.0], 10, "embedding".to_string())
+            .unwrap()
+            .with_include_row_ids(include_row_ids.clone());
+
+        let cloned = vector_search.clone();
+        assert_eq!(cloned.vector, vector_search.vector);
+        assert_eq!(cloned.limit, vector_search.limit);
+        assert_eq!(cloned.field_name, vector_search.field_name);
+        assert_eq!(cloned.include_row_ids.as_ref(), Some(&include_row_ids));
     }
 
     #[test]

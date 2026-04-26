@@ -19,16 +19,28 @@ use libloading::{Library, Symbol};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_float, c_int, c_void, CStr, CString};
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const ERR_BUF_SIZE: usize = 4096;
 
 static LIBRARY: OnceLock<Library> = OnceLock::new();
+static LIBRARY_LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 fn load_library() -> crate::Result<&'static Library> {
     if let Some(lib) = LIBRARY.get() {
         return Ok(lib);
     }
+
+    let _guard = LIBRARY_LOAD_LOCK
+        .lock()
+        .map_err(|_| crate::Error::UnexpectedError {
+            message: "Lumina library load lock poisoned".to_string(),
+            source: None,
+        })?;
+    if let Some(lib) = LIBRARY.get() {
+        return Ok(lib);
+    }
+
     let lib_path = std::env::var("LUMINA_LIB_PATH").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "liblumina_py.dylib".to_string()
@@ -44,8 +56,16 @@ fn load_library() -> crate::Result<&'static Library> {
             source: None,
         })?
     };
-    let _ = LIBRARY.set(lib);
-    Ok(LIBRARY.get().unwrap())
+    LIBRARY
+        .set(lib)
+        .map_err(|_| crate::Error::UnexpectedError {
+            message: "Lumina library was initialized unexpectedly while holding load lock"
+                .to_string(),
+            source: None,
+        })?;
+    Ok(LIBRARY
+        .get()
+        .expect("Lumina library should be initialized after successful set"))
 }
 
 fn check_error(ret: c_int, err_buf: &[u8; ERR_BUF_SIZE]) -> crate::Result<()> {

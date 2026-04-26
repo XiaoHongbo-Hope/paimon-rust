@@ -48,6 +48,7 @@ pub mod runtime;
 mod sql_handler;
 mod system_tables;
 mod table;
+mod table_function_args;
 mod update;
 mod vector_search;
 
