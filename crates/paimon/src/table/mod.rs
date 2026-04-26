@@ -52,6 +52,7 @@ mod table_read;
 mod table_scan;
 pub(crate) mod table_write;
 mod tag_manager;
+mod vector_search_builder;
 mod write_builder;
 
 use crate::Result;
@@ -75,11 +76,12 @@ pub use table_read::TableRead;
 pub use table_scan::TableScan;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
+pub use vector_search_builder::VectorSearchBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::TableSchema;
+use crate::spec::{DataField, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -153,6 +155,10 @@ impl Table {
         FullTextSearchBuilder::new(self)
     }
 
+    pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
+        VectorSearchBuilder::new(self)
+    }
+
     /// Create a write builder for write/commit.
     ///
     /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
@@ -175,3 +181,7 @@ impl Table {
 
 /// A stream of arrow [`RecordBatch`]es.
 pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
+
+pub(crate) fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
+    fields.iter().find(|f| f.name() == name).map(|f| f.id())
+}

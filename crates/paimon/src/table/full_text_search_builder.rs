@@ -21,7 +21,7 @@
 
 use crate::spec::{DataField, FileKind, IndexManifest};
 use crate::table::snapshot_manager::SnapshotManager;
-use crate::table::{RowRange, Table};
+use crate::table::{find_field_id_by_name, RowRange, Table};
 use crate::tantivy::full_text_search::{FullTextSearch, SearchResult};
 use crate::tantivy::reader::TantivyFullTextReader;
 
@@ -200,8 +200,4 @@ async fn evaluate_full_text_search(
     }
 
     Ok(merged.top_k(search.limit).to_row_ranges())
-}
-
-fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
-    fields.iter().find(|f| f.name() == name).map(|f| f.id())
 }
