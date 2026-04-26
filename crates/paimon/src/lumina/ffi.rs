@@ -169,6 +169,42 @@ impl LuminaSearcher {
         Ok(())
     }
 
+    pub fn open_file(&mut self, path: &str) -> crate::Result<()> {
+        if self.stream_ctx_keepalive.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "A stream is already open; close the searcher before opening a file"
+                    .to_string(),
+                source: None,
+            });
+        }
+
+        let lib = load_library()?;
+        let c_path = CString::new(path).map_err(|e| crate::Error::DataInvalid {
+            message: format!("Invalid path: {}", e),
+            source: None,
+        })?;
+        let mut err_buf = [0u8; ERR_BUF_SIZE];
+
+        let ret: c_int = unsafe {
+            let func: Symbol<
+                unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_char, c_int) -> c_int,
+            > = lib
+                .get(b"lumina_searcher_open")
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("Symbol lumina_searcher_open not found: {}", e),
+                    source: None,
+                })?;
+            func(
+                self.handle,
+                c_path.as_ptr(),
+                err_buf.as_mut_ptr() as *mut c_char,
+                ERR_BUF_SIZE as c_int,
+            )
+        };
+
+        check_error(ret, &err_buf)
+    }
+
     pub fn search(
         &self,
         query: &[f32],

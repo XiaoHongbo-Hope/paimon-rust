@@ -21,7 +21,8 @@ use crate::lumina::{
 };
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 const MIN_SEARCH_LIST_SIZE: usize = 16;
 // C ABI returns int64_t -1 for invalid results, which casts to u64::MAX in Rust.
@@ -98,6 +99,7 @@ pub struct LuminaVectorGlobalIndexReader {
     searcher: Option<LuminaSearcher>,
     index_meta: Option<LuminaIndexMeta>,
     search_options: Option<HashMap<String, String>>,
+    local_index_file: Option<PathBuf>,
 }
 
 impl LuminaVectorGlobalIndexReader {
@@ -108,6 +110,7 @@ impl LuminaVectorGlobalIndexReader {
             searcher: None,
             index_meta: None,
             search_options: None,
+            local_index_file: None,
         }
     }
 
@@ -227,12 +230,27 @@ impl LuminaVectorGlobalIndexReader {
 
         let mut searcher = LuminaSearcher::create(&searcher_options)?;
 
-        let stream = stream_fn(&self.io_meta.file_path)?;
-        searcher.open_stream(stream)?;
+        let mut stream = stream_fn(&self.io_meta.file_path)?;
+        let local_index_file = write_temp_index_file(&mut stream)?;
+        let local_index_path =
+            local_index_file
+                .to_str()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Temporary Lumina index path is not valid UTF-8: {}",
+                        local_index_file.display()
+                    ),
+                    source: None,
+                })?;
+        if let Err(err) = searcher.open_file(local_index_path) {
+            let _ = std::fs::remove_file(&local_index_file);
+            return Err(err);
+        }
 
         self.search_options = Some(searcher_options);
         self.index_meta = Some(index_meta);
         self.searcher = Some(searcher);
+        self.local_index_file = Some(local_index_file);
         Ok(())
     }
 
@@ -240,7 +258,49 @@ impl LuminaVectorGlobalIndexReader {
         self.searcher = None;
         self.index_meta = None;
         self.search_options = None;
+        if let Some(path) = self.local_index_file.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
+}
+
+fn write_temp_index_file<S: Read + Seek>(stream: &mut S) -> crate::Result<PathBuf> {
+    stream
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| crate::Error::UnexpectedError {
+            message: format!("Failed to seek Lumina index stream to start: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+
+    let path = std::env::temp_dir().join(format!(
+        "paimon-lumina-index-{}.index",
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = std::fs::File::create(&path).map_err(|e| crate::Error::UnexpectedError {
+        message: format!(
+            "Failed to create temporary Lumina index file '{}': {}",
+            path.display(),
+            e
+        ),
+        source: Some(Box::new(e)),
+    })?;
+    std::io::copy(stream, &mut file).map_err(|e| crate::Error::UnexpectedError {
+        message: format!(
+            "Failed to write temporary Lumina index file '{}': {}",
+            path.display(),
+            e
+        ),
+        source: Some(Box::new(e)),
+    })?;
+    file.sync_all().map_err(|e| crate::Error::UnexpectedError {
+        message: format!(
+            "Failed to sync temporary Lumina index file '{}': {}",
+            path.display(),
+            e
+        ),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(path)
 }
 
 impl Drop for LuminaVectorGlobalIndexReader {
@@ -253,6 +313,7 @@ impl Drop for LuminaVectorGlobalIndexReader {
 mod tests {
     use super::*;
     use crate::lumina::GlobalIndexIOMeta;
+    use std::io::Cursor;
 
     #[test]
     fn test_convert_distance_to_score() {
@@ -306,5 +367,18 @@ mod tests {
         let m = GlobalIndexIOMeta::new("a".into(), 100, vec![]);
         let reader = LuminaVectorGlobalIndexReader::new(m, HashMap::new());
         assert!(reader.searcher.is_none());
+    }
+
+    #[test]
+    fn test_write_temp_index_file_copies_stream() {
+        let bytes = b"lumina-index-bytes".to_vec();
+        let mut stream = Cursor::new(bytes.clone());
+        stream.seek(SeekFrom::End(0)).unwrap();
+
+        let path = write_temp_index_file(&mut stream).unwrap();
+        let actual = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(actual, bytes);
     }
 }

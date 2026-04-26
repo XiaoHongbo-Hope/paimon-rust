@@ -1135,4 +1135,22 @@ mod vector_search_tests {
         let ids = extract_ids(&batches);
         assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
     }
+
+    #[tokio::test]
+    async fn test_vector_search_without_matching_index_returns_empty() {
+        let (ctx, _tmp) = create_vector_search_context().await;
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "vector_search without a matching Lumina index should not fall back to a full table scan"
+        );
+    }
 }
