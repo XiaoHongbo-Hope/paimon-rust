@@ -19,6 +19,7 @@
 
 pub(crate) mod bin_pack;
 mod blob_file_writer;
+mod branch_manager;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -57,6 +58,7 @@ mod write_builder;
 
 use crate::Result;
 use arrow_array::RecordBatch;
+pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::DataEvolutionWriter;

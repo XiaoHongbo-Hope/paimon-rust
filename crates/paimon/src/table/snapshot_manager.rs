@@ -55,6 +55,12 @@ impl SnapshotManager {
         format!("{}/{}", self.table_path, SNAPSHOT_DIR)
     }
 
+    /// Create a SnapshotManager for a branch of this table.
+    pub fn with_branch(&self, branch_name: &str) -> Self {
+        let branch_path = format!("{}/branch/branch-{}", self.table_path, branch_name);
+        Self::new(self.file_io.clone(), branch_path)
+    }
+
     /// Path to the LATEST hint file.
     fn latest_hint_path(&self) -> String {
         format!("{}/{}", self.snapshot_dir(), LATEST_HINT)

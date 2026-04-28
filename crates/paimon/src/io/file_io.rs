@@ -213,6 +213,17 @@ impl FileIO {
         Ok(())
     }
 
+    /// Copy a file from src to dst.
+    ///
+    /// Overwrites dst if it already exists.
+    pub async fn copy_file(&self, src: &str, dst: &str) -> Result<()> {
+        let input = self.new_input(src)?;
+        let bytes = input.read().await?;
+        let output = self.new_output(dst)?;
+        output.write(bytes).await?;
+        Ok(())
+    }
+
     /// Renames the file/directory src to dst.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>

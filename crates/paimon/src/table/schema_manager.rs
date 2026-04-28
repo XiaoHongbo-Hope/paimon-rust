@@ -62,8 +62,18 @@ impl SchemaManager {
         format!("{}/{}", self.table_path.trim_end_matches('/'), SCHEMA_DIR)
     }
 
+    /// Create a SchemaManager for a branch of this table.
+    pub fn with_branch(&self, branch_name: &str) -> Self {
+        let branch_path = format!(
+            "{}/branch/branch-{}",
+            self.table_path.trim_end_matches('/'),
+            branch_name
+        );
+        Self::new(self.file_io.clone(), branch_path)
+    }
+
     /// Path to a specific schema file (e.g. `{table_path}/schema/schema-0`).
-    fn schema_path(&self, schema_id: i64) -> String {
+    pub fn schema_path(&self, schema_id: i64) -> String {
         format!("{}/{}{}", self.schema_directory(), SCHEMA_PREFIX, schema_id)
     }
 

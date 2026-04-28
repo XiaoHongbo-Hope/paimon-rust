@@ -330,6 +330,63 @@ async fn test_snapshots_system_table() {
 }
 
 #[tokio::test]
+async fn test_branches_system_table_empty_when_no_branch_dir() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$branches");
+    let batches = run_sql(&ctx, &sql).await;
+
+    // Schema must be present even with zero rows.
+    assert!(!batches.is_empty(), "$branches should return ≥1 batch");
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("branch_name", DataType::Utf8),
+        (
+            "create_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 0, "fixture has no branch dir, expected 0 rows");
+}
+
+#[tokio::test]
+async fn test_branches_system_table_with_seeded_branches() {
+    let (ctx, _catalog, tmp) = create_context().await;
+
+    let table_dir = tmp.path().join("default.db").join(FIXTURE_TABLE);
+    let branch_dir = table_dir.join("branch");
+    std::fs::create_dir_all(&branch_dir).expect("create branch dir");
+    std::fs::create_dir_all(branch_dir.join("branch-b1")).unwrap();
+    std::fs::create_dir_all(branch_dir.join("branch-b2")).unwrap();
+
+    let sql = format!("SELECT branch_name FROM paimon.default.{FIXTURE_TABLE}$branches");
+    let batches = run_sql(&ctx, &sql).await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "expected two seeded branches");
+
+    let mut names: Vec<String> = Vec::new();
+    for batch in &batches {
+        let names_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("branch_name is Utf8");
+        for i in 0..batch.num_rows() {
+            names.push(names_col.value(i).to_string());
+        }
+    }
+    let mut sorted_names = names.clone();
+    sorted_names.sort();
+    assert_eq!(names, sorted_names, "branch_name should be ascending");
+    assert_eq!(names, vec!["b1".to_string(), "b2".to_string()]);
+}
+
+#[tokio::test]
 async fn test_tags_system_table_empty_when_no_tag_dir() {
     let (ctx, _catalog, _tmp) = create_context().await;
     let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$tags");

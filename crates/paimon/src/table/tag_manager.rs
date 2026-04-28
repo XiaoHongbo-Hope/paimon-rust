@@ -53,6 +53,12 @@ impl TagManager {
         format!("{}/{}", self.table_path, TAG_DIR)
     }
 
+    /// Create a TagManager for a branch of this table.
+    pub fn with_branch(&self, branch_name: &str) -> Self {
+        let branch_path = format!("{}/branch/branch-{}", self.table_path, branch_name);
+        Self::new(self.file_io.clone(), branch_path)
+    }
+
     /// Path to the tag file for the given name (e.g. `tag/tag-my_tag`).
     pub fn tag_path(&self, tag_name: &str) -> String {
         format!("{}/{}{}", self.tag_directory(), TAG_PREFIX, tag_name)
