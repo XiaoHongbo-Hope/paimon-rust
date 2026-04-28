@@ -29,6 +29,9 @@
 //! - `ALTER TABLE db.t DROP COLUMN col`
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
 //! - `ALTER TABLE db.t RENAME TO new_name`
+//! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
+//! - `TRUNCATE TABLE db.t`
+//! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,7 +48,7 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, Expr as SqlExpr,
     FromTable, Insert, Merge, ObjectName, RenameTableNameKind, Reset, ResetStatement, Set,
-    SqlOption, Statement, TableFactor, TableObject, Update, Value as SqlValue,
+    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -195,6 +198,7 @@ impl PaimonSqlHandler {
                 }
                 self.ctx.sql(sql).await
             }
+            Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
             _ => self.ctx.sql(sql).await,
         }
     }
@@ -325,6 +329,18 @@ impl PaimonSqlHandler {
                             changes.push(SchemaChange::set_option(key.value.clone(), v));
                         }
                     }
+                }
+                AlterTableOperation::DropPartitions {
+                    partitions,
+                    if_exists: partition_if_exists,
+                } => {
+                    return self
+                        .handle_drop_partitions(
+                            &identifier,
+                            partitions,
+                            if_exists || *partition_if_exists,
+                        )
+                        .await;
                 }
                 other => {
                     return Err(DataFusionError::Plan(format!(
@@ -554,6 +570,84 @@ impl PaimonSqlHandler {
             .map_err(to_datafusion_error)?;
 
         crate::merge_into::ok_result(&self.ctx, row_count)
+    }
+
+    async fn handle_truncate_table(&self, truncate: &Truncate) -> DFResult<DataFrame> {
+        if truncate.table_names.len() > 1 {
+            return Err(DataFusionError::Plan(
+                "TRUNCATE TABLE does not support multiple tables".to_string(),
+            ));
+        }
+        let target = truncate.table_names.first().ok_or_else(|| {
+            DataFusionError::Plan("TRUNCATE TABLE requires a table name".to_string())
+        })?;
+        let identifier = self.resolve_table_name(&target.name)?;
+        let table = match self.catalog.get_table(&identifier).await {
+            Ok(t) => t,
+            Err(e) if truncate.if_exists && is_table_not_exist(&e) => {
+                return ok_result(&self.ctx);
+            }
+            Err(e) => return Err(to_datafusion_error(e)),
+        };
+
+        let wb = table.new_write_builder();
+        let commit = wb.new_commit();
+
+        if let Some(partitions) = &truncate.partitions {
+            if partitions.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "PARTITION clause requires at least one column = value".to_string(),
+                ));
+            }
+            let partition_values = parse_partition_values(
+                partitions,
+                table.schema().fields(),
+                table.schema().partition_keys(),
+            )?;
+            commit
+                .truncate_partitions(partition_values)
+                .await
+                .map_err(to_datafusion_error)?;
+            return ok_result(&self.ctx);
+        }
+
+        commit.truncate_table().await.map_err(to_datafusion_error)?;
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_drop_partitions(
+        &self,
+        identifier: &Identifier,
+        partitions: &[SqlExpr],
+        if_exists: bool,
+    ) -> DFResult<DataFrame> {
+        if partitions.is_empty() {
+            return Err(DataFusionError::Plan(
+                "DROP PARTITIONS requires at least one partition specification".to_string(),
+            ));
+        }
+        let table = match self.catalog.get_table(identifier).await {
+            Ok(t) => t,
+            Err(e) if if_exists && is_table_not_exist(&e) => {
+                return ok_result(&self.ctx);
+            }
+            Err(e) => return Err(to_datafusion_error(e)),
+        };
+
+        let partition_values = parse_partition_values(
+            partitions,
+            table.schema().fields(),
+            table.schema().partition_keys(),
+        )?;
+
+        let wb = table.new_write_builder();
+        let commit = wb.new_commit();
+        commit
+            .truncate_partitions(partition_values)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        ok_result(&self.ctx)
     }
 
     /// Resolve an ObjectName like `paimon.db.table` or `db.table` to a Paimon Identifier.
@@ -971,6 +1065,76 @@ fn extract_options(opts: &CreateTableOptions) -> DFResult<Vec<(String, String)>>
             ))),
         })
         .collect()
+}
+
+fn is_table_not_exist(e: &paimon::Error) -> bool {
+    matches!(e, paimon::Error::TableNotExist { .. })
+}
+
+/// Parse partition expressions (`col = val, ...`) into partition value maps
+/// suitable for `TableCommit::truncate_partitions`.
+///
+/// All expressions are treated as belonging to a single partition specification.
+/// For multiple partitions, callers should invoke this once per partition clause.
+fn parse_partition_values(
+    exprs: &[SqlExpr],
+    all_fields: &[PaimonDataField],
+    partition_keys: &[String],
+) -> DFResult<Vec<HashMap<String, Option<Datum>>>> {
+    let field_map: HashMap<&str, &PaimonDataField> =
+        all_fields.iter().map(|f| (f.name(), f)).collect();
+
+    let mut partition = HashMap::new();
+    for expr in exprs {
+        let (col_name, val_expr) = match expr {
+            SqlExpr::BinaryOp {
+                left,
+                op: datafusion::sql::sqlparser::ast::BinaryOperator::Eq,
+                right,
+            } => {
+                let col = match left.as_ref() {
+                    SqlExpr::Identifier(ident) => ident.value.clone(),
+                    other => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Expected column name in partition spec, got: {other}"
+                        )))
+                    }
+                };
+                (col, right.as_ref())
+            }
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Expected 'column = value' in partition spec, got: {other}"
+                )))
+            }
+        };
+
+        if !partition_keys.iter().any(|k| k == &col_name) {
+            return Err(DataFusionError::Plan(format!(
+                "Column '{col_name}' is not a partition column"
+            )));
+        }
+
+        let field = field_map.get(col_name.as_str()).ok_or_else(|| {
+            DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
+        })?;
+        let datum = sql_expr_to_datum(val_expr, field.data_type())?;
+        partition.insert(col_name, Some(datum));
+    }
+
+    let missing: Vec<&str> = partition_keys
+        .iter()
+        .filter(|k| !partition.contains_key(k.as_str()))
+        .map(|k| k.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(DataFusionError::Plan(format!(
+            "Incomplete partition spec: missing keys [{}]. All partition columns must be specified.",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(vec![partition])
 }
 
 /// Parse static partition assignments from `PARTITION (col = val, ...)` expressions.
@@ -2306,5 +2470,237 @@ mod tests {
         handler.sql("RESET 'paimon.scan.version'").await.unwrap();
         let opts = handler.dynamic_options().read().unwrap();
         assert!(opts.is_empty());
+    }
+
+    // ==================== TRUNCATE TABLE / DROP PARTITIONS tests ====================
+
+    async fn setup_fs_handler() -> (tempfile::TempDir, PaimonSqlHandler) {
+        use paimon::{CatalogOptions, FileSystemCatalog, Options};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let warehouse = format!("file://{}", temp_dir.path().display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+
+        let handler =
+            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
+        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+
+        (temp_dir, handler)
+    }
+
+    #[tokio::test]
+    async fn test_truncate_table() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("CREATE TABLE paimon.test_db.t1 (id INT, value INT)")
+            .await
+            .unwrap();
+        handler
+            .sql("INSERT INTO paimon.test_db.t1 VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        handler
+            .sql("TRUNCATE TABLE paimon.test_db.t1")
+            .await
+            .unwrap();
+
+        let batches = handler
+            .sql("SELECT * FROM paimon.test_db.t1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_table_partition() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("CREATE TABLE paimon.test_db.t2 (pt VARCHAR, id INT) PARTITIONED BY (pt)")
+            .await
+            .unwrap();
+        handler
+            .sql("INSERT INTO paimon.test_db.t2 VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        handler
+            .sql("TRUNCATE TABLE paimon.test_db.t2 PARTITION (pt = 'a')")
+            .await
+            .unwrap();
+
+        let batches = handler
+            .sql("SELECT pt, id FROM paimon.test_db.t2 ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let pts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((pts.value(i).to_string(), ids.value(i)));
+            }
+        }
+        assert_eq!(rows, vec![("b".to_string(), 3), ("b".to_string(), 4)]);
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_partitions() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("CREATE TABLE paimon.test_db.t3 (pt VARCHAR, id INT) PARTITIONED BY (pt)")
+            .await
+            .unwrap();
+        handler
+            .sql("INSERT INTO paimon.test_db.t3 VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        handler
+            .sql("ALTER TABLE paimon.test_db.t3 DROP PARTITION (pt = 'b')")
+            .await
+            .unwrap();
+
+        let batches = handler
+            .sql("SELECT pt, id FROM paimon.test_db.t3 ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let pts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((pts.value(i).to_string(), ids.value(i)));
+            }
+        }
+        assert_eq!(rows, vec![("a".to_string(), 1), ("a".to_string(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_table_incomplete_partition_spec() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("CREATE TABLE paimon.test_db.t_multi (pt1 VARCHAR, pt2 VARCHAR, id INT) PARTITIONED BY (pt1, pt2)")
+            .await
+            .unwrap();
+        handler
+            .sql("INSERT INTO paimon.test_db.t_multi VALUES ('a', 'x', 1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let err = handler
+            .sql("TRUNCATE TABLE paimon.test_db.t_multi PARTITION (pt1 = 'a')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Incomplete partition spec"),
+            "Expected incomplete partition spec error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_table_if_exists_nonexistent() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("TRUNCATE TABLE IF EXISTS paimon.test_db.nonexistent")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_truncate_table_nonexistent_without_if_exists() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        let err = handler
+            .sql("TRUNCATE TABLE paimon.test_db.nonexistent")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "Expected table-not-exist error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_if_exists_drop_partition_nonexistent() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("ALTER TABLE IF EXISTS paimon.test_db.nonexistent DROP PARTITION (pt = 'a')")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_drop_partition_incomplete_spec() {
+        let (_tmp, handler) = setup_fs_handler().await;
+
+        handler
+            .sql("CREATE TABLE paimon.test_db.t_dp (pt1 VARCHAR, pt2 VARCHAR, id INT) PARTITIONED BY (pt1, pt2)")
+            .await
+            .unwrap();
+        handler
+            .sql("INSERT INTO paimon.test_db.t_dp VALUES ('a', 'x', 1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let err = handler
+            .sql("ALTER TABLE paimon.test_db.t_dp DROP PARTITION (pt1 = 'a')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Incomplete partition spec"),
+            "Expected incomplete partition spec error, got: {err}"
+        );
     }
 }
