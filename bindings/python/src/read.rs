@@ -25,7 +25,7 @@ use paimon::table::{DataSplit, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
@@ -307,6 +307,91 @@ impl PySplit {
     /// Physical row count: sum of data-file row counts (not a logical result count).
     fn row_count(&self) -> i64 {
         self.inner.row_count()
+    }
+
+    /// Expose this planned split as a plain dict so a non-Rust reader (e.g.
+    /// pypaimon) can rebuild a split and read the files without re-planning.
+    /// `partition` is a serialized `BinaryRow` (as in a manifest `_PARTITION`);
+    /// `row_ranges` `{from, to}` is inclusive; a deletion `path` is fully
+    /// resolved; planning-only stats are omitted.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = &self.inner;
+        let d = PyDict::new(py);
+        d.set_item("snapshot_id", s.snapshot_id())?;
+        d.set_item("bucket", s.bucket())?;
+        d.set_item("bucket_path", s.bucket_path())?;
+        d.set_item("total_buckets", s.total_buckets())?;
+        d.set_item("raw_convertible", s.raw_convertible())?;
+        let partition_bytes = s.partition().to_serialized_bytes();
+        d.set_item("partition", PyBytes::new(py, &partition_bytes))?;
+
+        // Row ranges (sub-file slicing) must not be dropped, else a consumer that
+        // rebuilds this split would over-read the whole file. None for plain splits.
+        match s.row_ranges() {
+            Some(ranges) => {
+                let out = PyList::empty(py);
+                for r in ranges {
+                    let rd = PyDict::new(py);
+                    rd.set_item("from", r.from())?;
+                    rd.set_item("to", r.to())?;
+                    out.append(rd)?;
+                }
+                d.set_item("row_ranges", out)?;
+            }
+            None => d.set_item("row_ranges", py.None())?,
+        }
+
+        let files = PyList::empty(py);
+        let deletions = PyList::empty(py);
+        let has_deletions = s.data_deletion_files().is_some();
+        for (i, f) in s.data_files().iter().enumerate() {
+            let fd = PyDict::new(py);
+            fd.set_item("file_name", f.file_name.as_str())?;
+            fd.set_item("file_path", s.data_file_path(f))?;
+            fd.set_item("file_size", f.file_size)?;
+            fd.set_item("row_count", f.row_count)?;
+            fd.set_item("min_sequence_number", f.min_sequence_number)?;
+            fd.set_item("max_sequence_number", f.max_sequence_number)?;
+            fd.set_item("schema_id", f.schema_id)?;
+            fd.set_item("level", f.level)?;
+            fd.set_item("extra_files", f.extra_files.clone())?;
+            fd.set_item(
+                "creation_time",
+                f.creation_time.map(|t| t.timestamp_millis()),
+            )?;
+            fd.set_item("delete_row_count", f.delete_row_count)?;
+            fd.set_item(
+                "embedded_index",
+                f.embedded_index.as_deref().map(|b| PyBytes::new(py, b)),
+            )?;
+            fd.set_item("file_source", f.file_source)?;
+            fd.set_item("value_stats_cols", f.value_stats_cols.clone())?;
+            fd.set_item("external_path", f.external_path.clone())?;
+            fd.set_item("first_row_id", f.first_row_id)?;
+            fd.set_item("write_cols", f.write_cols.clone())?;
+            files.append(fd)?;
+
+            if has_deletions {
+                match s.deletion_file_for_data_file_index(i) {
+                    Some(df) => {
+                        let dd = PyDict::new(py);
+                        dd.set_item("path", df.path())?;
+                        dd.set_item("offset", df.offset())?;
+                        dd.set_item("length", df.length())?;
+                        dd.set_item("cardinality", df.cardinality())?;
+                        deletions.append(dd)?;
+                    }
+                    None => deletions.append(py.None())?,
+                }
+            }
+        }
+        d.set_item("data_files", files)?;
+        if has_deletions {
+            d.set_item("data_deletion_files", deletions)?;
+        } else {
+            d.set_item("data_deletion_files", py.None())?;
+        }
+        Ok(d)
     }
 
     /// Reduce to `Split(bytes)` for pickle/copy. The bytes are an opaque,

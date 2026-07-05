@@ -657,3 +657,72 @@ def test_time_travel_conflicting_selectors_raises():
         # both offending keys are named
         assert "scan.snapshot-id" in str(exc.value)
         assert "scan.tag-name" in str(exc.value)
+
+
+def test_split_to_dict_exposes_fields():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        assert splits
+        d = splits[0].to_dict()
+        assert set(d) >= {"bucket", "bucket_path", "total_buckets", "partition",
+                          "raw_convertible", "snapshot_id", "data_files",
+                          "data_deletion_files", "row_ranges"}
+        assert isinstance(d["bucket"], int)
+        assert isinstance(d["partition"], (bytes, bytearray))
+        assert d["data_deletion_files"] is None  # no deletion vectors on an append table
+        assert d["row_ranges"] is None  # plain split reads whole files
+        files = d["data_files"]
+        assert files
+        f = files[0]
+        assert set(f) >= {"file_name", "file_path", "file_size", "row_count",
+                          "schema_id", "level", "first_row_id", "write_cols"}
+        assert f["file_path"].startswith(d["bucket_path"])
+        assert f["file_path"].endswith(f["file_name"])
+        assert sum(x["row_count"] for x in files) == 3
+
+
+def test_split_to_dict_partition_and_reads():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "equal", "field": "dt", "literals": ["p1"]})
+        splits = b.new_scan().plan().splits()
+        assert splits
+        d = splits[0].to_dict()
+        # byte-identical to a manifest _PARTITION: 4-byte big-endian arity + body
+        assert d["partition"][:4] == b"\x00\x00\x00\x01"  # one partition column (dt)
+        assert b"p1" in d["partition"]  # the partition value is encoded
+        # partition filter pruned to p1
+        t = pa.Table.from_batches(b.new_read().read(splits))
+        assert sorted(t.column("id").to_pylist()) == [1, 2]
+
+
+def test_split_to_dict_deletions_row_ranges_external_path():
+    # plan() can't produce these; inject them via the serde payload.
+    import json
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)  # two files
+        split = table.new_read_builder().new_scan().plan().splits()[0]
+        cls, (raw,) = split.__reduce__()
+        payload = json.loads(bytes(raw))
+        n = len(payload["data_files"])
+        assert n >= 2
+        deletion = {"path": "dv/idx-0", "offset": 4, "length": 20, "cardinality": 3}
+        payload["data_deletion_files"] = [deletion] + [None] * (n - 1)
+        payload["row_ranges"] = [{"from": 0, "to": 5}, {"from": 8, "to": 9}]
+        payload["data_files"][0]["_EXTERNAL_PATH"] = "s3://ext/data-0.parquet"
+        payload["data_files"][0]["_EMBEDDED_FILE_INDEX"] = [1, 2, 3]
+
+        d = cls(json.dumps(payload).encode()).to_dict()
+
+        ddf = d["data_deletion_files"]  # index-aligned with data_files
+        assert isinstance(ddf, list) and len(ddf) == n
+        assert ddf[0] == deletion
+        assert all(x is None for x in ddf[1:])
+        assert d["row_ranges"] == [{"from": 0, "to": 5}, {"from": 8, "to": 9}]
+        # external path wins
+        assert d["data_files"][0]["file_path"] == "s3://ext/data-0.parquet"
+        assert d["data_files"][0]["external_path"] == "s3://ext/data-0.parquet"
+        assert d["data_files"][0]["embedded_index"] == b"\x01\x02\x03"
