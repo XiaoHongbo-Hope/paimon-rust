@@ -1121,4 +1121,17 @@ mod tests {
         let mut sink = Vec::new();
         assert!(write_java_utf(&mut sink, &"a".repeat(70000)).is_err());
     }
+
+    #[test]
+    fn binary_array_str_var_element() {
+        // Element > 7 bytes takes the offset+length pointer branch, which datasplit-v8
+        // (all elements <= 7, inline) never exercises. Check the pointer resolves to the value.
+        let out = crate::spec::serialize_binary_array_str(&["abcdefgh".to_string()]);
+        assert_eq!(&out[0..4], &1i32.to_le_bytes()); // element count
+        let slot = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        let off = (slot >> 32) as usize;
+        let len = (slot & 0xFFFF_FFFF) as usize;
+        assert_eq!(len, 8);
+        assert_eq!(&out[off..off + len], b"abcdefgh");
+    }
 }
