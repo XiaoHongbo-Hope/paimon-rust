@@ -310,9 +310,11 @@ impl PySplit {
     }
 
     /// Serialize this planned split to Java `DataSplit#serialize` (version 8) binary,
-    /// so pypaimon (or any Paimon reader) can rebuild it without re-planning.
-    fn serialize<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.serialize())
+    /// so pypaimon (or any Paimon reader) can rebuild it without re-planning. Raises for a
+    /// split carrying row ranges (row-id / global-index / vector plans), which v8 can't represent.
+    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.serialize().map_err(to_py_err)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     /// Reduce to `Split(bytes)` for pickle/copy. The bytes are an opaque,

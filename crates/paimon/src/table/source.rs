@@ -599,7 +599,18 @@ impl DataSplit {
 
     /// Serialize to Java `DataSplit#serialize` (version 8) binary so any Paimon reader
     /// (pypaimon, Java) can rebuild this split. Byte-compatible with `compatibility/datasplit-v8`.
-    pub fn serialize(&self) -> Vec<u8> {
+    ///
+    /// Errors on a split carrying row ranges (row-id / global-index / vector / full-text plans):
+    /// v8 has no field for them, so silently dropping them would widen the split and read extra rows.
+    pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        if self.row_ranges.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "cannot serialize a split with row ranges to DataSplit v8 \
+                          (row-id / global-index / vector plans are not representable)"
+                    .to_string(),
+                source: None,
+            });
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_VERSION.to_be_bytes());
@@ -608,7 +619,7 @@ impl DataSplit {
         out.extend_from_slice(&(p.len() as i32).to_be_bytes());
         out.extend_from_slice(&p);
         out.extend_from_slice(&self.bucket.to_be_bytes());
-        write_java_utf(&mut out, &self.bucket_path);
+        write_java_utf(&mut out, &self.bucket_path)?;
         out.push(1); // totalBuckets present (version >= 6)
         out.extend_from_slice(&self.total_buckets.to_be_bytes());
         out.extend_from_slice(&0i32.to_be_bytes()); // deprecated beforeFiles count
@@ -619,10 +630,10 @@ impl DataSplit {
             out.extend_from_slice(&(d.len() as i32).to_be_bytes());
             out.extend_from_slice(&d);
         }
-        write_deletion_list(&mut out, self.data_deletion_files.as_deref());
+        write_deletion_list(&mut out, self.data_deletion_files.as_deref())?;
         out.push(0); // isStreaming = false
         out.push(u8::from(self.raw_convertible));
-        out
+        Ok(out)
     }
 }
 
@@ -630,16 +641,50 @@ impl DataSplit {
 const SPLIT_MAGIC: i64 = -2394839472490812314;
 const SPLIT_VERSION: i32 = 8;
 
-/// Java `writeUTF`: u16 length + modified UTF-8 (== UTF-8 for the ASCII paths/names used here).
-fn write_java_utf(out: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
-    out.extend_from_slice(b);
+/// Java `DataOutput#writeUTF`: modified UTF-8 over UTF-16 code units, prefixed by the u16
+/// byte length. NUL and chars >= U+0800 (incl. surrogates for supplementary chars) take 2-3
+/// bytes. Errors if the encoded form exceeds 65535 bytes, as Java throws UTFDataFormatException.
+fn write_java_utf(out: &mut Vec<u8>, s: &str) -> crate::Result<()> {
+    let byte_len: usize = s
+        .encode_utf16()
+        .map(|c| {
+            if (0x0001..=0x007F).contains(&c) {
+                1
+            } else if c > 0x07FF {
+                3
+            } else {
+                2
+            }
+        })
+        .sum();
+    if byte_len > 0xFFFF {
+        return Err(crate::Error::DataInvalid {
+            message: format!("string too long for writeUTF: {byte_len} bytes (max 65535)"),
+            source: None,
+        });
+    }
+    out.extend_from_slice(&(byte_len as u16).to_be_bytes());
+    for c in s.encode_utf16() {
+        if (0x0001..=0x007F).contains(&c) {
+            out.push(c as u8);
+        } else if c > 0x07FF {
+            out.push(0xE0 | (c >> 12) as u8);
+            out.push(0x80 | ((c >> 6) & 0x3F) as u8);
+            out.push(0x80 | (c & 0x3F) as u8);
+        } else {
+            out.push(0xC0 | (c >> 6) as u8);
+            out.push(0x80 | (c & 0x3F) as u8);
+        }
+    }
+    Ok(())
 }
 
 /// Java `DeletionFile#serializeList`: `0` = null list; else `1` + count + per entry
 /// (`0` = null, or `1` + path + offset + length + cardinality, -1 when absent).
-fn write_deletion_list(out: &mut Vec<u8>, files: Option<&[Option<DeletionFile>]>) {
+fn write_deletion_list(
+    out: &mut Vec<u8>,
+    files: Option<&[Option<DeletionFile>]>,
+) -> crate::Result<()> {
     match files {
         None => out.push(0),
         Some(list) => {
@@ -650,7 +695,7 @@ fn write_deletion_list(out: &mut Vec<u8>, files: Option<&[Option<DeletionFile>]>
                     None => out.push(0),
                     Some(df) => {
                         out.push(1);
-                        write_java_utf(out, df.path());
+                        write_java_utf(out, df.path())?;
                         out.extend_from_slice(&df.offset().to_be_bytes());
                         out.extend_from_slice(&df.length().to_be_bytes());
                         out.extend_from_slice(&df.cardinality().unwrap_or(-1).to_be_bytes());
@@ -659,6 +704,7 @@ fn write_deletion_list(out: &mut Vec<u8>, files: Option<&[Option<DeletionFile>]>
             }
         }
     }
+    Ok(())
 }
 
 /// Builder for [DataSplit].
@@ -1037,6 +1083,42 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(split.serialize().as_slice(), &expected[..]);
+        assert_eq!(split.serialize().unwrap().as_slice(), &expected[..]);
+    }
+
+    #[test]
+    fn serialize_rejects_row_ranges() {
+        // v8 has no row-range field; serializing would widen the split, so it must error.
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file("a", 10, Some(0))])
+            .with_row_ranges(vec![RowRange::new(0, 4)])
+            .build()
+            .unwrap();
+        assert!(split.serialize().is_err());
+    }
+
+    #[test]
+    fn write_java_utf_matches_java_modified_utf8() {
+        let enc = |s: &str| {
+            let mut b = Vec::new();
+            write_java_utf(&mut b, s).unwrap();
+            b
+        };
+        // ASCII: u16 length + raw bytes.
+        assert_eq!(enc("ab"), vec![0, 2, b'a', b'b']);
+        // NUL -> C0 80 (2 bytes), not 0x00.
+        assert_eq!(enc("\u{0}"), vec![0, 2, 0xC0, 0x80]);
+        // U+00E9 'é' -> 2 bytes C3 A9.
+        assert_eq!(enc("\u{00E9}"), vec![0, 2, 0xC3, 0xA9]);
+        // U+4E2D '中' -> 3 bytes E4 B8 AD.
+        assert_eq!(enc("\u{4E2D}"), vec![0, 3, 0xE4, 0xB8, 0xAD]);
+        // Overlong -> error (like Java UTFDataFormatException).
+        let mut sink = Vec::new();
+        assert!(write_java_utf(&mut sink, &"a".repeat(70000)).is_err());
     }
 }
