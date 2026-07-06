@@ -596,6 +596,69 @@ impl DataSplit {
     pub fn builder() -> DataSplitBuilder {
         DataSplitBuilder::new()
     }
+
+    /// Serialize to Java `DataSplit#serialize` (version 8) binary so any Paimon reader
+    /// (pypaimon, Java) can rebuild this split. Byte-compatible with `compatibility/datasplit-v8`.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SPLIT_MAGIC.to_be_bytes());
+        out.extend_from_slice(&SPLIT_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.snapshot_id.to_be_bytes());
+        let p = self.partition.to_serialized_bytes(); // serializeBinaryRow: writeInt(len) + [arity+data]
+        out.extend_from_slice(&(p.len() as i32).to_be_bytes());
+        out.extend_from_slice(&p);
+        out.extend_from_slice(&self.bucket.to_be_bytes());
+        write_java_utf(&mut out, &self.bucket_path);
+        out.push(1); // totalBuckets present (version >= 6)
+        out.extend_from_slice(&self.total_buckets.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes()); // deprecated beforeFiles count
+        out.push(0); // beforeDeletionFiles = null list
+        out.extend_from_slice(&(self.data_files.len() as i32).to_be_bytes());
+        for f in &self.data_files {
+            let d = f.to_serialized_row_data();
+            out.extend_from_slice(&(d.len() as i32).to_be_bytes());
+            out.extend_from_slice(&d);
+        }
+        write_deletion_list(&mut out, self.data_deletion_files.as_deref());
+        out.push(0); // isStreaming = false
+        out.push(u8::from(self.raw_convertible));
+        out
+    }
+}
+
+/// Java `DataSplit#MAGIC` / `VERSION` for the serialize format.
+const SPLIT_MAGIC: i64 = -2394839472490812314;
+const SPLIT_VERSION: i32 = 8;
+
+/// Java `writeUTF`: u16 length + modified UTF-8 (== UTF-8 for the ASCII paths/names used here).
+fn write_java_utf(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+/// Java `DeletionFile#serializeList`: `0` = null list; else `1` + count + per entry
+/// (`0` = null, or `1` + path + offset + length + cardinality, -1 when absent).
+fn write_deletion_list(out: &mut Vec<u8>, files: Option<&[Option<DeletionFile>]>) {
+    match files {
+        None => out.push(0),
+        Some(list) => {
+            out.push(1);
+            out.extend_from_slice(&(list.len() as i32).to_be_bytes());
+            for f in list {
+                match f {
+                    None => out.push(0),
+                    Some(df) => {
+                        out.push(1);
+                        write_java_utf(out, df.path());
+                        out.extend_from_slice(&df.offset().to_be_bytes());
+                        out.extend_from_slice(&df.length().to_be_bytes());
+                        out.extend_from_slice(&df.cardinality().unwrap_or(-1).to_be_bytes());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Builder for [DataSplit].
@@ -904,5 +967,76 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(unknown.merged_row_count(), None);
+    }
+
+    /// serializeBinaryRow(singleColumn(s)): a 1-field BinaryRow's serialized bytes.
+    fn single_col(s: &str) -> Vec<u8> {
+        let mut b = crate::spec::BinaryRowBuilder::new(1);
+        b.write_bytes(0, s.as_bytes());
+        b.build_serialized()
+    }
+
+    #[test]
+    fn serialize_matches_datasplit_v8() {
+        use chrono::DateTime;
+        let expected = include_bytes!("../../testdata/datasplit_v8.bin");
+
+        let mut pb = crate::spec::BinaryRowBuilder::new(1);
+        pb.write_bytes(0, b"aaaaa");
+
+        let file = DataFileMeta {
+            file_name: "my_file".to_string(),
+            file_size: 1024 * 1024,
+            row_count: 1024,
+            min_key: single_col("min_key"),
+            max_key: single_col("max_key"),
+            key_stats: BinaryTableStats::new(
+                single_col("min_key"),
+                single_col("max_key"),
+                vec![Some(0)],
+            ),
+            value_stats: BinaryTableStats::new(
+                single_col("min_value"),
+                single_col("max_value"),
+                vec![Some(0)],
+            ),
+            min_sequence_number: 15,
+            max_sequence_number: 200,
+            schema_id: 5,
+            level: 3,
+            extra_files: vec!["extra1".to_string(), "extra2".to_string()],
+            creation_time: DateTime::from_timestamp_millis(1646252412000),
+            delete_row_count: Some(11),
+            embedded_index: Some(vec![1, 2, 4]),
+            first_row_id: Some(12),
+            write_cols: Some(["a", "b", "c", "f"].iter().map(|s| s.to_string()).collect()),
+            external_path: Some("hdfs:///path/to/warehouse".to_string()),
+            file_source: Some(1),
+            value_stats_cols: Some(
+                ["field1", "field2", "field3"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        };
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(18)
+            .with_partition(pb.build())
+            .with_bucket(20)
+            .with_total_buckets(32)
+            .with_bucket_path("my path".to_string())
+            .with_data_files(vec![file])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                "deletion_file".to_string(),
+                100,
+                22,
+                Some(33),
+            ))])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+
+        assert_eq!(split.serialize().as_slice(), &expected[..]);
     }
 }
