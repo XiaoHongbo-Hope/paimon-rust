@@ -309,11 +309,11 @@ impl PySplit {
         self.inner.row_count()
     }
 
-    /// Serialize this planned split to Java `DataSplit#serialize` (version 8) binary,
-    /// so pypaimon (or any Paimon reader) can rebuild it without re-planning. Raises for a
-    /// split carrying row ranges (row-id / global-index / vector plans), which v8 can't represent.
+    /// Serialize this planned split to the Java `SplitSerializer` (v1) binary, so pypaimon (or
+    /// any Paimon reader) can rebuild it without re-planning. Raises for a split carrying row
+    /// ranges (row-id / global-index / vector plans), which the format can't represent.
     fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.inner.serialize().map_err(to_py_err)?;
+        let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))
     }
 

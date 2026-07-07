@@ -635,11 +635,27 @@ impl DataSplit {
         out.push(u8::from(self.raw_convertible));
         Ok(out)
     }
+
+    /// Java `SplitSerializer#serialize` frame: magic + version + type id + `DataSplit#serialize`.
+    /// The cross-language entry point; byte-compatible with `compatibility/split-v1-data`.
+    pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+        out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+        out.extend_from_slice(&SPLIT_SER_TYPE_DATA_SPLIT.to_be_bytes());
+        out.extend_from_slice(&self.serialize()?);
+        Ok(out)
+    }
 }
 
 /// Java `DataSplit#MAGIC` / `VERSION` for the serialize format.
 const SPLIT_MAGIC: i64 = -2394839472490812314;
 const SPLIT_VERSION: i32 = 8;
+
+/// Java `SplitSerializer` frame: magic "SPLIT_V1", version, and the `DataSplit` type id.
+const SPLIT_SER_MAGIC: i64 = 0x53504C49545F5631; // "SPLIT_V1"
+const SPLIT_SER_VERSION: i32 = 1;
+const SPLIT_SER_TYPE_DATA_SPLIT: i32 = 1;
 
 /// Java `DataOutput#writeUTF`: modified UTF-8 over UTF-16 code units, prefixed by the u16
 /// byte length. NUL and chars >= U+0800 (incl. surrogates for supplementary chars) take 2-3
@@ -1133,5 +1149,74 @@ mod tests {
         let len = (slot & 0xFFFF_FFFF) as usize;
         assert_eq!(len, 8);
         assert_eq!(&out[off..off + len], b"abcdefgh");
+    }
+
+    fn int_binary_row(vals: &[i32]) -> BinaryRow {
+        let mut b = crate::spec::BinaryRowBuilder::new(vals.len() as i32);
+        for (i, v) in vals.iter().enumerate() {
+            b.write_int(i, *v);
+        }
+        b.build()
+    }
+
+    // Mirror SplitSerializerTest.dataFile(name, level, minKey, maxKey, maxSequence).
+    fn v1_data_file(
+        name: &str,
+        level: i32,
+        min_key: i32,
+        max_key: i32,
+        max_seq: i64,
+    ) -> DataFileMeta {
+        let size = (max_key - min_key + 1) as i64;
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: size,
+            row_count: size,
+            min_key: int_binary_row(&[min_key]).to_serialized_bytes(),
+            max_key: int_binary_row(&[max_key]).to_serialized_bytes(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: max_seq,
+            schema_id: 0,
+            level,
+            extra_files: Vec::new(),
+            creation_time: chrono::DateTime::from_timestamp_millis(100),
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: Some(0), // FileSource.APPEND
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
+    #[test]
+    fn serialize_split_v1_matches_golden() {
+        // Mirrors SplitSerializerTest.dataSplit(); also covers EMPTY_STATS, two files,
+        // and a null-padded deletion list.
+        let expected = include_bytes!("../../testdata/split_v1_data.bin");
+        let split = DataSplitBuilder::new()
+            .with_snapshot(42)
+            .with_partition(int_binary_row(&[2026, 7]))
+            .with_bucket(3)
+            .with_total_buckets(8)
+            .with_bucket_path("dt=20260706/bucket-3".to_string())
+            .with_data_files(vec![
+                v1_data_file("file-a", 0, 1, 10, 100),
+                v1_data_file("file-b", 1, 11, 20, 200),
+            ])
+            .with_data_deletion_files(vec![
+                None,
+                Some(DeletionFile::new("dv/file-b".to_string(), 2, 10, Some(3))),
+            ])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            split.serialize_split_v1().unwrap().as_slice(),
+            &expected[..]
+        );
     }
 }

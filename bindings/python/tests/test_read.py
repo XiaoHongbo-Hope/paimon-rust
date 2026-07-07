@@ -659,7 +659,7 @@ def test_time_travel_conflicting_selectors_raises():
         assert "scan.tag-name" in str(exc.value)
 
 
-def test_split_serialize_produces_version8_binary():
+def test_split_serialize_produces_split_v1_binary():
     import struct
 
     with tempfile.TemporaryDirectory() as warehouse:
@@ -668,10 +668,15 @@ def test_split_serialize_produces_version8_binary():
         assert splits
         data = splits[0].serialize()
         assert isinstance(data, (bytes, bytearray))
-        # Java DataSplit#serialize header: MAGIC (long) + VERSION (int == 8)
-        magic, version = struct.unpack_from(">qi", data, 0)
+        # SplitSerializer frame: "SPLIT_V1" + version(1) + type-id(1=DATA_SPLIT)
+        assert data[:8] == b"SPLIT_V1"
+        version, type_id = struct.unpack_from(">ii", data, 8)
+        assert version == 1
+        assert type_id == 1
+        # DataSplit v8 body follows: MAGIC + VERSION(8)
+        magic, body_version = struct.unpack_from(">qi", data, 16)
         assert magic == -2394839472490812314
-        assert version == 8
+        assert body_version == 8
         assert splits[0].serialize() == data  # deterministic
 
 
