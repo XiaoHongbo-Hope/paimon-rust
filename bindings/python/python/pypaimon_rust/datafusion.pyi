@@ -39,7 +39,8 @@ class TableSchema:
 class Split:
     def __init__(self, state: bytes) -> None: ...
     def row_count(self) -> int: ...
-    # Java DataSplit v8 binary; raises for splits carrying row ranges.
+    # Java SplitSerializer v1 binary (wraps a DataSplit v8 payload);
+    # raises for splits carrying row ranges.
     def serialize(self) -> bytes: ...
 
 class Plan:

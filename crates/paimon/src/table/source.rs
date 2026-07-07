@@ -1151,6 +1151,22 @@ mod tests {
         assert_eq!(&out[off..off + len], b"abcdefgh");
     }
 
+    #[test]
+    fn binary_array_long_multiword_null_bitset() {
+        // n > 32 spans a second 4-byte null word; a None at index >= 32 must set the right bit.
+        let mut vals: Vec<Option<i64>> = (0..40).map(|i| Some(i as i64)).collect();
+        vals[35] = None;
+        let out = crate::spec::serialize_binary_array_long(&vals);
+        assert_eq!(&out[0..4], &40i32.to_le_bytes()); // element count
+        let header = 4 + 40usize.div_ceil(32) * 4; // 12
+        assert_eq!(out[4 + 35 / 8] & (1 << (35 % 8)), 1 << (35 % 8)); // null bit in 2nd word
+        assert_eq!(out[4] & 1, 0); // element 0 not null
+        assert_eq!(
+            i64::from_le_bytes(out[header..header + 8].try_into().unwrap()),
+            0
+        );
+    }
+
     fn int_binary_row(vals: &[i32]) -> BinaryRow {
         let mut b = crate::spec::BinaryRowBuilder::new(vals.len() as i32);
         for (i, v) in vals.iter().enumerate() {
