@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::spec::stats::BinaryTableStats;
+use crate::spec::{serialize_binary_array_str, BinaryRowBuilder};
 use chrono::serde::ts_milliseconds_option::deserialize as from_millis_opt;
 use chrono::serde::ts_milliseconds_option::serialize as to_millis_opt;
 use chrono::{DateTime, Utc};
@@ -144,10 +145,70 @@ impl Display for DataFileMeta {
     }
 }
 
+fn opt_long(b: &mut BinaryRowBuilder, pos: usize, v: Option<i64>) {
+    match v {
+        Some(x) => b.write_long(pos, x),
+        None => b.set_null_at(pos),
+    }
+}
+
+fn opt_str_array(b: &mut BinaryRowBuilder, pos: usize, v: &Option<Vec<String>>) {
+    match v {
+        Some(a) => b.write_bytes(pos, &serialize_binary_array_str(a)),
+        None => b.set_null_at(pos),
+    }
+}
+
 impl DataFileMeta {
     /// Returns the row ID range `[first_row_id, first_row_id + row_count - 1]` if `first_row_id` is set.
     pub fn row_id_range(&self) -> Option<(i64, i64)> {
         self.first_row_id.map(|fid| (fid, fid + self.row_count - 1))
+    }
+
+    /// Serialize as a `DataFileMeta.SCHEMA` (version 8) BinaryRow, raw data without the
+    /// arity prefix -- the form `DataSplit#serialize` writes per file as `writeInt(len) + data`.
+    /// Fields, order and nullability mirror Java `DataFileMetaSerializer#toRow`.
+    pub fn to_serialized_row_data(&self) -> crate::Result<Vec<u8>> {
+        let mut b = BinaryRowBuilder::new(20);
+        b.write_bytes(0, self.file_name.as_bytes());
+        b.write_long(1, self.file_size);
+        b.write_long(2, self.row_count);
+        b.write_bytes(3, &self.min_key);
+        b.write_bytes(4, &self.max_key);
+        b.write_bytes(5, &self.key_stats.to_simple_stats_row_data());
+        b.write_bytes(6, &self.value_stats.to_simple_stats_row_data());
+        b.write_long(7, self.min_sequence_number);
+        b.write_long(8, self.max_sequence_number);
+        b.write_long(9, self.schema_id);
+        b.write_int(10, self.level);
+        b.write_bytes(11, &serialize_binary_array_str(&self.extra_files));
+        match self.creation_time {
+            Some(t) => b.write_timestamp_compact(12, t.timestamp_millis()),
+            None => b.set_null_at(12),
+        }
+        opt_long(&mut b, 13, self.delete_row_count);
+        match &self.embedded_index {
+            Some(v) => b.write_bytes(14, v),
+            None => b.set_null_at(14),
+        }
+        match self.file_source {
+            Some(v) => {
+                let byte = i8::try_from(v).map_err(|_| crate::Error::DataInvalid {
+                    message: format!("file_source {v} out of TINYINT range [-128, 127]"),
+                    source: None,
+                })?;
+                b.write_byte(15, byte);
+            }
+            None => b.set_null_at(15),
+        }
+        opt_str_array(&mut b, 16, &self.value_stats_cols);
+        match &self.external_path {
+            Some(s) => b.write_bytes(17, s.as_bytes()),
+            None => b.set_null_at(17),
+        }
+        opt_long(&mut b, 18, self.first_row_id);
+        opt_str_array(&mut b, 19, &self.write_cols);
+        Ok(b.build_row_data())
     }
 
     /// Full path for this data file.

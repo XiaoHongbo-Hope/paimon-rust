@@ -634,6 +634,145 @@ impl DataSplit {
     pub fn builder() -> DataSplitBuilder {
         DataSplitBuilder::new()
     }
+
+    /// Serialize the DataSplit fields to Java `DataSplit#serialize` (version 8) binary.
+    /// Byte-compatible with `compatibility/datasplit-v8`. Row ranges are not part of the v8
+    /// format; `serialize_split_v1` wraps a row-range split as an `IndexedSplit` instead.
+    pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SPLIT_MAGIC.to_be_bytes());
+        out.extend_from_slice(&SPLIT_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.snapshot_id.to_be_bytes());
+        let p = self.partition.to_serialized_bytes(); // serializeBinaryRow: writeInt(len) + [arity+data]
+        out.extend_from_slice(&(p.len() as i32).to_be_bytes());
+        out.extend_from_slice(&p);
+        out.extend_from_slice(&self.bucket.to_be_bytes());
+        write_java_utf(&mut out, &self.bucket_path)?;
+        out.push(1); // totalBuckets present (version >= 6)
+        out.extend_from_slice(&self.total_buckets.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes()); // deprecated beforeFiles count
+        out.push(0); // beforeDeletionFiles = null list
+        out.extend_from_slice(&(self.data_files.len() as i32).to_be_bytes());
+        for f in &self.data_files {
+            let d = f.to_serialized_row_data()?;
+            out.extend_from_slice(&(d.len() as i32).to_be_bytes());
+            out.extend_from_slice(&d);
+        }
+        write_deletion_list(&mut out, self.data_deletion_files.as_deref())?;
+        out.push(0); // isStreaming = false
+        out.push(u8::from(self.raw_convertible));
+        Ok(out)
+    }
+
+    /// Java `SplitSerializer#serialize` frame: magic + version + type id + body. The cross-language
+    /// entry point. A plain split serializes as `DataSplit` (type 1); a split carrying row ranges as
+    /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
+    /// `compatibility/split-v1-data` / `split-v1-indexed`.
+    pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+        out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+        match &self.row_ranges {
+            None => {
+                out.extend_from_slice(&SPLIT_SER_TYPE_DATA_SPLIT.to_be_bytes());
+                out.extend_from_slice(&self.serialize()?);
+            }
+            Some(ranges) => {
+                out.extend_from_slice(&SPLIT_SER_TYPE_INDEXED_SPLIT.to_be_bytes());
+                // IndexedSplit#serialize: magic + version + DataSplit body + ranges + scores.
+                out.extend_from_slice(&INDEXED_SPLIT_MAGIC.to_be_bytes());
+                out.extend_from_slice(&INDEXED_SPLIT_VERSION.to_be_bytes());
+                out.extend_from_slice(&self.serialize()?);
+                out.extend_from_slice(&(ranges.len() as i32).to_be_bytes());
+                for r in ranges {
+                    out.extend_from_slice(&r.from().to_be_bytes());
+                    out.extend_from_slice(&r.to().to_be_bytes());
+                }
+                out.push(0); // scores = null (vector scores are not modeled on the Rust split)
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Java `DataSplit#MAGIC` / `VERSION` for the serialize format.
+const SPLIT_MAGIC: i64 = -2394839472490812314;
+const SPLIT_VERSION: i32 = 8;
+
+/// Java `SplitSerializer` frame: magic "SPLIT_V1", version, and the `DataSplit` type id.
+const SPLIT_SER_MAGIC: i64 = 0x53504C49545F5631; // "SPLIT_V1"
+const SPLIT_SER_VERSION: i32 = 1;
+const SPLIT_SER_TYPE_DATA_SPLIT: i32 = 1;
+const SPLIT_SER_TYPE_INDEXED_SPLIT: i32 = 3;
+
+/// Java `IndexedSplit#MAGIC` / `VERSION`.
+const INDEXED_SPLIT_MAGIC: i64 = -938472394838495695;
+const INDEXED_SPLIT_VERSION: i32 = 1;
+
+/// Java `DataOutput#writeUTF`: modified UTF-8 over UTF-16 code units, prefixed by the u16
+/// byte length. NUL and chars >= U+0800 (incl. surrogates for supplementary chars) take 2-3
+/// bytes. Errors if the encoded form exceeds 65535 bytes, as Java throws UTFDataFormatException.
+fn write_java_utf(out: &mut Vec<u8>, s: &str) -> crate::Result<()> {
+    let byte_len: usize = s
+        .encode_utf16()
+        .map(|c| {
+            if (0x0001..=0x007F).contains(&c) {
+                1
+            } else if c > 0x07FF {
+                3
+            } else {
+                2
+            }
+        })
+        .sum();
+    if byte_len > 0xFFFF {
+        return Err(crate::Error::DataInvalid {
+            message: format!("string too long for writeUTF: {byte_len} bytes (max 65535)"),
+            source: None,
+        });
+    }
+    out.extend_from_slice(&(byte_len as u16).to_be_bytes());
+    for c in s.encode_utf16() {
+        if (0x0001..=0x007F).contains(&c) {
+            out.push(c as u8);
+        } else if c > 0x07FF {
+            out.push(0xE0 | (c >> 12) as u8);
+            out.push(0x80 | ((c >> 6) & 0x3F) as u8);
+            out.push(0x80 | (c & 0x3F) as u8);
+        } else {
+            out.push(0xC0 | (c >> 6) as u8);
+            out.push(0x80 | (c & 0x3F) as u8);
+        }
+    }
+    Ok(())
+}
+
+/// Java `DeletionFile#serializeList`: `0` = null list; else `1` + count + per entry
+/// (`0` = null, or `1` + path + offset + length + cardinality, -1 when absent).
+fn write_deletion_list(
+    out: &mut Vec<u8>,
+    files: Option<&[Option<DeletionFile>]>,
+) -> crate::Result<()> {
+    match files {
+        None => out.push(0),
+        Some(list) => {
+            out.push(1);
+            out.extend_from_slice(&(list.len() as i32).to_be_bytes());
+            for f in list {
+                match f {
+                    None => out.push(0),
+                    Some(df) => {
+                        out.push(1);
+                        write_java_utf(out, df.path())?;
+                        out.extend_from_slice(&df.offset().to_be_bytes());
+                        out.extend_from_slice(&df.length().to_be_bytes());
+                        out.extend_from_slice(&df.cardinality().unwrap_or(-1).to_be_bytes());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Builder for [DataSplit].
@@ -1043,5 +1182,217 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 9)]
         );
+    }
+
+    fn single_col(s: &str) -> Vec<u8> {
+        let mut b = crate::spec::BinaryRowBuilder::new(1);
+        b.write_bytes(0, s.as_bytes());
+        b.build_serialized()
+    }
+
+    #[test]
+    fn serialize_matches_datasplit_v8() {
+        use chrono::DateTime;
+        // Golden generated by Java (paimon-core DataSplitCompatibleTest) for cross-language parity.
+        let expected = include_bytes!("goldens/datasplit_v8.bin");
+
+        let mut pb = crate::spec::BinaryRowBuilder::new(1);
+        pb.write_bytes(0, b"aaaaa");
+
+        let file = DataFileMeta {
+            file_name: "my_file".to_string(),
+            file_size: 1024 * 1024,
+            row_count: 1024,
+            min_key: single_col("min_key"),
+            max_key: single_col("max_key"),
+            key_stats: BinaryTableStats::new(
+                single_col("min_key"),
+                single_col("max_key"),
+                vec![Some(0)],
+            ),
+            value_stats: BinaryTableStats::new(
+                single_col("min_value"),
+                single_col("max_value"),
+                vec![Some(0)],
+            ),
+            min_sequence_number: 15,
+            max_sequence_number: 200,
+            schema_id: 5,
+            level: 3,
+            extra_files: vec!["extra1".to_string(), "extra2".to_string()],
+            creation_time: DateTime::from_timestamp_millis(1646252412000),
+            delete_row_count: Some(11),
+            embedded_index: Some(vec![1, 2, 4]),
+            first_row_id: Some(12),
+            write_cols: Some(["a", "b", "c", "f"].iter().map(|s| s.to_string()).collect()),
+            external_path: Some("hdfs:///path/to/warehouse".to_string()),
+            file_source: Some(1),
+            value_stats_cols: Some(
+                ["field1", "field2", "field3"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        };
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(18)
+            .with_partition(pb.build())
+            .with_bucket(20)
+            .with_total_buckets(32)
+            .with_bucket_path("my path".to_string())
+            .with_data_files(vec![file])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                "deletion_file".to_string(),
+                100,
+                22,
+                Some(33),
+            ))])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+
+        assert_eq!(split.serialize().unwrap().as_slice(), &expected[..]);
+    }
+
+    #[test]
+    fn write_java_utf_matches_java_modified_utf8() {
+        let enc = |s: &str| {
+            let mut b = Vec::new();
+            write_java_utf(&mut b, s).unwrap();
+            b
+        };
+        // ASCII: u16 length + raw bytes.
+        assert_eq!(enc("ab"), vec![0, 2, b'a', b'b']);
+        // NUL -> C0 80 (2 bytes), not 0x00.
+        assert_eq!(enc("\u{0}"), vec![0, 2, 0xC0, 0x80]);
+        // U+00E9 'é' -> 2 bytes C3 A9.
+        assert_eq!(enc("\u{00E9}"), vec![0, 2, 0xC3, 0xA9]);
+        // U+4E2D '中' -> 3 bytes E4 B8 AD.
+        assert_eq!(enc("\u{4E2D}"), vec![0, 3, 0xE4, 0xB8, 0xAD]);
+        // U+1F600 -> surrogate pair D83D DE00, each surrogate 3 bytes -> 6 bytes.
+        assert_eq!(
+            enc("\u{1F600}"),
+            vec![0, 6, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]
+        );
+        // Overlong -> error (like Java UTFDataFormatException).
+        let mut sink = Vec::new();
+        assert!(write_java_utf(&mut sink, &"a".repeat(70000)).is_err());
+    }
+
+    #[test]
+    fn binary_array_str_var_element() {
+        // Element > 7 bytes takes the offset+length pointer branch, which datasplit-v8
+        // (all elements <= 7, inline) never exercises. Check the pointer resolves to the value.
+        let out = crate::spec::serialize_binary_array_str(&["abcdefgh".to_string()]);
+        assert_eq!(&out[0..4], &1i32.to_le_bytes()); // element count
+        let slot = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        let off = (slot >> 32) as usize;
+        let len = (slot & 0xFFFF_FFFF) as usize;
+        assert_eq!(len, 8);
+        assert_eq!(&out[off..off + len], b"abcdefgh");
+    }
+
+    #[test]
+    fn binary_array_long_multiword_null_bitset() {
+        // n > 32 spans a second 4-byte null word; a None at index >= 32 must set the right bit.
+        let mut vals: Vec<Option<i64>> = (0..40).map(|i| Some(i as i64)).collect();
+        vals[35] = None;
+        let out = crate::spec::serialize_binary_array_long(&vals);
+        assert_eq!(&out[0..4], &40i32.to_le_bytes()); // element count
+        let header = 4 + 40usize.div_ceil(32) * 4; // 12
+        assert_eq!(out[4 + 35 / 8] & (1 << (35 % 8)), 1 << (35 % 8)); // null bit in 2nd word
+        assert_eq!(out[4] & 1, 0); // element 0 not null
+        assert_eq!(
+            i64::from_le_bytes(out[header..header + 8].try_into().unwrap()),
+            0
+        );
+    }
+
+    fn int_binary_row(vals: &[i32]) -> BinaryRow {
+        let mut b = crate::spec::BinaryRowBuilder::new(vals.len() as i32);
+        for (i, v) in vals.iter().enumerate() {
+            b.write_int(i, *v);
+        }
+        b.build()
+    }
+
+    // Mirror SplitSerializerTest.dataFile(name, level, minKey, maxKey, maxSequence).
+    fn v1_data_file(
+        name: &str,
+        level: i32,
+        min_key: i32,
+        max_key: i32,
+        max_seq: i64,
+    ) -> DataFileMeta {
+        let size = (max_key - min_key + 1) as i64;
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: size,
+            row_count: size,
+            min_key: int_binary_row(&[min_key]).to_serialized_bytes(),
+            max_key: int_binary_row(&[max_key]).to_serialized_bytes(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: max_seq,
+            schema_id: 0,
+            level,
+            extra_files: Vec::new(),
+            creation_time: chrono::DateTime::from_timestamp_millis(100),
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: Some(0), // FileSource.APPEND
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
+    // Mirrors SplitSerializerTest.dataSplit(): two files, EMPTY_STATS, null-padded deletion list.
+    fn v1_data_split_builder() -> DataSplitBuilder {
+        DataSplitBuilder::new()
+            .with_snapshot(42)
+            .with_partition(int_binary_row(&[2026, 7]))
+            .with_bucket(3)
+            .with_total_buckets(8)
+            .with_bucket_path("dt=20260706/bucket-3".to_string())
+            .with_data_files(vec![
+                v1_data_file("file-a", 0, 1, 10, 100),
+                v1_data_file("file-b", 1, 11, 20, 200),
+            ])
+            .with_data_deletion_files(vec![
+                None,
+                Some(DeletionFile::new("dv/file-b".to_string(), 2, 10, Some(3))),
+            ])
+            .with_raw_convertible(true)
+    }
+
+    #[test]
+    fn serialize_split_v1_matches_golden() {
+        // Golden generated by Java (paimon-core) for byte-for-byte cross-language compatibility.
+        let expected = include_bytes!("goldens/split_v1_data.bin");
+        let split = v1_data_split_builder().build().unwrap();
+        assert_eq!(
+            split.serialize_split_v1().unwrap().as_slice(),
+            &expected[..]
+        );
+    }
+
+    #[test]
+    fn serialize_indexed_split_v1_matches_golden() {
+        // Row ranges -> IndexedSplit (type 3): same DataSplit as split-v1-data + ranges [1,4],[11,13].
+        // The Java golden ends with vector scores, which the Rust split has none of, so compare against
+        // the golden up to its scores tail plus a `false` scores flag.
+        let golden = include_bytes!("goldens/split_v1_indexed.bin");
+        let scores_len = 1 + 4 + 3 * 4; // writeBoolean(true) + count + 3 floats
+        let mut expected = golden[..golden.len() - scores_len].to_vec();
+        expected.push(0); // scores = false
+        let split = v1_data_split_builder()
+            .with_row_ranges(vec![RowRange::new(1, 4), RowRange::new(11, 13)])
+            .build()
+            .unwrap();
+        assert_eq!(split.serialize_split_v1().unwrap(), expected);
     }
 }

@@ -533,6 +533,16 @@ impl BinaryRowBuilder {
         self.data[offset + 7] = 0x80 | (value.len() as u8);
     }
 
+    /// Inline (len <= 7) or var-length, matching Java `BinaryRowWriter`. Also correct for
+    /// nested rows / arrays: always > 7 bytes, so they land in the var part like `writeRow`.
+    pub fn write_bytes(&mut self, pos: usize, value: &[u8]) {
+        if value.len() <= 7 {
+            self.write_binary_inline(pos, value);
+        } else {
+            self.write_binary(pos, value);
+        }
+    }
+
     /// Write a compact Decimal (precision <= 18) as its unscaled i64 value.
     pub fn write_decimal_compact(&mut self, pos: usize, unscaled: i64) {
         self.write_long(pos, unscaled);
@@ -592,6 +602,12 @@ impl BinaryRowBuilder {
         serialized.extend_from_slice(&self.arity.to_be_bytes());
         serialized.extend_from_slice(&self.data);
         serialized
+    }
+
+    /// Raw row data without the arity prefix, for embedding in a parent serializer that writes
+    /// its own length (e.g. `writeInt(size) + rowData`).
+    pub fn build_row_data(self) -> Vec<u8> {
+        self.data
     }
 
     /// Write a Datum value at the given position, dispatching by type.
@@ -679,6 +695,66 @@ pub fn datums_to_binary_row(datums: &[(&Option<Datum>, &DataType)]) -> Vec<u8> {
         }
     }
     builder.build_serialized()
+}
+
+/// Round up to the nearest 8-byte word (Java `roundNumberOfBytesToNearestWord`).
+fn round_to_word(n: usize) -> usize {
+    let r = n & 7;
+    if r == 0 {
+        n
+    } else {
+        n + (8 - r)
+    }
+}
+
+/// `BinaryArray` header size: 4-byte element count + null bitset (4-byte aligned).
+fn binary_array_header(n: usize) -> usize {
+    4 + n.div_ceil(32) * 4
+}
+
+/// Serialize a `BinaryArray` of non-null UTF-8 strings, matching Java's `BinaryArray`
+/// layout: `[count(int)] [null bits] [8B element slots] [var-length part]`. Each element
+/// is inline (len <= 7) or an offset+length pointer, like `BinaryRowWriter`.
+pub fn serialize_binary_array_str(values: &[String]) -> Vec<u8> {
+    let n = values.len();
+    let header = binary_array_header(n);
+    let mut data = vec![0u8; round_to_word(header + n * 8)];
+    data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+    for (k, s) in values.iter().enumerate() {
+        let eo = header + k * 8;
+        let b = s.as_bytes();
+        if b.len() <= 7 {
+            data[eo..eo + b.len()].copy_from_slice(b);
+            data[eo + 7] = 0x80 | (b.len() as u8);
+        } else {
+            let var_off = data.len();
+            data.extend_from_slice(b);
+            let pad = (8 - (b.len() % 8)) % 8;
+            data.extend(std::iter::repeat_n(0u8, pad));
+            let encoded = ((var_off as u64) << 32) | (b.len() as u64);
+            data[eo..eo + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+    }
+    data
+}
+
+/// Serialize a `BinaryArray` of nullable i64 (Java `array<bigint>`): fixed 8-byte
+/// element slots, a set null bit for `None` elements.
+pub fn serialize_binary_array_long(values: &[Option<i64>]) -> Vec<u8> {
+    let n = values.len();
+    let header = binary_array_header(n);
+    let mut data = vec![0u8; round_to_word(header + n * 8)];
+    data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+    for (k, v) in values.iter().enumerate() {
+        match v {
+            None => data[4 + k / 8] |= 1 << (k % 8),
+            Some(x) => {
+                let eo = header + k * 8;
+                data[eo..eo + 8].copy_from_slice(&x.to_le_bytes());
+            }
+        }
+    }
+    data
 }
 
 /// Extract a Datum from an Arrow RecordBatch column at the given row index.

@@ -18,7 +18,10 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
 
-use super::{extract_datum_from_arrow, BinaryRowBuilder, DataType, Datum, EMPTY_SERIALIZED_ROW};
+use super::{
+    extract_datum_from_arrow, serialize_binary_array_long, BinaryRowBuilder, DataType, Datum,
+    EMPTY_SERIALIZED_ROW,
+};
 use arrow_array::RecordBatch;
 
 /// Deserialize `_NULL_COUNTS` which in Avro is `["null", {"type":"array","items":["null","long"]}]`.
@@ -108,6 +111,17 @@ impl BinaryTableStats {
             max_values: EMPTY_SERIALIZED_ROW.clone(),
             null_counts: Vec::new(),
         }
+    }
+
+    /// Serialize as a `SimpleStats.SCHEMA` BinaryRow (raw data, no arity prefix), matching
+    /// Java `SimpleStats#toRow`: `[_MIN_VALUES bytes] [_MAX_VALUES bytes] [_NULL_COUNTS array<bigint>]`.
+    /// `min_values`/`max_values` are already serialized `BinaryRow`s, written as-is.
+    pub fn to_simple_stats_row_data(&self) -> Vec<u8> {
+        let mut b = BinaryRowBuilder::new(3);
+        b.write_bytes(0, &self.min_values);
+        b.write_bytes(1, &self.max_values);
+        b.write_bytes(2, &serialize_binary_array_long(&self.null_counts));
+        b.build_row_data()
     }
 }
 

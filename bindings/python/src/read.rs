@@ -310,6 +310,14 @@ impl PySplit {
         self.inner.row_count()
     }
 
+    /// Serialize this planned split to the Java `SplitSerializer` (v1) binary, so pypaimon (or
+    /// any Paimon reader) can rebuild it without re-planning. A split carrying row ranges is
+    /// serialized as an `IndexedSplit`.
+    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Reduce to `Split(bytes)` for pickle/copy. The bytes are an opaque,
     /// implementation-detail encoding; only same/compatible-version round-trip
     /// is guaranteed.

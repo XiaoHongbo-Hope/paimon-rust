@@ -657,3 +657,58 @@ def test_time_travel_conflicting_selectors_raises():
         # both offending keys are named
         assert "scan.snapshot-id" in str(exc.value)
         assert "scan.tag-name" in str(exc.value)
+
+
+def test_split_serialize_produces_split_v1_binary():
+    import struct
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        assert splits
+        data = splits[0].serialize()
+        assert isinstance(data, (bytes, bytearray))
+        # SplitSerializer frame: "SPLIT_V1" + version(1) + type-id(1=DATA_SPLIT)
+        assert data[:8] == b"SPLIT_V1"
+        version, type_id = struct.unpack_from(">ii", data, 8)
+        assert version == 1
+        assert type_id == 1
+        # DataSplit v8 body follows: MAGIC + VERSION(8)
+        magic, body_version = struct.unpack_from(">qi", data, 16)
+        assert magic == -2394839472490812314
+        assert body_version == 8
+        assert splits[0].serialize() == data  # deterministic
+
+
+def test_split_serialize_carries_partition_and_reads():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "equal", "field": "dt", "literals": ["p1"]})
+        splits = b.new_scan().plan().splits()
+        assert splits
+        assert b"p1" in splits[0].serialize()  # partition value encoded
+        # partition filter pruned to p1
+        t = pa.Table.from_batches(b.new_read().read(splits))
+        assert sorted(t.column("id").to_pylist()) == [1, 2]
+
+
+def test_split_serialize_encodes_deletions_and_external_path():
+    # plan() can't produce these; inject them via the serde payload.
+    import json
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)  # two files
+        split = table.new_read_builder().new_scan().plan().splits()[0]
+        cls, (raw,) = split.__reduce__()
+        payload = json.loads(bytes(raw))
+        n = len(payload["data_files"])
+        assert n >= 2
+        payload["data_deletion_files"] = [
+            {"path": "dv/idx-0", "offset": 4, "length": 20, "cardinality": 3}
+        ] + [None] * (n - 1)
+        payload["data_files"][0]["_EXTERNAL_PATH"] = "s3://ext/data-0.parquet"
+
+        data = cls(json.dumps(payload).encode()).serialize()
+        assert b"dv/idx-0" in data                 # deletion file path
+        assert b"s3://ext/data-0.parquet" in data  # external path
