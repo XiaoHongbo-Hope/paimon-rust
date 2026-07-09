@@ -1216,6 +1216,7 @@ fn literal_scalar_for_parquet_filter(
         | DataType::Timestamp(_)
         | DataType::LocalZonedTimestamp(_)
         | DataType::Blob(_)
+        | DataType::Variant(_)
         | DataType::Array(_)
         | DataType::Map(_)
         | DataType::Multiset(_)

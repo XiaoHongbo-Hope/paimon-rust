@@ -39,9 +39,10 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
         PaimonDataType::Float(_) => ArrowDataType::Float32,
         PaimonDataType::Double(_) => ArrowDataType::Float64,
         PaimonDataType::VarChar(_) | PaimonDataType::Char(_) => ArrowDataType::Utf8,
-        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) | PaimonDataType::Blob(_) => {
-            ArrowDataType::Binary
-        }
+        PaimonDataType::Binary(_)
+        | PaimonDataType::VarBinary(_)
+        | PaimonDataType::Blob(_)
+        | PaimonDataType::Variant(_) => ArrowDataType::Binary,
         PaimonDataType::Date(_) => ArrowDataType::Date32,
         PaimonDataType::Time(_) => ArrowDataType::Time32(TimeUnit::Millisecond),
         PaimonDataType::Timestamp(t) => {

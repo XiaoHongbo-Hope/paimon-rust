@@ -521,6 +521,7 @@ fn validate_supported_type(data_type: &DataType) -> crate::Result<()> {
         | DataType::Binary(_)
         | DataType::VarBinary(_)
         | DataType::Blob(_)
+        | DataType::Variant(_)
         | DataType::Date(_)
         | DataType::Time(_)
         | DataType::Timestamp(_)
@@ -655,10 +656,14 @@ fn write_field_value(
                 .value(row_idx)
                 .as_bytes(),
         ),
-        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => write_bytes(
-            out,
-            downcast::<BinaryArray>(array, data_type)?.value(row_idx),
-        ),
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
+            write_bytes(out, downcast::<BinaryArray>(array, data_type)?.value(row_idx))
+        }
+        DataType::Variant(_) => {
+            return Err(Error::Unsupported {
+                message: "VariantType is not supported in .row field serialization".to_string(),
+            });
+        }
         DataType::Date(_) => out.extend_from_slice(
             &downcast::<Date32Array>(array, data_type)?
                 .value(row_idx)
@@ -1145,6 +1150,11 @@ impl ColumnBuilder {
             DataType::Char(_) | DataType::VarChar(_) => Self::String(StringBuilder::new()),
             DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
                 Self::Binary(BinaryBuilder::new())
+            }
+            DataType::Variant(_) => {
+                return Err(Error::Unsupported {
+                    message: "VariantType is not supported in .row ColumnBuilder".to_string(),
+                });
             }
             DataType::Date(_) => Self::Date(Date32Builder::with_capacity(capacity)),
             DataType::Time(_) => Self::Time(Time32MillisecondBuilder::with_capacity(capacity)),

@@ -78,6 +78,8 @@ pub enum DataType {
     VarBinary(VarBinaryType),
     /// Data type of binary large object.
     Blob(BlobType),
+    /// Data type of semi-structured variant.
+    Variant(VariantType),
     /// Data type of a fixed-length character string.
     Char(CharType),
     /// Data type of a variable-length character string.
@@ -140,6 +142,7 @@ impl DataType {
             DataType::Binary(v) => v.nullable,
             DataType::VarBinary(v) => v.nullable,
             DataType::Blob(v) => v.nullable,
+            DataType::Variant(v) => v.nullable,
             DataType::Char(v) => v.nullable,
             DataType::VarChar(v) => v.nullable,
             DataType::Date(v) => v.nullable,
@@ -177,6 +180,7 @@ impl DataType {
                 DataType::VarBinary(VarBinaryType::try_new(nullable, v.length())?)
             }
             DataType::Blob(_) => DataType::Blob(BlobType::with_nullable(nullable)),
+            DataType::Variant(_) => DataType::Variant(VariantType::with_nullable(nullable)),
             DataType::Char(v) => DataType::Char(CharType::with_nullable(nullable, v.length())?),
             DataType::VarChar(v) => {
                 DataType::VarChar(VarCharType::with_nullable(nullable, v.length())?)
@@ -619,6 +623,39 @@ impl Default for BlobType {
 }
 
 impl BlobType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+    }
+}
+
+/// VariantType for paimon.
+///
+/// Data type of semi-structured variant values.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/VariantType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
+pub struct VariantType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::VARIANT>>")]
+    nullable: bool,
+}
+
+impl Default for VariantType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VariantType {
     pub fn new() -> Self {
         Self::with_nullable(true)
     }
@@ -1732,6 +1769,11 @@ mod serde_utils {
         const NAME: &'static str = "BLOB";
     }
 
+    pub struct VARIANT;
+    impl DataTypeName for VARIANT {
+        const NAME: &'static str = "VARIANT";
+    }
+
     pub struct BINARY;
     impl DataTypeName for BINARY {
         const NAME: &'static str = "BINARY";
@@ -1965,6 +2007,14 @@ mod tests {
             (
                 "blob_type_nullable",
                 DataType::Blob(BlobType { nullable: true }),
+            ),
+            (
+                "variant_type",
+                DataType::Variant(VariantType { nullable: false }),
+            ),
+            (
+                "variant_type_nullable",
+                DataType::Variant(VariantType { nullable: true }),
             ),
             (
                 "boolean_type",
