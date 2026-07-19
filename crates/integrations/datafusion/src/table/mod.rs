@@ -21,7 +21,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::catalog::Session;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -44,6 +46,8 @@ use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
 
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+
 pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
     let mut fields = table.schema().fields().to_vec();
     if CoreOptions::new(table.schema().options()).data_evolution_enabled() {
@@ -54,6 +58,38 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
         ));
     }
     fields
+}
+
+fn datafusion_arrow_schema(
+    fields: &[DataField],
+    schema_force_view_types: bool,
+) -> DFResult<ArrowSchemaRef> {
+    let paimon_schema =
+        paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
+    let fields = paimon_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut metadata = field.metadata().clone();
+            metadata.remove(PARQUET_FIELD_ID_META_KEY);
+            let data_type = match field.data_type() {
+                ArrowDataType::Utf8 if schema_force_view_types => ArrowDataType::Utf8View,
+                data_type => data_type.clone(),
+            };
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(data_type)
+                    .with_metadata(metadata),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        paimon_schema.metadata().clone(),
+    )))
 }
 
 /// Read-only table provider for a Paimon table.
@@ -86,8 +122,7 @@ impl PaimonTableProvider {
         table_definition: Option<String>,
     ) -> DFResult<Self> {
         let fields = datafusion_read_fields(&table);
-        let schema =
-            paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
+        let schema = datafusion_arrow_schema(&fields, true)?;
         Ok(Self {
             table,
             schema,
@@ -112,6 +147,18 @@ impl PaimonTableProvider {
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new_with_table_definition(table, table_definition)
+    }
+
+    pub(crate) fn with_schema_force_view_types(
+        mut self,
+        schema_force_view_types: bool,
+    ) -> DFResult<Self> {
+        if schema_force_view_types {
+            return Ok(self);
+        }
+        let fields = datafusion_read_fields(&self.table);
+        self.schema = datafusion_arrow_schema(&fields, schema_force_view_types)?;
+        Ok(self)
     }
 
     pub fn table(&self) -> &Table {
@@ -479,6 +526,7 @@ mod tests {
     use datafusion::logical_expr::{col, lit, Expr};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
+    use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
     use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
 
     use crate::physical_plan::PaimonTableScan;
@@ -747,6 +795,71 @@ mod tests {
         assert!(snapshot_manager.commit_snapshot(&snapshot).await.unwrap());
 
         PaimonTableProvider::try_new(table).expect("provider should be created")
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_schema_hides_paimon_field_ids() {
+        let provider = data_evolution_projection_pruning_provider().await;
+
+        for field in provider.schema().fields() {
+            assert!(
+                !field.metadata().contains_key("PARQUET:field_id"),
+                "storage field id leaked through DataFusion schema for {}",
+                field.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_datafusion_schema_uses_views_only_for_top_level_strings() {
+        let string_type = || DataType::VarChar(VarCharType::string_type());
+        let schema = datafusion_arrow_schema(
+            &[
+                DataField::new(0, "plain".to_string(), string_type()),
+                DataField::new(
+                    1,
+                    "array".to_string(),
+                    DataType::Array(ArrayType::new(string_type())),
+                ),
+                DataField::new(
+                    2,
+                    "map".to_string(),
+                    DataType::Map(MapType::new(string_type(), string_type())),
+                ),
+                DataField::new(
+                    3,
+                    "row".to_string(),
+                    DataType::Row(RowType::new(vec![DataField::new(
+                        4,
+                        "nested".to_string(),
+                        string_type(),
+                    )])),
+                ),
+            ],
+            true,
+        )
+        .expect("DataFusion schema should be created");
+
+        assert_eq!(schema.field(0).data_type(), &ArrowDataType::Utf8View);
+
+        let ArrowDataType::List(element) = schema.field(1).data_type() else {
+            panic!("array field should map to an Arrow List");
+        };
+        assert_eq!(element.data_type(), &ArrowDataType::Utf8);
+
+        let ArrowDataType::Map(entries, _) = schema.field(2).data_type() else {
+            panic!("map field should map to an Arrow Map");
+        };
+        let ArrowDataType::Struct(map_fields) = entries.data_type() else {
+            panic!("map entries should map to an Arrow Struct");
+        };
+        assert_eq!(map_fields[0].data_type(), &ArrowDataType::Utf8);
+        assert_eq!(map_fields[1].data_type(), &ArrowDataType::Utf8);
+
+        let ArrowDataType::Struct(row_fields) = schema.field(3).data_type() else {
+            panic!("row field should map to an Arrow Struct");
+        };
+        assert_eq!(row_fields[0].data_type(), &ArrowDataType::Utf8);
     }
 
     fn planned_file_names(scan: &PaimonTableScan) -> Vec<String> {
@@ -1107,7 +1220,7 @@ mod tests {
             let pts = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<datafusion::arrow::array::StringViewArray>()
                 .unwrap();
             let ids = batch
                 .column(1)
