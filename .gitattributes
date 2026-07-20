@@ -1,2 +1,10 @@
-# Auto-generated dependency files — collapse in GitHub diffs
-*.tsv linguist-generated=true
+# Generated TSVs keep trailing empty columns.
+*.tsv text eol=lf linguist-generated=true whitespace=-blank-at-eol
+
+# Legal files are verified byte-for-byte.
+LICENSE text eol=lf
+NOTICE text eol=lf
+**/LICENSE text eol=lf
+**/NOTICE text eol=lf
+**/THIRD-PARTY-LICENSES*.html text eol=lf
+third-party-licenses/* text eol=lf

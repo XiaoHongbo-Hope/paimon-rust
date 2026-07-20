@@ -28,7 +28,6 @@ pub(crate) enum BlobFixtureValue<'a> {
     Null,
     Placeholder,
 }
-
 pub(crate) fn build_blob_file_bytes(rows: &[Option<&[u8]>]) -> Vec<u8> {
     let values = rows
         .iter()

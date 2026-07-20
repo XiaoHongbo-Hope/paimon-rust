@@ -44,7 +44,7 @@ In practice, the release relationship should look like this:
 3. build the Go embedded libraries from the same baseline,
 4. create a Go release commit that contains the generated `libpaimon_c.*.zst`
    files, and
-5. tag that commit as `bindings/go/vX.Y.Z` or `bindings/go/vX.Y.Z-rc.N`.
+5. tag that commit as `bindings/go/vX.Y.Z` or `bindings/go/vX.Y.Z-rcN`.
 
 This keeps a clear link to the Rust release baseline while allowing the Go
 submodule tag to contain the embedded artifacts required by Go module consumers.
@@ -66,7 +66,7 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
 - Decide the exact `source_ref` to pass into the release workflow.
 - Confirm whether this Go release is based on a Rust GA tag or an approved Rust
   release-candidate commit.
-- Use `vX.Y.Z-rc.N` for release candidates, for example `v0.1.0-rc.1`.
+- Use `vX.Y.Z-rcN` for release candidates, for example `v0.1.0-rc1`.
 - Use `vX.Y.Z` for the final general-availability release.
 - Confirm the version has not already been used as a Go submodule tag:
   `bindings/go/v0.1.0`.
@@ -76,14 +76,16 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
   - `libpaimon_c.linux.arm64.so.zst`
   - `libpaimon_c.darwin.amd64.dylib.zst`
   - `libpaimon_c.darwin.arm64.dylib.zst`
+- Confirm `LICENSE`, `NOTICE`, and all four `THIRD-PARTY-LICENSES.*.html`
+  files match `python3 scripts/release_licenses.py --check`.
 - Confirm CI is green on `main` before publishing.
 
 ## Publish
 
 - Open GitHub Actions and run `Release Go Binding`.
 - Provide the release version, for example `v0.1.0`.
-- Provide `source_ref`, for example `main`, `v0.1.0-rc.1`, or a specific commit SHA.
-- For release candidates, publish `bindings/go/vX.Y.Z-rc.N` first and verify it before the final tag.
+- Provide `source_ref`, for example `main`, `v0.1.0-rc1`, or a specific commit SHA.
+- For release candidates, publish `bindings/go/vX.Y.Z-rcN` first and verify it before the final tag.
 - Make sure the workflow is started from the intended Rust release baseline
   branch or commit lineage.
 - Wait for all matrix builds to finish successfully:
@@ -96,11 +98,14 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
 
 ## After Release
 
-- Confirm the release contains all four compressed shared-library assets.
+- Confirm the release contains LICENSE, NOTICE, four compressed shared libraries,
+  and four matching third-party license reports.
 - Confirm the tag resolves to a commit that contains:
   - `bindings/go/go.mod`
   - `bindings/go/RELEASE.md`
   - the four `libpaimon_c.*.zst` files
+  - `bindings/go/LICENSE` and `bindings/go/NOTICE`
+  - the four `bindings/go/THIRD-PARTY-LICENSES.*.html` files
 - Record which Rust release tag or baseline commit this Go binding release was
   built from.
 - Verify module resolution from a clean environment:
@@ -124,7 +129,7 @@ import paimon "github.com/apache/paimon-rust/bindings/go"
 ## Rollback Notes
 
 - Do not reuse a broken Go module version once it has been observed externally.
-- Do not delete and recreate an existing `bindings/go/vX.Y.Z-rc.N` or `bindings/go/vX.Y.Z` tag.
+- Do not delete and recreate an existing `bindings/go/vX.Y.Z-rcN` or `bindings/go/vX.Y.Z` tag.
 - Publish a new patch version instead, for example move from `v0.1.0` to `v0.1.1`.
-- If an RC is bad, publish the next RC, for example move from `v0.1.0-rc.1` to `v0.1.0-rc.2`.
+- If an RC is bad, publish the next RC, for example move from `v0.1.0-rc1` to `v0.1.0-rc2`.
 - If the workflow fails before pushing the tag, fix the issue and rerun with the same intended version.

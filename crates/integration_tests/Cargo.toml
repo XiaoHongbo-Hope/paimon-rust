@@ -17,9 +17,11 @@
 
 [package]
 name = "paimon-integration-tests"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 

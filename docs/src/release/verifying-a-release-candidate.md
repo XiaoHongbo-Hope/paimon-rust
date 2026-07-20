@@ -89,7 +89,7 @@ cd paimon-rust-${RELEASE_VERSION}
 Build the workspace:
 
 ```bash
-cargo build --workspace --release
+cargo build --locked --workspace --release
 ```
 
 For Python binding, see `bindings/python/`. For Go binding, see `bindings/go/`.
@@ -98,12 +98,31 @@ For Python binding, see `bindings/python/`. For Go binding, see `bindings/go/`.
 
 Unzip the source release archive and verify that:
 
-1. The **LICENSE** and **NOTICE** files in the root directory are correct and refer to dependencies in the source release.
-2. All files that need it have ASF license headers.
-3. All dependencies have been checked for their license and the license is ASL 2.0 compatible ([ASF third-party license policy](http://www.apache.org/legal/resolved.html#category-x)).
-4. Compatible non-ASL 2.0 licenses are documented (e.g. in NOTICE or in dependency audit files such as `DEPENDENCIES*.tsv`).
+1. The root **LICENSE**, **NOTICE**, and **Cargo.lock** files are present and correct.
+2. All committed `DEPENDENCIES.rust.tsv` reports match the locked dependency graph.
+3. All files that need it have ASF license headers.
+4. All dependencies have been checked for license compatibility with the [ASF third-party license policy](http://www.apache.org/legal/resolved.html#category-x).
+5. Compatible non-ASL 2.0 licenses and bundled source components are documented in the generated dependency or third-party license reports.
 
-The project uses [cargo-deny](https://embarkstudios.github.io/cargo-deny/) for license checks; see [Creating a Release](creating-a-release.md) for how the dependency list is generated before a release.
+The project uses [cargo-deny](https://embarkstudios.github.io/cargo-deny/) and [cargo-about](https://github.com/EmbarkStudios/cargo-about). Reproduce the committed reports with:
+
+```bash
+cargo install cargo-deny --version 0.19.6 --locked
+cargo install cargo-about --version 0.9.1 --locked
+cargo fetch --locked
+python3 scripts/dependencies.py check
+python3 scripts/dependencies.py verify
+python3 scripts/release_licenses.py --check
+```
+
+Also inspect the publishable Rust package inventories:
+
+```bash
+cargo package --locked -p paimon --list
+cargo package --locked -p paimon-datafusion --list
+```
+
+Each package must contain its crate-local `LICENSE`, `NOTICE`, `DEPENDENCIES.rust.tsv`, shared test helpers, and `testdata/` fixtures. Python wheels must contain `LICENSE`, `NOTICE`, and `THIRD-PARTY-LICENSES.html`; the Go release must contain `LICENSE`, `NOTICE`, four native libraries, and the four matching third-party license reports.
 
 ## Testing Features
 

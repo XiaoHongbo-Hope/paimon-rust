@@ -18,11 +18,13 @@
 [package]
 name = "paimon-c"
 description = "C bindings for Apache Paimon Rust"
+publish = false
 
 repository.workspace = true
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

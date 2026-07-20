@@ -21,6 +21,7 @@ publish = false
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

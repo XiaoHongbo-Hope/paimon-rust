@@ -17,28 +17,34 @@
 # under the License.
 
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
-def list_packages():
-    """Package directories from [workspace].members in root Cargo.toml, plus workspace root.
-    Each gets a DEPENDENCIES.rust.tsv. Avoids scanning target/, .git/, etc.
-    Requires Python 3.11+ (tomllib).
-    """
+@dataclass(frozen=True)
+class PackageSpec:
+    output_dir: str
+    manifest_path: str
+
+
+def list_packages() -> list[PackageSpec]:
+    """List dependency report inputs and destinations."""
     root_cargo = ROOT_DIR / "Cargo.toml"
     if not root_cargo.exists():
-        return ["."]
+        return [PackageSpec(".", "Cargo.toml")]
     with open(root_cargo, "rb") as f:
         data = tomllib.load(f)
     members = data.get("workspace", {}).get("members", [])
     if not isinstance(members, list):
-        return ["."]
-    packages = ["."]
+        return [PackageSpec(".", "Cargo.toml")]
+    packages = [PackageSpec(".", "Cargo.toml")]
     for m in members:
         if isinstance(m, str) and m:
-            packages.append(m)
+            packages.append(PackageSpec(m, f"{m}/Cargo.toml"))
+    # The Go module embeds paimon-c.
+    packages.append(PackageSpec("bindings/go", "bindings/c/Cargo.toml"))
     return packages
 
 

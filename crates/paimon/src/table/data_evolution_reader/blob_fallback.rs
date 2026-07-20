@@ -313,10 +313,7 @@ mod tests {
 
     #[allow(dead_code)]
     mod blob_test_utils {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../blob_test_utils.rs"
-        ));
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));
     }
 
     use blob_test_utils::{build_blob_file_bytes_with_values, BlobFixtureValue};

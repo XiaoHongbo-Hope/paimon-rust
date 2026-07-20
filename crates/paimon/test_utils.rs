@@ -53,7 +53,6 @@ pub(crate) fn write_int_parquet_file(
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 }
-
 pub(crate) fn local_file_path(path: &Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
     if normalized.starts_with('/') {

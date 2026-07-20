@@ -20,8 +20,7 @@ name: Release Go Binding
 on:
   push:
     tags:
-      # Trigger this workflow when tag follows the versioning format: v<major>.<minor>.<patch> OR v<major>.<minor>.<patch>-rc<release_candidate>
-      # Example valid tags: v0.4.0, v0.4.0-rc1
+      # Tags: vX.Y.Z or vX.Y.Z-rcN.
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
   workflow_dispatch:
@@ -69,8 +68,8 @@ jobs:
             version="$tag_name"
           fi
 
-          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-            echo "invalid version: $version; expected vX.Y.Z or vX.Y.Z-rc.N" >&2
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "invalid version: $version; expected vX.Y.Z or vX.Y.Z-rcN" >&2
             exit 1
           fi
           if [[ -z "$source_ref" ]]; then
@@ -103,12 +102,20 @@ jobs:
         include:
           - runner: ubuntu-latest
             expected_file: libpaimon_c.linux.amd64.so.zst
+            rust_target: x86_64-unknown-linux-gnu
+            license_file: THIRD-PARTY-LICENSES.linux.amd64.html
           - runner: ubuntu-24.04-arm
             expected_file: libpaimon_c.linux.arm64.so.zst
+            rust_target: aarch64-unknown-linux-gnu
+            license_file: THIRD-PARTY-LICENSES.linux.arm64.html
           - runner: macos-15-intel
             expected_file: libpaimon_c.darwin.amd64.dylib.zst
+            rust_target: x86_64-apple-darwin
+            license_file: THIRD-PARTY-LICENSES.darwin.amd64.html
           - runner: macos-14
             expected_file: libpaimon_c.darwin.arm64.dylib.zst
+            rust_target: aarch64-apple-darwin
+            license_file: THIRD-PARTY-LICENSES.darwin.arm64.html
 
     steps:
       - uses: actions/checkout@v7
@@ -143,17 +150,23 @@ jobs:
         working-directory: bindings/go
         run: make build
 
-      - name: Verify packaged library
-        working-directory: bindings/go
+      - name: Stage and verify packaged library
         shell: bash
         run: |
-          test -s '${{ matrix.expected_file }}'
+          mkdir -p release/go
+          cp 'bindings/go/${{ matrix.expected_file }}' release/go/
+          cp 'bindings/go/${{ matrix.license_file }}' release/go/
+          python3 scripts/verify_go_release_artifacts.py \
+            --artifacts-dir release/go \
+            --target '${{ matrix.rust_target }}'
 
       - name: Upload packaged library
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.expected_file }}
-          path: bindings/go/${{ matrix.expected_file }}
+          path: |
+            release/go/${{ matrix.expected_file }}
+            release/go/${{ matrix.license_file }}
           if-no-files-found: error
 
   publish:
@@ -167,24 +180,30 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.source_sha }}
 
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.1
+
+      - name: Verify generated release licenses
+        run: |
+          cargo fetch --locked
+          python3 scripts/release_licenses.py --check
+
+      - name: Install artifact verification tools
+        run: sudo apt-get update && sudo apt-get install -y file zstd
+
       - name: Download packaged libraries
         uses: actions/download-artifact@v8
         with:
-          path: bindings/go
+          path: release/go
           merge-multiple: true
 
       - name: Verify embedded assets
-        working-directory: bindings/go
         shell: bash
         run: |
-          for file in \
-            libpaimon_c.linux.amd64.so.zst \
-            libpaimon_c.linux.arm64.so.zst \
-            libpaimon_c.darwin.amd64.dylib.zst \
-            libpaimon_c.darwin.arm64.dylib.zst
-          do
-            test -s "$file"
-          done
+          cp bindings/go/LICENSE bindings/go/NOTICE release/go/
+          python3 scripts/verify_go_release_artifacts.py --artifacts-dir release/go
 
       - name: Create release tag commit
         env:
@@ -197,7 +216,12 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git add bindings/go/libpaimon_c.*.zst
+          cp release/go/libpaimon_c.*.zst bindings/go/
+          git add \
+            bindings/go/libpaimon_c.*.zst \
+            bindings/go/LICENSE \
+            bindings/go/NOTICE \
+            bindings/go/THIRD-PARTY-LICENSES.*.html
 
           if ! git diff --cached --quiet; then
             git commit -m "bindings/go: release ${VERSION} (from ${SOURCE_REF}@${SOURCE_SHA})"
@@ -211,12 +235,18 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
           GH_TOKEN: ${{ github.token }}
-        working-directory: bindings/go
+        working-directory: release/go
         run: |
           gh release create "$TAG" \
             --title "Release Go binding $VERSION" \
             --generate-notes \
+            LICENSE \
+            NOTICE \
             libpaimon_c.linux.amd64.so.zst \
             libpaimon_c.linux.arm64.so.zst \
             libpaimon_c.darwin.amd64.dylib.zst \
-            libpaimon_c.darwin.arm64.dylib.zst
+            libpaimon_c.darwin.arm64.dylib.zst \
+            THIRD-PARTY-LICENSES.linux.amd64.html \
+            THIRD-PARTY-LICENSES.linux.arm64.html \
+            THIRD-PARTY-LICENSES.darwin.amd64.html \
+            THIRD-PARTY-LICENSES.darwin.arm64.html

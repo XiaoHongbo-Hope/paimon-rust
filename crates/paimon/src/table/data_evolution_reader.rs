@@ -2289,15 +2289,12 @@ mod tests {
     use tempfile::tempdir;
 
     mod blob_test_utils {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../blob_test_utils.rs"
-        ));
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));
     }
 
     #[allow(dead_code)]
     mod test_utils {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/test_utils.rs"));
     }
 
     use blob_test_utils::{write_blob_file, write_blob_file_with_values, BlobFixtureValue};

@@ -164,35 +164,51 @@ RC_NUM="1"
 RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
 ```
 
-### Generate dependencies list
+### Generate dependency and license reports
 
-[ASF release policy](https://www.apache.org/legal/release-policy.html) requires that every release comply with [ASF licensing policy](https://www.apache.org/legal/resolved.html). Generate and commit a dependency list on `main` **before** creating the release branch, so both `main` and the release branch have the same list.
+[ASF release policy](https://www.apache.org/legal/release-policy.html) requires that every release comply with [ASF licensing policy](https://www.apache.org/legal/resolved.html). Generate and commit the dependency and artifact license reports on `main` **before** creating the release branch, so both `main` and the release branch use the same locked dependency graph.
 
-1. Install [cargo-deny](https://embarkstudios.github.io/cargo-deny/):
+1. Install the pinned release tools:
 
     ```bash
-    cargo install cargo-deny
+    cargo install cargo-deny --version 0.19.6 --locked
+    cargo install cargo-about --version 0.9.1 --locked
     ```
 
-2. Generate the dependency list (requires **Python 3.11+**):
+2. Generate the reports (requires **Python 3.11+**):
 
     ```bash
     git checkout main
     git pull
+    cargo fetch --locked
+    cargo metadata --locked --format-version 1 > /dev/null
     python3 scripts/dependencies.py generate
+    python3 scripts/release_licenses.py
     ```
 
-    This creates a `DEPENDENCIES.rust.tsv` file for the workspace root and each member crate.
+    This creates `DEPENDENCIES.rust.tsv` files for the workspace and release components, target-specific Python wheel license bundles under `bindings/python/licenses/`, and the Go module's `LICENSE`, `NOTICE`, and target-specific `THIRD-PARTY-LICENSES.*.html` files.
 
-3. Commit the result:
+3. Verify the committed output is reproducible:
 
     ```bash
-    git add **/DEPENDENCIES*.tsv
-    git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
+    python3 scripts/dependencies.py check
+    python3 scripts/dependencies.py verify
+    python3 scripts/release_licenses.py --check
+    ```
+
+4. Commit the result, including the locked dependency graph:
+
+    ```bash
+    git add Cargo.lock DEPENDENCIES.rust.tsv
+    git add -- ':(glob)**/DEPENDENCIES.rust.tsv'
+    git add bindings/python/licenses
+    git add bindings/go/LICENSE bindings/go/NOTICE
+    git add -- 'bindings/go/THIRD-PARTY-LICENSES.*.html'
+    git commit -m "chore: update legal metadata for release ${RELEASE_VERSION}"
     git push origin main
     ```
 
-To only check licenses without generating files: `python3 scripts/dependencies.py check`.
+The publishable Rust crates must also package crate-local `LICENSE` and `NOTICE` copies matching the repository root, plus `DEPENDENCIES.rust.tsv`, shared test helpers, and `testdata/` fixtures. The `Release Rust` workflow checks this package inventory before any upload.
 
 ### Create a release branch
 
@@ -264,9 +280,10 @@ Upload the source release to the ASF dev area:
 svn checkout https://dist.apache.org/repos/dist/dev/paimon/ paimon-dist-dev --depth=immediates
 cd paimon-dist-dev
 mkdir paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}
-cp ../paimon-rust-${RELEASE_VERSION}.tar.gz* paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}/
+cp ../dist/paimon-rust-${RELEASE_VERSION}.tar.gz* paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}/
 svn add paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}
 svn commit -m "Add paimon-rust ${RELEASE_VERSION} RC${RC_NUM}"
+cd ..
 ```
 
 **Checklist**

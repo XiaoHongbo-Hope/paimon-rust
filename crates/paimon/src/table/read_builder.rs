@@ -635,7 +635,7 @@ mod tests {
     use super::{PaimonReadBuilder, ReadBuilder, ReadBuilderKind};
     use crate::table::TableRead;
     mod test_utils {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/test_utils.rs"));
     }
 
     use crate::catalog::Identifier;
