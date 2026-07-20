@@ -20,6 +20,7 @@ categories = ["database"]
 description = "The rust implementation of Apache Paimon"
 documentation = "https://docs.rs/paimon"
 name = "paimon"
+publish = ["crates-io"]
 exclude = ["testdata/"]
 
 homepage.workspace = true
@@ -27,6 +28,7 @@ repository.workspace = true
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["storage-memory", "storage-fs", "storage-oss"]

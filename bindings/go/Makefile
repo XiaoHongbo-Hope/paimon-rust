@@ -45,7 +45,7 @@ LIB_NAME := libpaimon_c.$(OS).$(ARCH).$(LIB_EXT)
 
 # Build the Rust shared library, compress with zstd, and place in Go package dir.
 build:
-	cd $(RUST_ROOT) && cargo build -p paimon-c --release
+	cd $(RUST_ROOT) && cargo build --locked -p paimon-c --release
 	zstd -19 -f $(TARGET_DIR)/release/libpaimon_c.$(LIB_EXT) -o $(GO_DIR)/$(LIB_NAME).zst
 
 # Run Go integration tests.

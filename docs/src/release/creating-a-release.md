@@ -171,7 +171,7 @@ RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
 1. Install [cargo-deny](https://embarkstudios.github.io/cargo-deny/):
 
     ```bash
-    cargo install cargo-deny
+    cargo install cargo-deny --version 0.19.6 --locked
     ```
 
 2. Generate the dependency list (requires **Python 3.11+**):
@@ -179,15 +179,17 @@ RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
     ```bash
     git checkout main
     git pull
+    cargo fetch --locked
     python3 scripts/dependencies.py generate
+    python3 scripts/dependencies.py verify
     ```
 
-    This creates a `DEPENDENCIES.rust.tsv` file for the workspace root and each member crate.
+    This creates dependency reports for the workspace, each member crate, and the Go binding.
 
 3. Commit the result:
 
     ```bash
-    git add **/DEPENDENCIES*.tsv
+    git add Cargo.lock DEPENDENCIES.rust.tsv '**/DEPENDENCIES.rust.tsv'
     git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
     git push origin main
     ```
