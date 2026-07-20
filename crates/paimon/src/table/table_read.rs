@@ -110,6 +110,22 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Configure whether data predicates may remove rows from emitted batches.
+    ///
+    /// When disabled, predicates remain available for conservative scan and
+    /// file-format pruning, and the caller must enforce them exactly. Merge and
+    /// data-evolution readers do not push such predicates below materialization.
+    pub fn with_row_filter(self, row_filter: bool) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => {
+                Self(TableReadKind::Paimon(read.with_row_filter(row_filter)))
+            }
+            TableReadKind::Format(read) => {
+                Self(TableReadKind::Format(read.with_row_filter(row_filter)))
+            }
+        }
+    }
+
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         match &self.0 {
@@ -158,6 +174,7 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
+    row_filter: bool,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -171,6 +188,7 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
+            row_filter: true,
         }
     }
 
@@ -189,9 +207,9 @@ impl<'a> PaimonTableRead<'a> {
         self.table
     }
 
-    /// Set a filter predicate. Used conservatively for read-side pruning and
-    /// enforced exactly by residual filtering on append, data-evolution, and
-    /// primary-key merge read paths (see
+    /// Set a filter predicate. Used conservatively for read-side pruning and,
+    /// unless row filtering is disabled, enforced exactly by residual filtering
+    /// on append, data-evolution, and primary-key merge read paths (see
     /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
     /// for per-format exceptions).
     pub fn with_filter(mut self, filter: Predicate) -> Self {
@@ -201,6 +219,11 @@ impl<'a> PaimonTableRead<'a> {
         // residual pass applies the full predicate exactly. Pruning here would
         // drop compound predicates before the residual could enforce them.
         self.data_predicates = data_predicates;
+        self
+    }
+
+    fn with_row_filter(mut self, row_filter: bool) -> Self {
+        self.row_filter = row_filter;
         self
     }
 
@@ -286,6 +309,7 @@ impl<'a> PaimonTableRead<'a> {
             read_type,
             self.data_predicates.clone(),
         )
+        .with_row_filter(self.row_filter)
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
         let raw_stream = reader.read(&data_splits)?;
 
@@ -443,7 +467,8 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
             },
-        );
+        )
+        .with_row_filter(self.row_filter);
         reader.read(splits)
     }
 
@@ -466,6 +491,7 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
         )?
+        .with_row_filter(self.row_filter)
         .with_batch_size(Some(core_options.read_batch_size()?));
         reader.read(data_splits)
     }
@@ -484,6 +510,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_row_filter(self.row_filter)
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?)))
     }
 }
@@ -639,6 +666,19 @@ mod tests {
         assert!(pk_split_needs_merge(&dv_l0, true));
         let dv_compacted = split(vec![file("a", 5, None)], false);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
+    }
+
+    #[test]
+    fn test_row_filter_disabled_keeps_data_predicates() {
+        let table = query_auth_table();
+        let read = PaimonTableRead::new(
+            &table,
+            table.schema.fields().to_vec(),
+            vec![Predicate::AlwaysFalse],
+        )
+        .with_row_filter(false);
+
+        assert_eq!(read.data_predicates(), &[Predicate::AlwaysFalse]);
     }
 
     #[test]

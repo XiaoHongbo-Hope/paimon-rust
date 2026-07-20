@@ -164,6 +164,7 @@ target/release/paimon-tpcds-bench run \
   --warmup 1 \
   --iterations 3 \
   --target-partitions 64 \
+  --parquet-pushdown-filters \
   --memory-limit-gib 192 \
   --spill-dir /nvme/datafusion-spill \
   --max-spill-gib 1024
@@ -172,6 +173,10 @@ target/release/paimon-tpcds-bench run \
 This is an end-to-end source comparison. Loading the data into Paimon rewrites
 the physical files, so it is not a pure measurement of catalog or manifest
 overhead.
+
+`--parquet-pushdown-filters` only controls DataFusion's Parquet reader. Paimon
+always receives supported predicates for conservative pruning, while exact row
+filtering stays in the parent DataFusion operator for benchmark runs.
 
 ## Cache Protocol
 

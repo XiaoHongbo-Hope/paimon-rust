@@ -270,10 +270,12 @@ impl FormatFileReader for ParquetFormatReader {
         let arrow_file_reader = ArrowFileReader::new(file_size, reader);
 
         let empty_predicates = Vec::new();
-        let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
-            Some(fp) => (&fp.predicates, &fp.file_fields),
-            None => (&empty_predicates, &[]),
-        };
+        let (preds, apply_row_filter, file_fields): (&[Predicate], bool, &[DataField]) =
+            match predicates {
+                Some(fp) => (&fp.predicates, fp.apply_row_filter, &fp.file_fields),
+                None => (&empty_predicates, true, &[]),
+            };
+        let pruning_preds = preds;
 
         // Only load the Parquet page index (ColumnIndex + OffsetIndex) when a
         // predicate can use it for page-level pruning — matching Java Paimon,
@@ -284,7 +286,7 @@ impl FormatFileReader for ParquetFormatReader {
         // skip it. `Optional` lets files without a page index fall through to
         // row-group-level pruning instead of erroring.
         let mut arrow_options = ArrowReaderOptions::new();
-        if !preds.is_empty() {
+        if !pruning_preds.is_empty() {
             arrow_options = arrow_options.with_page_index_policy(PageIndexPolicy::Optional);
         }
         let mut batch_stream_builder =
@@ -303,9 +305,10 @@ impl FormatFileReader for ParquetFormatReader {
         // predicate is fully enforced, so we decode exactly `read_fields`, skip
         // the residual pass entirely, and return the stream as before — zero
         // added overhead.
-        let all_enforced = preds
-            .iter()
-            .all(|p| predicate_fully_enforced_by_row_filter(&parquet_schema, p, file_fields));
+        let all_enforced = !apply_row_filter
+            || preds
+                .iter()
+                .all(|p| predicate_fully_enforced_by_row_filter(&parquet_schema, p, file_fields));
 
         // Residual branch must decode the predicate columns too, or the residual
         // pass could not see a predicate on a non-projected column (Gap A). The
@@ -331,14 +334,16 @@ impl FormatFileReader for ParquetFormatReader {
         let mask = ProjectionMask::roots(&parquet_schema, root_indices);
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
-        let parquet_row_filter = build_parquet_row_filter(&parquet_schema, preds, file_fields)?;
-        if let Some(f) = parquet_row_filter {
-            batch_stream_builder = batch_stream_builder.with_row_filter(f);
+        if apply_row_filter {
+            let parquet_row_filter = build_parquet_row_filter(&parquet_schema, preds, file_fields)?;
+            if let Some(f) = parquet_row_filter {
+                batch_stream_builder = batch_stream_builder.with_row_filter(f);
+            }
         }
 
         let predicate_row_selection = build_predicate_row_selection(
             batch_stream_builder.metadata().row_groups(),
-            preds,
+            pruning_preds,
             file_fields,
         )?;
         let mut combined_selection = predicate_row_selection;
@@ -346,8 +351,11 @@ impl FormatFileReader for ParquetFormatReader {
         // Page-level selection. Returns `None` when ColumnIndex / OffsetIndex are
         // absent (page index not loaded, older files, writer without page index)
         // or when no page could be skipped, so intersecting is a no-op then.
-        let page_selection =
-            build_predicate_page_selection(batch_stream_builder.metadata(), preds, file_fields)?;
+        let page_selection = build_predicate_page_selection(
+            batch_stream_builder.metadata(),
+            pruning_preds,
+            file_fields,
+        )?;
         combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
 
         if let Some(ref ranges) = row_selection {
@@ -396,6 +404,7 @@ impl FormatFileReader for ParquetFormatReader {
         // projects the filtered batch to `read_fields` by name.
         let residual_predicates = FilePredicates {
             predicates: preds.to_vec(),
+            apply_row_filter: true,
             file_fields: file_fields.to_vec(),
         };
         let stream = batch_stream.map(move |result| {
@@ -3009,6 +3018,7 @@ mod tests {
 
         let predicates = FilePredicates {
             predicates: vec![predicate],
+            apply_row_filter: true,
             file_fields: id_name_age_file_fields(),
         };
 
@@ -3163,6 +3173,7 @@ mod tests {
         let reader_input = input.reader().await.unwrap();
         let predicates = FilePredicates {
             predicates: vec![leaf_gt, leaf_lt],
+            apply_row_filter: true,
             file_fields,
         };
         let reader = ParquetFormatReader;
@@ -3480,6 +3491,7 @@ mod tests {
         ])];
         let file_predicates = FilePredicates {
             predicates,
+            apply_row_filter: true,
             file_fields: fields.clone(),
         };
 

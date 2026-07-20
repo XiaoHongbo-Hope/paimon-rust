@@ -38,6 +38,7 @@ pub(crate) struct FormatTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
+    row_filter: bool,
     limit: Option<usize>,
 }
 
@@ -52,6 +53,7 @@ impl<'a> FormatTableRead<'a> {
             table,
             read_type,
             data_predicates,
+            row_filter: true,
             limit,
         }
     }
@@ -73,6 +75,11 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
+    pub(crate) fn with_row_filter(mut self, row_filter: bool) -> Self {
+        self.row_filter = row_filter;
+        self
+    }
+
     pub(crate) fn to_arrow(
         &self,
         data_splits: &[DataSplit],
@@ -88,13 +95,13 @@ impl<'a> FormatTableRead<'a> {
         let table_fields = self.table.schema().fields().to_vec();
         let (data_table_fields, data_predicates) =
             split_format_table_fields(&table_fields, &partition_keys, &self.data_predicates);
-
         let splits = data_splits.to_vec();
         let file_io = self.table.file_io().clone();
         let schema_manager = self.table.schema_manager().clone();
         let schema_id = self.table.schema().id();
         let mut remaining = self.limit;
         let batch_size = Some(core_options.read_batch_size()?);
+        let row_filter = self.row_filter;
 
         Ok(try_stream! {
             for split in splits {
@@ -110,6 +117,7 @@ impl<'a> FormatTableRead<'a> {
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )
+                .with_row_filter(row_filter)
                 .with_batch_size(batch_size)
                 .read(std::slice::from_ref(&split))?;
 

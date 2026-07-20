@@ -1524,7 +1524,9 @@ SET 'paimon.scan.version' = '1';
 RESET 'paimon.scan.version';
 ```
 
-Options prefixed with `paimon.` are handled by Paimon; all others are delegated to DataFusion. Dynamic options are applied at table load time via `table.copy_with_options()`.
+Quoted options prefixed with `paimon.` are handled as Paimon table options; all
+others are delegated to DataFusion. Dynamic table options are applied at table
+load time via `table.copy_with_options()`.
 
 Example — enable BLOB descriptor mode:
 
