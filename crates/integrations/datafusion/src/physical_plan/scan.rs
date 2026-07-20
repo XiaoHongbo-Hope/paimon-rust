@@ -1156,7 +1156,7 @@ impl DisplayAs for PaimonTableScan {
 mod tests {
     use super::*;
     mod test_utils {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_utils.rs"));
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/test_utils.rs"));
     }
 
     use datafusion::arrow::array::Int32Array;

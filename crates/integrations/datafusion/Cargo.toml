@@ -20,7 +20,6 @@ name = "paimon-datafusion"
 edition.workspace = true
 version.workspace = true
 publish = ["crates-io"]
-exclude = ["testdata/"]
 license.workspace = true
 rust-version.workspace = true
 homepage = "https://paimon.apache.org/docs/rust/datafusion/"
