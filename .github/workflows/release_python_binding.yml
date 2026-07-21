@@ -16,7 +16,7 @@
 # under the License.
 
 # Publish the paimon Python binding to PyPI.
-# Trigger: push tag only (e.g. v0.1.0).
+# Trigger: release tag push or manual dispatch.
 # Pre-release tags (containing '-') publish to TestPyPI; release tags publish to PyPI.
 #
 # Token auth: add secrets PYPI_API_TOKEN / TEST_PYPI_API_TOKEN for publishing.
@@ -29,21 +29,37 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.3.0-rc2
+        required: true
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
-      - uses: PyO3/maturin-action@v1
+      - name: Set Python release version
+        run: >
+          python3 scripts/python_release_version.py
+          --tag "${RELEASE_TAG}"
+          --pyproject bindings/python/pyproject.toml
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: bindings/python
           command: sdist
@@ -69,8 +85,17 @@ jobs:
           - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
-      - uses: PyO3/maturin-action@v1
+      - name: Set Python release version
+        shell: bash
+        run: >
+          python3 scripts/python_release_version.py
+          --tag "${RELEASE_TAG}"
+          --pyproject bindings/python/pyproject.toml
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: bindings/python
           target: ${{ matrix.target }}
@@ -143,7 +168,7 @@ jobs:
     permissions:
       contents: read
     needs: [sdist, wheels]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(inputs.tag || github.ref_name, 'v')
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -152,8 +177,8 @@ jobs:
           path: bindings/python/dist
 
       - name: Publish to TestPyPI
-        if: contains(github.ref, '-')
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        if: contains(env.RELEASE_TAG, '-')
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
@@ -161,8 +186,8 @@ jobs:
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
       - name: Publish to PyPI
-        if: ${{ !contains(github.ref, '-') }}
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        if: ${{ !contains(env.RELEASE_TAG, '-') }}
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           skip-existing: true
           packages-dir: bindings/python/dist
