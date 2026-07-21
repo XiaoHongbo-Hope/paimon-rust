@@ -757,6 +757,104 @@ pub fn serialize_binary_array_long(values: &[Option<i64>]) -> Vec<u8> {
     data
 }
 
+/// Reverse of [`serialize_binary_array_str`].
+pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
+    let n = read_binary_array_len(data)?;
+    let header = binary_array_header(n);
+    // The fixed element region is `n * 8` bytes after the header; reject any
+    // count whose slots cannot fit in the buffer up front. This bounds both the
+    // reservation and the loop, so a forged large count (with or without
+    // element slots) cannot amplify memory before per-element validation.
+    check_binary_array_fits(n, header, data.len())?;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let eo = header + k * 8;
+        let slot = data
+            .get(eo..eo + 8)
+            .ok_or_else(|| bin_arr_err("string element slot out of range"))?;
+        let marker = slot[7];
+        let bytes = if marker & 0x80 != 0 {
+            let len = (marker & 0x7F) as usize;
+            slot.get(..len)
+                .ok_or_else(|| bin_arr_err("inline string length out of range"))?
+        } else {
+            let encoded = u64::from_le_bytes(slot.try_into().unwrap());
+            let var_off = (encoded >> 32) as usize;
+            let len = (encoded & 0xFFFF_FFFF) as usize;
+            let end = var_off
+                .checked_add(len)
+                .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?;
+            data.get(var_off..end)
+                .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?
+        };
+        out.push(
+            std::str::from_utf8(bytes)
+                .map_err(|_| bin_arr_err("string element is not valid UTF-8"))?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// Reverse of [`serialize_binary_array_long`].
+pub fn deserialize_binary_array_long(data: &[u8]) -> crate::Result<Vec<Option<i64>>> {
+    let n = read_binary_array_len(data)?;
+    let header = binary_array_header(n);
+    // See `deserialize_binary_array_str`: reject a count whose fixed element
+    // region overflows the buffer before allocating. Null elements skip the
+    // per-slot read, so this up-front check is what prevents a forged
+    // "large count + all-null bitmap + no slots" input from amplifying memory.
+    check_binary_array_fits(n, header, data.len())?;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let null = data
+            .get(4 + k / 8)
+            .map(|b| b & (1 << (k % 8)) != 0)
+            .unwrap_or(false);
+        if null {
+            out.push(None);
+        } else {
+            let eo = header + k * 8;
+            let slot = data
+                .get(eo..eo + 8)
+                .ok_or_else(|| bin_arr_err("long element slot out of range"))?;
+            out.push(Some(i64::from_le_bytes(slot.try_into().unwrap())));
+        }
+    }
+    Ok(out)
+}
+
+fn read_binary_array_len(data: &[u8]) -> crate::Result<usize> {
+    let raw = data
+        .get(0..4)
+        .ok_or_else(|| bin_arr_err("binary array too short for length prefix"))?;
+    let n = i32::from_le_bytes(raw.try_into().unwrap());
+    if n < 0 {
+        return Err(bin_arr_err("binary array has negative length"));
+    }
+    Ok(n as usize)
+}
+
+/// Reject a binary array whose `n` fixed 8-byte element slots cannot fit in the
+/// buffer after its `header`. Computed without overflow so a forged count
+/// cannot wrap; guards allocation and iteration for both decoders (`None`
+/// elements otherwise skip the per-slot bounds check).
+fn check_binary_array_fits(n: usize, header: usize, data_len: usize) -> crate::Result<()> {
+    if n > data_len.saturating_sub(header) / 8 {
+        return Err(bin_arr_err(
+            "binary array element region exceeds buffer length",
+        ));
+    }
+    Ok(())
+}
+
+fn bin_arr_err(msg: &str) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: msg.to_string(),
+        source: None,
+    }
+}
+
 /// Extract a Datum from an Arrow RecordBatch column at the given row index.
 pub fn extract_datum_from_arrow(
     batch: &RecordBatch,
@@ -1916,5 +2014,60 @@ mod tests {
             (-1, 999_000),
             "binary-row write path must store euclidean timestamp parts"
         );
+    }
+
+    #[test]
+    fn binary_array_str_round_trips() {
+        for v in [
+            vec![],
+            vec!["a".to_string()],
+            vec!["".to_string(), "short".to_string(), "x".repeat(20)],
+            vec!["1234567".to_string(), "12345678".to_string()], // 7-byte inline vs 8-byte pointer
+        ] {
+            let bytes = serialize_binary_array_str(&v);
+            assert_eq!(deserialize_binary_array_str(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn binary_array_long_round_trips() {
+        for v in [
+            vec![],
+            vec![Some(1i64), None, Some(-5), Some(i64::MAX)],
+            vec![None, None],
+        ] {
+            let bytes = serialize_binary_array_long(&v);
+            assert_eq!(deserialize_binary_array_long(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn binary_array_str_rejects_truncated() {
+        assert!(deserialize_binary_array_str(&[1, 0]).is_err()); // < 4 header bytes
+    }
+
+    #[test]
+    fn binary_array_rejects_huge_length_prefix() {
+        // A 4-byte buffer whose length prefix decodes to i32::MAX must return an
+        // Err rather than eagerly reserving a huge Vec (capacity-overflow / OOM).
+        let huge = [0xFF, 0xFF, 0xFF, 0x7F];
+        assert!(deserialize_binary_array_str(&huge).is_err());
+        assert!(deserialize_binary_array_long(&huge).is_err());
+    }
+
+    #[test]
+    fn binary_array_long_rejects_all_null_amplification() {
+        // Forged input: a large element count with an all-ones null bitmap and
+        // NO element slots. Null elements skip the per-slot bounds check, so
+        // without an up-front `count * 8 <= remaining` guard the loop would
+        // push `count` `None`s from a tiny buffer (~128x memory amplification),
+        // reachable through the C entry point (OOM risk). Must error, not
+        // allocate.
+        let count: i32 = 8000;
+        let bitmap_len = (count as usize).div_ceil(8); // 1000 bytes
+        let mut buf = Vec::with_capacity(4 + bitmap_len);
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0xFFu8, bitmap_len)); // every element null
+        assert!(deserialize_binary_array_long(&buf).is_err());
     }
 }
