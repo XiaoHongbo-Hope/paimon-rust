@@ -172,10 +172,7 @@ impl GlobalIndexScanner {
             else {
                 continue;
             };
-            let global_meta = match &entry.index_file.global_index_meta {
-                Some(m) => m,
-                None => return None,
-            };
+            let global_meta = entry.index_file.global_index_meta.as_ref()?;
 
             let sorted_meta = global_meta
                 .index_meta
