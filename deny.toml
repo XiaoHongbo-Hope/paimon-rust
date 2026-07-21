@@ -17,7 +17,7 @@
 
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "No fixed version; reqsign uses RSA only for outbound cloud request signing." },
+    { id = "RUSTSEC-2023-0071", reason = "No fixed version; reqsign only signs locally generated outbound requests and exposes no remote signing or decryption timing oracle." },
     { id = "RUSTSEC-2026-0176", reason = "The affected PyList and PyTuple iterator APIs are unused." },
     { id = "RUSTSEC-2026-0177", reason = "PyCFunction::new_closure is unused." },
 ]
