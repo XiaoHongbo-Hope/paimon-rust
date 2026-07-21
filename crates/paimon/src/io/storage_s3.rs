@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
+use opendal_service_s3::S3Config;
 use url::Url;
 
 use crate::error::Error;
@@ -106,7 +106,7 @@ pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config
     cfg.role_session_name = normalized.get("s3.assumed.role.session.name").cloned();
 
     // Anonymous access.
-    cfg.allow_anonymous = normalized
+    cfg.skip_signature = normalized
         .get("s3.anonymous")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
@@ -138,7 +138,7 @@ pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(Operator::new(builder)?.finish())
+    Ok(super::with_http_transport(Operator::new(builder)?))
 }
 
 #[cfg(test)]

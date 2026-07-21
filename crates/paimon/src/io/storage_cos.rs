@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::CosConfig;
 use opendal::{Configurator, Operator};
+use opendal_service_cos::CosConfig;
 use url::Url;
 
 use crate::error::Error;
@@ -39,6 +39,7 @@ const KEY_ALIASES: &[(&str, &str)] = &[
     ("fs.cosn.secret-key", "fs.cosn.userinfo.secretKey"),
 ];
 
+#[allow(deprecated)]
 pub(crate) fn cos_config_parse(props: HashMap<String, String>) -> Result<CosConfig> {
     let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.cosn.", KEY_ALIASES);
 
@@ -68,7 +69,7 @@ pub(crate) fn cos_config_build(cfg: &CosConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(Operator::new(builder)?.finish())
+    Ok(super::with_http_transport(Operator::new(builder)?))
 }
 
 #[cfg(test)]

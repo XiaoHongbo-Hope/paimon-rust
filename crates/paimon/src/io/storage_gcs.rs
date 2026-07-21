@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::GcsConfig;
 use opendal::{Configurator, Operator};
+use opendal_service_gcs::GcsConfig;
 use url::Url;
 
 use crate::error::Error;
@@ -68,7 +68,7 @@ pub(crate) fn gcs_config_parse(props: HashMap<String, String>) -> Result<GcsConf
     cfg.predefined_acl = normalized.get("gcs.predefined-acl").cloned();
     cfg.default_storage_class = normalized.get("gcs.default-storage-class").cloned();
     cfg.token = normalized.get("gcs.token").cloned();
-    cfg.allow_anonymous = normalized
+    cfg.skip_signature = normalized
         .get(GCS_ALLOW_ANONYMOUS)
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     cfg.disable_vm_metadata = normalized
@@ -91,7 +91,7 @@ pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(Operator::new(builder)?.finish())
+    Ok(super::with_http_transport(Operator::new(builder)?))
 }
 
 #[cfg(test)]
@@ -146,7 +146,7 @@ mod tests {
 
         let cfg = gcs_config_parse(props).unwrap();
         assert_eq!(cfg.credential_path.as_deref(), Some("/tmp/gcs.json"));
-        assert!(cfg.allow_anonymous);
+        assert!(cfg.skip_signature);
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
             cfg.service_account.as_deref(),
             Some("opendal-sa@example.iam.gserviceaccount.com")
         );
-        assert!(cfg.allow_anonymous);
+        assert!(cfg.skip_signature);
         assert!(cfg.disable_vm_metadata);
         assert!(cfg.disable_config_load);
     }

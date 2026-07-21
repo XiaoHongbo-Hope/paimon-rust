@@ -22,6 +22,22 @@ mod storage;
 pub use storage::*;
 
 #[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-obs",
+    feature = "storage-oss",
+    feature = "storage-s3"
+))]
+fn with_http_transport(op: opendal::Operator) -> opendal::Operator {
+    use opendal::{HttpTransporter, OperationContext};
+    use opendal_http_transport_reqwest::ReqwestTransport;
+
+    let transport = HttpTransporter::new(ReqwestTransport::default());
+    op.with_context(OperationContext::new().with_http_transport(transport))
+}
+
+#[cfg(any(
     feature = "storage-s3",
     feature = "storage-cos",
     feature = "storage-azdls",

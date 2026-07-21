@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::HdfsNativeConfig;
 use opendal::Operator;
+use opendal_service_hdfs_native::HdfsNativeConfig;
 use url::Url;
 
 use crate::error::Error;
@@ -54,6 +54,7 @@ const HDFS_ENABLE_APPEND: &str = "hdfs.enable-append";
 /// Extracts HDFS-related configuration from the properties map.
 /// The `hdfs.name-node` key is optional — if omitted, the name node
 /// will be extracted from the file path URL at operator build time.
+#[allow(deprecated)]
 pub(crate) fn hdfs_config_parse(props: HashMap<String, String>) -> Result<HdfsNativeConfig> {
     let mut cfg = HdfsNativeConfig::default();
 
@@ -91,10 +92,11 @@ pub(crate) fn hdfs_config_build(cfg: &HdfsNativeConfig, path: &str) -> Result<Op
 
     cfg.root = Some("/".to_string());
 
-    Ok(Operator::from_config(cfg)?.finish())
+    Ok(Operator::from_config(cfg)?)
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

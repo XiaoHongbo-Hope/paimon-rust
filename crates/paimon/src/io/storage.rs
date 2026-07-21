@@ -39,19 +39,19 @@ use std::sync::MutexGuard;
 
 #[cfg(feature = "storage-azdls")]
 use super::AzdlsStorageConfig;
+use opendal::Operator;
 #[cfg(feature = "storage-cos")]
-use opendal::services::CosConfig;
+use opendal_service_cos::CosConfig;
 #[cfg(feature = "storage-gcs")]
-use opendal::services::GcsConfig;
+use opendal_service_gcs::GcsConfig;
 #[cfg(feature = "storage-hdfs")]
-use opendal::services::HdfsNativeConfig;
+use opendal_service_hdfs_native::HdfsNativeConfig;
 #[cfg(feature = "storage-obs")]
-use opendal::services::ObsConfig;
+use opendal_service_obs::ObsConfig;
 #[cfg(feature = "storage-oss")]
-use opendal::services::OssConfig;
+use opendal_service_oss::OssConfig;
 #[cfg(feature = "storage-s3")]
-use opendal::services::S3Config;
-use opendal::{Operator, Scheme};
+use opendal_service_s3::S3Config;
 #[cfg(any(
     feature = "storage-cos",
     feature = "storage-gcs",
@@ -112,19 +112,17 @@ pub enum Storage {
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
         let (scheme_str, props) = file_io_builder.into_parts();
-        let scheme = Self::parse_scheme(&scheme_str)?;
-
-        match scheme {
+        match scheme_str.as_str() {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory {
+            "memory" => Ok(Self::Memory {
                 op: super::memory_config_build()?,
             }),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs {
+            "file" | "" => Ok(Self::LocalFs {
                 op: super::fs_config_build()?,
             }),
             #[cfg(feature = "storage-oss")]
-            Scheme::Oss => {
+            "oss" => {
                 let config = super::oss_config_parse(props)?;
                 Ok(Self::Oss {
                     config: Box::new(config),
@@ -132,7 +130,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-s3")]
-            Scheme::S3 => {
+            "s3" | "s3a" => {
                 let config = super::s3_config_parse(props)?;
                 Ok(Self::S3 {
                     config: Box::new(config),
@@ -140,7 +138,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-cos")]
-            Scheme::Cos => {
+            "cos" | "cosn" => {
                 let config = super::cos_config_parse(props)?;
                 Ok(Self::Cos {
                     config: Box::new(config),
@@ -148,7 +146,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-azdls")]
-            Scheme::Azdls => {
+            "abfs" | "abfss" | "az" | "azdls" | "azure" => {
                 let config = super::azdls_config_parse(props)?;
                 Ok(Self::Azdls {
                     config: Box::new(config),
@@ -156,7 +154,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-obs")]
-            Scheme::Obs => {
+            "obs" => {
                 let config = super::obs_config_parse(props)?;
                 Ok(Self::Obs {
                     config: Box::new(config),
@@ -164,7 +162,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-gcs")]
-            Scheme::Gcs => {
+            "gcs" | "gs" => {
                 let config = super::gcs_config_parse(props)?;
                 Ok(Self::Gcs {
                     config: Box::new(config),
@@ -172,7 +170,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-hdfs")]
-            Scheme::HdfsNative => {
+            "hdfs" | "hdfs-native" => {
                 let config = super::hdfs_config_parse(props)?;
                 Ok(Self::Hdfs {
                     config: Box::new(config),
@@ -413,18 +411,17 @@ impl Storage {
             super::s3_config_build(config, path)
         })
     }
+}
 
-    fn parse_scheme(scheme: &str) -> crate::Result<Scheme> {
-        match scheme {
-            "memory" => Ok(Scheme::Memory),
-            "file" | "" => Ok(Scheme::Fs),
-            "s3" | "s3a" => Ok(Scheme::S3),
-            "cosn" => Ok(Scheme::Cos),
-            "abfs" | "abfss" | "az" | "azure" => Ok(Scheme::Azdls),
-            "gs" => Ok(Scheme::Gcs),
-            "hdfs" => Ok(Scheme::HdfsNative),
-            s => Ok(s.parse::<Scheme>()?),
-        }
+#[cfg(test)]
+mod scheme_tests {
+    use crate::error::Error;
+    use crate::io::FileIOBuilder;
+
+    #[test]
+    fn unknown_scheme_is_rejected() {
+        let error = FileIOBuilder::new("unknown").build().unwrap_err();
+        assert!(matches!(error, Error::IoUnsupported { .. }));
     }
 }
 

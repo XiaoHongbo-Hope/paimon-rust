@@ -47,14 +47,14 @@ fulltext = ["tantivy", "tempfile"]
 vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]
-storage-fs = ["opendal/services-fs"]
-storage-oss = ["opendal/services-oss"]
-storage-s3 = ["opendal/services-s3"]
-storage-cos = ["opendal/services-cos"]
-storage-azdls = ["opendal/services-azdls"]
-storage-obs = ["opendal/services-obs"]
-storage-gcs = ["opendal/services-gcs"]
-storage-hdfs = ["opendal/services-hdfs-native"]
+storage-fs = ["dep:opendal-service-fs"]
+storage-oss = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-oss"]
+storage-s3 = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-s3"]
+storage-cos = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-cos"]
+storage-azdls = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-azdls"]
+storage-obs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-obs"]
+storage-gcs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-gcs"]
+storage-hdfs = ["dep:opendal-service-hdfs-native"]
 
 [dependencies]
 url = "2.5.2"
@@ -70,7 +70,16 @@ serde_with = "3.9.0"
 serde_repr = "0.1"
 snafu = "0.9.0"
 typed-builder = "^0.19"
-opendal = { version = "0.55", features = ["services-fs"] }
+opendal = { package = "opendal-core", version = "0.58.0" }
+opendal-http-transport-reqwest = { version = "0.58.0", optional = true }
+opendal-service-azdls = { version = "0.58.0", optional = true }
+opendal-service-cos = { version = "0.58.0", optional = true }
+opendal-service-fs = { version = "0.58.0", optional = true }
+opendal-service-gcs = { version = "0.58.0", optional = true }
+opendal-service-hdfs-native = { version = "0.58.0", optional = true }
+opendal-service-obs = { version = "0.58.0", optional = true }
+opendal-service-oss = { version = "0.58.0", optional = true }
+opendal-service-s3 = { version = "0.58.0", optional = true }
 pretty_assertions = "1"
 apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
 indexmap = "2.5.0"
