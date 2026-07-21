@@ -32,6 +32,28 @@ const FORMAT_VERSION_WITH_NULL_FLAGS: u8 = 1;
 const FIRST_KEY_IS_NULL: u8 = 1;
 const LAST_KEY_IS_NULL: u8 = 1 << 1;
 
+fn invalid_meta(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn read_key(data: &[u8], pos: &mut usize) -> io::Result<Vec<u8>> {
+    let remaining = data
+        .get(*pos..)
+        .ok_or_else(|| invalid_meta("BTreeIndexMeta key offset out of bounds"))?;
+    let length_bytes = remaining
+        .get(..4)
+        .ok_or_else(|| invalid_meta("BTreeIndexMeta key length is truncated"))?;
+    let length = i32::from_le_bytes(length_bytes.try_into().unwrap());
+    let length = usize::try_from(length)
+        .map_err(|_| invalid_meta("BTreeIndexMeta key length is negative"))?;
+    let key = remaining
+        .get(4..)
+        .and_then(|bytes| bytes.get(..length))
+        .ok_or_else(|| invalid_meta("BTreeIndexMeta key data is truncated"))?;
+    *pos += 4 + length;
+    Ok(key.to_vec())
+}
+
 /// Index meta for each BTree index file.
 #[derive(Debug, Clone)]
 pub struct BTreeIndexMeta {
@@ -166,23 +188,12 @@ impl BTreeIndexMeta {
 
         let mut pos = 0;
 
-        let fk_len = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        let mut first_key = {
-            let key = data[pos..pos + fk_len].to_vec();
-            pos += fk_len;
-            Some(key)
-        };
-
-        let lk_len = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        let mut last_key = {
-            let key = data[pos..pos + lk_len].to_vec();
-            pos += lk_len;
-            Some(key)
-        };
-
-        let has_nulls = data[pos] == 1;
+        let mut first_key = Some(read_key(data, &mut pos)?);
+        let mut last_key = Some(read_key(data, &mut pos)?);
+        let has_nulls = *data
+            .get(pos)
+            .ok_or_else(|| invalid_meta("BTreeIndexMeta has_nulls flag is missing"))?
+            == 1;
         pos += 1;
 
         if data.len().saturating_sub(pos) >= 2 {
@@ -197,7 +208,10 @@ impl BTreeIndexMeta {
                     last_key = None;
                 }
             }
-        } else if fk_len == 0 && lk_len == 0 && has_nulls {
+        } else if first_key.as_ref().is_some_and(Vec::is_empty)
+            && last_key.as_ref().is_some_and(Vec::is_empty)
+            && has_nulls
+        {
             first_key = None;
             last_key = None;
         }
@@ -252,5 +266,27 @@ mod tests {
         let decoded = BTreeIndexMeta::deserialize(&encoded).unwrap();
         assert!(!decoded.has_nulls);
         assert!(!decoded.only_nulls());
+    }
+
+    #[test]
+    fn test_meta_rejects_invalid_key_lengths() {
+        let mut negative_first = vec![0; 9];
+        negative_first[..4].copy_from_slice(&(-1i32).to_le_bytes());
+        let mut truncated_first = vec![0; 9];
+        truncated_first[..4].copy_from_slice(&10i32.to_le_bytes());
+        let mut negative_last = vec![0; 9];
+        negative_last[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        let mut truncated_last = vec![0; 9];
+        truncated_last[4..8].copy_from_slice(&10i32.to_le_bytes());
+
+        for encoded in [
+            negative_first,
+            truncated_first,
+            negative_last,
+            truncated_last,
+        ] {
+            let error = BTreeIndexMeta::deserialize(&encoded).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }

@@ -82,7 +82,7 @@ struct GlobalIndexEntry {
     index_type: GlobalIndexFileKind,
     file_size: i64,
     row_range_start: i64,
-    meta: BTreeIndexMeta,
+    meta: Option<BTreeIndexMeta>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,8 +180,7 @@ impl GlobalIndexScanner {
             let sorted_meta = global_meta
                 .index_meta
                 .as_ref()
-                .and_then(|bytes| BTreeIndexMeta::deserialize(bytes).ok())
-                .unwrap_or_else(|| BTreeIndexMeta::new(None, None, false));
+                .and_then(|bytes| BTreeIndexMeta::deserialize(bytes).ok());
 
             let resolved = GlobalIndexEntry {
                 file_name: entry.index_file.file_name.clone(),
@@ -364,6 +363,14 @@ impl GlobalIndexScanner {
         entries: &[GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<Option<Vec<RowRange>>> {
+        let Some(metas) = entries
+            .iter()
+            .map(|entry| entry.meta.as_ref())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
 
@@ -391,9 +398,9 @@ impl GlobalIndexScanner {
         let predicate_matches: Vec<Vec<bool>> = pruning_info
             .iter()
             .map(|(op, cmp, serialized)| {
-                entries
+                metas
                     .iter()
-                    .map(|entry| entry.meta.may_match(*op, serialized, cmp))
+                    .map(|meta| meta.may_match(*op, serialized, cmp))
                     .collect()
             })
             .collect();
@@ -411,9 +418,9 @@ impl GlobalIndexScanner {
                 let cmp = make_key_comparator(b.data_type);
                 let from_key = serialize_datum(b.from, b.data_type);
                 let to_key = serialize_datum(b.to, b.data_type);
-                entries
+                metas
                     .iter()
-                    .map(|entry| entry.meta.may_match_between(&from_key, &to_key, &cmp))
+                    .map(|meta| meta.may_match_between(&from_key, &to_key, &cmp))
                     .collect()
             }
             None => Vec::new(),
@@ -487,7 +494,10 @@ impl GlobalIndexScanner {
             let mut reader = if (between_matches && between_evaluated_for_entry)
                 || !matching_predicates.is_empty()
             {
-                Some(self.open_reader_for_entry(entry, data_type).await?)
+                Some(
+                    self.open_reader_for_entry(entry, metas[entry_idx], data_type)
+                        .await?,
+                )
             } else {
                 None
             };
@@ -589,11 +599,12 @@ impl GlobalIndexScanner {
     async fn open_reader_for_entry(
         &self,
         entry: &GlobalIndexEntry,
+        meta: &BTreeIndexMeta,
         data_type: &DataType,
     ) -> Result<OpenedGlobalIndexReader> {
         match entry.index_type {
             GlobalIndexFileKind::BTree => {
-                self.get_or_open_reader(&entry.file_name, &entry.meta, data_type)
+                self.get_or_open_reader(&entry.file_name, meta, data_type)
                     .await
             }
             GlobalIndexFileKind::Bitmap => self
@@ -1745,6 +1756,47 @@ mod tests {
                 .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(25, 25)]);
+    }
+
+    #[tokio::test]
+    async fn test_missing_or_invalid_index_meta_falls_back() {
+        let (file_io, table_path, file_name, tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let second_file_name = "btree_int_100_no_compress_2.bin";
+        std::fs::copy(
+            tmp.path().join("index").join(&file_name),
+            tmp.path().join("index").join(second_file_name),
+        )
+        .unwrap();
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let mut invalid_meta = vec![0; 9];
+        invalid_meta[..4].copy_from_slice(&10i32.to_le_bytes());
+
+        for index_meta in [None, Some(invalid_meta)] {
+            let valid_entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+            let mut invalid_entry = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
+            invalid_entry
+                .index_file
+                .global_index_meta
+                .as_mut()
+                .unwrap()
+                .index_meta = index_meta;
+
+            let result = evaluate_global_index_fast(
+                &file_io,
+                &table_path,
+                &[valid_entry, invalid_entry],
+                &[int_eq("id", 0, 50)],
+                &int_schema_fields(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                result.is_none(),
+                "missing or invalid index metadata must fall back to the normal table scan"
+            );
+        }
     }
 
     #[tokio::test]
