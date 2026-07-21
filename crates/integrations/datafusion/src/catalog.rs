@@ -25,7 +25,7 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::{plan_datafusion_err, Column};
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
@@ -338,6 +338,8 @@ pub struct PaimonSchemaProvider {
     dynamic_options: DynamicOptions,
     /// Optional temporary in-memory provider for temp tables and views.
     temp_provider: Option<Arc<MemorySchemaProvider>>,
+    /// Table types populated together with `table_names` for metadata-only lookups.
+    catalog_table_types: RwLock<HashMap<String, TableType>>,
     blob_reader_registry: BlobReaderRegistry,
     session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
@@ -369,6 +371,7 @@ impl PaimonSchemaProvider {
             database,
             dynamic_options,
             temp_provider,
+            catalog_table_types: RwLock::new(HashMap::new()),
             blob_reader_registry,
             session_state,
             schema_force_view_types: true,
@@ -386,29 +389,45 @@ impl SchemaProvider for PaimonSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();
-        let mut names = block_on_with_runtime(
+        let (mut names, views) = block_on_with_runtime(
             {
                 let db = database.clone();
                 async move {
-                    let mut names = match catalog.list_tables(&db).await {
+                    let names = match catalog.list_tables(&db).await {
                         Ok(names) => names,
                         Err(e) => {
                             log::error!("failed to list tables in '{}': {e}", db);
                             vec![]
                         }
                     };
-                    match catalog.list_views(&db).await {
-                        Ok(views) => names.extend(views),
-                        Err(paimon::Error::Unsupported { .. }) => {}
+                    let views = match catalog.list_views(&db).await {
+                        Ok(views) => views,
+                        Err(paimon::Error::Unsupported { .. }) => vec![],
                         Err(error) => {
                             log::error!("failed to list views in '{}': {error}", db);
+                            vec![]
                         }
-                    }
-                    names
+                    };
+                    (names, views)
                 }
             },
             "paimon catalog access thread panicked",
         );
+
+        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
+        for name in &names {
+            catalog_table_types.insert(name.clone(), TableType::Base);
+        }
+        for view in views {
+            catalog_table_types
+                .entry(view.clone())
+                .or_insert(TableType::View);
+            names.push(view);
+        }
+        *self
+            .catalog_table_types
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
 
         if let Some(temp) = &self.temp_provider {
             names.extend(temp.table_names());
@@ -538,6 +557,27 @@ impl SchemaProvider for PaimonSchemaProvider {
             }
         })
         .await
+    }
+
+    async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
+        if let Some(temp) = &self.temp_provider {
+            if let Some(table_type) = temp.table_type(name).await? {
+                return Ok(Some(table_type));
+            }
+        }
+
+        if let Some(table_type) = self
+            .catalog_table_types
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+        {
+            return Ok(Some(*table_type));
+        }
+
+        self.table(name)
+            .await
+            .map(|table| table.map(|table| table.table_type()))
     }
 
     fn table_exist(&self, name: &str) -> bool {

@@ -17,7 +17,7 @@
 
 //! SQL context integration tests for paimon-datafusion.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -48,6 +48,105 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     let mut ctx = SQLContext::new();
     ctx.register_catalog("paimon", catalog).await.unwrap();
     ctx
+}
+
+struct MetadataListingCatalog {
+    get_table_calls: AtomicUsize,
+}
+
+impl MetadataListingCatalog {
+    fn new() -> Self {
+        Self {
+            get_table_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_table_calls(&self) -> usize {
+        self.get_table_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Catalog for MetadataListingCatalog {
+    async fn list_databases(&self) -> paimon::Result<Vec<String>> {
+        Ok(vec!["default".to_string()])
+    }
+
+    async fn create_database(
+        &self,
+        _name: &str,
+        _ignore_if_exists: bool,
+        _properties: std::collections::HashMap<String, String>,
+    ) -> paimon::Result<()> {
+        Ok(())
+    }
+
+    async fn get_database(&self, name: &str) -> paimon::Result<paimon::catalog::Database> {
+        Ok(paimon::catalog::Database::new(
+            name.to_string(),
+            std::collections::HashMap::new(),
+            None,
+        ))
+    }
+
+    async fn drop_database(
+        &self,
+        _name: &str,
+        _ignore_if_not_exists: bool,
+        _cascade: bool,
+    ) -> paimon::Result<()> {
+        Ok(())
+    }
+
+    async fn get_table(&self, _identifier: &Identifier) -> paimon::Result<paimon::table::Table> {
+        self.get_table_calls.fetch_add(1, Ordering::SeqCst);
+        Err(paimon::Error::Unsupported {
+            message: "table loading is unavailable".to_string(),
+        })
+    }
+
+    async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+        Ok(vec!["metadata_only".to_string()])
+    }
+
+    async fn list_views(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+        Ok(vec!["metadata_view".to_string()])
+    }
+
+    async fn create_table(
+        &self,
+        _identifier: &Identifier,
+        _creation: paimon::spec::Schema,
+        _ignore_if_exists: bool,
+    ) -> paimon::Result<()> {
+        Ok(())
+    }
+
+    async fn drop_table(
+        &self,
+        _identifier: &Identifier,
+        _ignore_if_not_exists: bool,
+    ) -> paimon::Result<()> {
+        Ok(())
+    }
+
+    async fn rename_table(
+        &self,
+        _from: &Identifier,
+        _to: &Identifier,
+        _ignore_if_not_exists: bool,
+    ) -> paimon::Result<()> {
+        Ok(())
+    }
+
+    async fn alter_table(
+        &self,
+        _identifier: &Identifier,
+        _changes: Vec<SchemaChange>,
+        _ignore_if_not_exists: bool,
+    ) -> paimon::Result<()> {
+        Ok(())
+    }
 }
 
 struct PartitionCatalog {
@@ -263,6 +362,48 @@ async fn test_show_tables_is_enabled() {
         .collect()
         .await
         .expect("SHOW TABLES should execute");
+}
+
+#[tokio::test]
+async fn test_show_tables_does_not_load_table_providers() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    let table_names = collect_string_column(&sql_context, "SHOW TABLES", "table_name").await;
+
+    assert!(table_names.contains(&"metadata_only".to_string()));
+    assert_eq!(catalog.get_table_calls(), 0);
+
+    assert!(sql_context
+        .sql("SELECT * FROM metadata_only")
+        .await
+        .is_err());
+    assert!(catalog.get_table_calls() > 0);
+}
+
+#[tokio::test]
+async fn test_show_tables_preserves_catalog_view_type() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    let table_types = collect_string_column(
+        &sql_context,
+        "SELECT table_type FROM information_schema.tables \
+         WHERE table_schema = 'default' AND table_name = 'metadata_view'",
+        "table_type",
+    )
+    .await;
+
+    assert_eq!(table_types, vec!["VIEW"]);
+    assert_eq!(catalog.get_table_calls(), 0);
 }
 
 #[tokio::test]
