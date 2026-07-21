@@ -107,6 +107,7 @@ jobs:
           }
 
       - name: Package release crates
+        # Cargo verifies workspace dependencies through its temporary registry.
         run: >
           cargo package --locked
           -p paimon
