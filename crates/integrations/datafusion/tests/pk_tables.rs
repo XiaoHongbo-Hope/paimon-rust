@@ -32,9 +32,13 @@ use common::{
     collect_id_name, collect_id_value, collect_int_int_str, create_sql_context, create_test_env,
     row_count, setup_sql_context, string_value,
 };
-use datafusion::arrow::array::{Array, Int32Array, Int64Array};
+use datafusion::arrow::array::{Array, Int32Array, Int64Array, Int8Array, RecordBatch};
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use paimon::catalog::Identifier;
 use paimon::Catalog;
+use std::sync::Arc;
 
 // ======================= Basic PK Write + Read =======================
 
@@ -171,6 +175,71 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
             (2, Some(200), Some("old-2".to_string())),
             (3, Some(30), None),
         ]
+    );
+}
+
+#[tokio::test]
+async fn test_pk_partial_update_ignore_delete_alias_e2e() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_partial_update_ignore_delete (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'partial-update',
+                'partial-update.ignore-delete' = 'true'
+            )",
+        )
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new(
+            "test_db",
+            "t_partial_update_ignore_delete",
+        ))
+        .await
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new("_VALUE_KIND", ArrowDataType::Int8, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 2, 1])),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                Some(999),
+                Some(200),
+                Some(20),
+            ])),
+            Arc::new(Int8Array::from(vec![0, 3, 1, 2])),
+        ],
+    )
+    .unwrap();
+    let write_builder = table.new_write_builder();
+    let mut write = write_builder.new_write().unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    write_builder.new_commit().commit(messages).await.unwrap();
+
+    assert_eq!(
+        collect_id_value(
+            &sql_context,
+            "SELECT id, value
+             FROM paimon.test_db.t_partial_update_ignore_delete
+             ORDER BY id",
+        )
+        .await,
+        vec![(1, 20)]
     );
 }
 

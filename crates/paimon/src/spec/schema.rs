@@ -453,6 +453,15 @@ impl TableSchema {
         new_schema.highest_field_id =
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
 
+        if PartialUpdateConfig::new(&new_schema.options).is_enabled()
+            && self.core_options().ignore_delete()
+            && !CoreOptions::new(&new_schema.options).ignore_delete()
+        {
+            return Err(crate::Error::Unsupported {
+                message: "Cannot change ignore-delete from true to false.".to_string(),
+            });
+        }
+
         // Re-run create-time validations on the final schema, mirroring Java
         // `SchemaValidation.validateTableSchema` after applying changes.
         Schema::validate_key_field_types(
@@ -2099,7 +2108,7 @@ mod tests {
     #[test]
     fn test_partial_update_schema_validation_rejects_unsupported_options() {
         for (key, value) in [
-            ("ignore-delete", "true"),
+            ("fields.value.ignore-delete", "true"),
             ("fields.value.sequence-group", "g1"),
             ("fields.default-aggregate-function", "last_non_null"),
         ] {
@@ -2116,6 +2125,27 @@ mod tests {
                 matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains(key)),
                 "partial-update create-time validation should reject '{key}', got {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_partial_update_schema_validation_accepts_ignore_delete_options() {
+        for (key, value) in [
+            ("ignore-delete", "true"),
+            ("ignore-delete", "false"),
+            ("partial-update.ignore-delete", "true"),
+            ("partial-update.ignore-delete", "false"),
+        ] {
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .option(key, value)
+                .build()
+                .unwrap();
+
+            assert_eq!(schema.options().get(key).map(String::as_str), Some(value));
         }
     }
 
@@ -2709,7 +2739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_update_apply_changes_rejects_unsupported_option() {
+    fn test_partial_update_apply_changes_accepts_ignore_delete_option() {
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
@@ -2721,19 +2751,68 @@ mod tests {
                 .unwrap(),
         );
 
-        let err = table_schema
+        let new_schema = table_schema
             .apply_changes(vec![crate::spec::SchemaChange::set_option(
                 "ignore-delete".to_string(),
                 "true".to_string(),
             )])
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("merge-engine=partial-update")
-                    && message.contains("ignore-delete")),
-            "partial-update alter should reject unsupported option, got {err:?}"
+        assert_eq!(
+            new_schema
+                .options()
+                .get("ignore-delete")
+                .map(String::as_str),
+            Some("true")
         );
+    }
+
+    #[test]
+    fn test_partial_update_apply_changes_rejects_disabling_ignore_delete() {
+        for (existing_options, change) in [
+            (
+                vec![("ignore-delete", "true")],
+                crate::spec::SchemaChange::set_option(
+                    "ignore-delete".to_string(),
+                    "false".to_string(),
+                ),
+            ),
+            (
+                vec![("ignore-delete", "true")],
+                crate::spec::SchemaChange::remove_option("ignore-delete".to_string()),
+            ),
+            (
+                vec![("partial-update.ignore-delete", "true")],
+                crate::spec::SchemaChange::set_option(
+                    "ignore-delete".to_string(),
+                    "false".to_string(),
+                ),
+            ),
+            (
+                vec![("partial-update.ignore-delete", "true")],
+                crate::spec::SchemaChange::remove_option(
+                    "partial-update.ignore-delete".to_string(),
+                ),
+            ),
+        ] {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update");
+            for (key, value) in existing_options {
+                builder = builder.option(key, value);
+            }
+            let table_schema = TableSchema::new(0, &builder.build().unwrap());
+
+            let err = table_schema.apply_changes(vec![change]).unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("Cannot change ignore-delete from true to false")),
+                "got {err:?}"
+            );
+        }
     }
 
     #[test]

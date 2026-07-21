@@ -1880,6 +1880,15 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'merge-engine' = 'partial-update'` | Basic partial-update engine for PK tables |
 | `'merge-engine' = 'aggregation'` | Basic aggregation engine for PK tables |
 
+Rust supports the basic partial-update engine with latest-non-null semantics.
+Set either `'ignore-delete' = 'true'` or
+`'partial-update.ignore-delete' = 'true'` to ignore `DELETE` and
+`UPDATE_BEFORE` rows during writes and when reading existing files. The default
+and an explicit `false` continue to reject these retract rows. Once enabled on
+an existing partial-update table, `ignore-delete` cannot be changed back to
+`false`. Advanced partial-update features such as sequence groups, partial
+aggregation, and remove-record-on-delete are not supported.
+
 Rust currently supports `merge-engine=aggregation` in basic mode only. It works
 with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
 primary key includes all partition columns. It supports per-field aggregate

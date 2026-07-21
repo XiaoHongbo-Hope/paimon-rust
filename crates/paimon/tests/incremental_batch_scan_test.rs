@@ -69,6 +69,19 @@ async fn read_incremental_pairs(
     collect_pairs(&batches)
 }
 
+async fn read_current_pairs(table: &paimon::table::Table) -> Vec<(i32, i32)> {
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let read = table.new_read_builder().new_read().unwrap();
+    let batches: Vec<RecordBatch> = read
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    collect_pairs(&batches)
+}
+
 async fn plan_incremental(
     table: &paimon::table::Table,
     mode: IncrementalScanMode,
@@ -267,6 +280,34 @@ async fn changelog_between_snapshots_reads_changelog_manifest_files() {
 
     let rows = read_incremental_pairs(&table, IncrementalScanMode::Changelog, 0, 1).await;
     assert_eq!(rows, vec![(1, 10), (1, 20)]);
+}
+
+#[tokio::test]
+async fn partial_update_ignore_delete_filters_data_and_input_changelog() {
+    let table_path = "memory:/incremental_batch/partial_update_ignore_delete";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "partial-update"),
+            ("partial-update.ignore-delete", "true"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(
+        &table,
+        &make_batch_with_kinds(vec![1, 1, 2, 1], vec![10, 999, 200, 20], vec![0, 3, 1, 2]),
+    )
+    .await;
+
+    assert_eq!(read_current_pairs(&table).await, vec![(1, 20)]);
+    assert_eq!(
+        read_incremental_pairs(&table, IncrementalScanMode::Changelog, 0, 1).await,
+        vec![(1, 10), (1, 20)]
+    );
 }
 
 /// Multi-snapshot changelog range is left-open / right-closed and ordered by snapshot id.

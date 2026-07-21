@@ -1966,9 +1966,26 @@ mod tests {
         let opts = CoreOptions::new(&fallback);
         assert!(opts.ignore_delete());
 
+        let partial_update = HashMap::from([(
+            "partial-update.ignore-delete".to_string(),
+            "true".to_string(),
+        )]);
+        let opts = CoreOptions::new(&partial_update);
+        assert!(opts.ignore_delete());
+
         let primary = HashMap::from([("ignore-delete".to_string(), "true".to_string())]);
         let opts = CoreOptions::new(&primary);
         assert!(opts.ignore_delete());
+
+        let primary_precedence = HashMap::from([
+            ("ignore-delete".to_string(), "false".to_string()),
+            (
+                "partial-update.ignore-delete".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let opts = CoreOptions::new(&primary_precedence);
+        assert!(!opts.ignore_delete());
     }
 
     #[test]

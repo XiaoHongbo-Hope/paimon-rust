@@ -26,7 +26,7 @@
 //! - DataFusion: `SortPreservingMergeStream` (LoserTree layout)
 //! - Arrow-row: `RowConverter` for efficient key comparison
 
-use crate::spec::{AggregationConfig, DataField, PartialUpdateConfig, RowKind};
+use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig, RowKind};
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
@@ -184,9 +184,12 @@ impl MergeFunction for DeduplicateMergeFunction {
 /// Basic partial-update merge: for each non-key column, keep the latest
 /// non-null value ordered by user sequence (if configured) then system sequence.
 ///
-/// DELETE / UPDATE_BEFORE rows are treated as unsupported in this mode.
+/// DELETE / UPDATE_BEFORE rows are ignored when `ignore-delete=true` and
+/// treated as unsupported otherwise.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PartialUpdateMergeFunction(());
+pub(crate) struct PartialUpdateMergeFunction {
+    ignore_delete: bool,
+}
 
 impl PartialUpdateMergeFunction {
     pub(crate) fn new(
@@ -194,7 +197,9 @@ impl PartialUpdateMergeFunction {
         table_name: &str,
     ) -> crate::Result<Self> {
         PartialUpdateConfig::new(table_options).validate_runtime_mode(true, table_name)?;
-        Ok(Self(()))
+        Ok(Self {
+            ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+        })
     }
 }
 
@@ -221,14 +226,19 @@ impl MergeFunction for PartialUpdateMergeFunction {
 
         let mut latest_non_null_by_col: Vec<Option<(usize, usize)>> =
             vec![None; output_schema.fields().len()];
+        let mut saw_add = false;
 
         for row_idx in ordered_row_indices {
             let row = &rows[row_idx];
             if !RowKind::from_value(row.value_kind)?.is_add() {
+                if self.ignore_delete {
+                    continue;
+                }
                 return Err(crate::Error::Unsupported {
                     message: "merge-engine=partial-update basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
                 });
             }
+            saw_add = true;
 
             for (output_col_idx, latest_non_null) in latest_non_null_by_col.iter_mut().enumerate() {
                 let source_array = batch_buffer[row.batch_idx]
@@ -237,6 +247,10 @@ impl MergeFunction for PartialUpdateMergeFunction {
                     *latest_non_null = Some((row.batch_idx, row.row_idx));
                 }
             }
+        }
+
+        if !saw_add {
+            return Ok(MergeResult::Omit);
         }
 
         let output_columns: Vec<ArrayRef> = output_schema
@@ -1909,6 +1923,158 @@ mod tests {
             Error::Unsupported { message }
             if message.contains("partial-update basic mode does not support DELETE or UPDATE_BEFORE")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_ignores_delete_when_configured() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![0],
+            vec![Some("old")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![Some("delete")],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            ("ignore-delete".to_string(), "true".to_string()),
+        ]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        assert_eq!(
+            result[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "old"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_alias_ignores_update_before() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![0],
+            vec![Some("old")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![1],
+            vec![Some("before")],
+        )]);
+        let s2 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![3],
+            vec![2],
+            vec![Some("new")],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "partial-update.ignore-delete".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1, s2],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        assert_eq!(
+            result[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_omits_retract_only_key_when_configured() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let stream = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![3],
+            vec![Some("delete")],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            ("ignore-delete".to_string(), "true".to_string()),
+        ]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     }
 
     #[test]

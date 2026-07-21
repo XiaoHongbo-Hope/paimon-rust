@@ -21,6 +21,7 @@ const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const PARTIAL_UPDATE_ENGINE: &str = "partial-update";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_DELETE_SUFFIX: &str = ".ignore-delete";
+const PARTIAL_UPDATE_IGNORE_DELETE_OPTION: &str = "partial-update.ignore-delete";
 const PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION: &str =
     "partial-update.remove-record-on-delete";
 const PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION: &str =
@@ -116,8 +117,9 @@ impl<'a> PartialUpdateConfig<'a> {
 }
 
 fn is_unsupported_partial_update_option(key: &str) -> bool {
-    key == IGNORE_DELETE_OPTION
-        || key.ends_with(IGNORE_DELETE_SUFFIX)
+    (key.ends_with(IGNORE_DELETE_SUFFIX)
+        && key != IGNORE_DELETE_OPTION
+        && key != PARTIAL_UPDATE_IGNORE_DELETE_OPTION)
         || key == PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION
         || key == PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION
         || key == FIELDS_DEFAULT_AGG_FUNCTION_OPTION
@@ -158,6 +160,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_create_mode_accepts_partial_update_ignore_delete() {
+        for value in ["true", "false"] {
+            let options = partial_update_options(&[(PARTIAL_UPDATE_IGNORE_DELETE_OPTION, value)]);
+            let config = PartialUpdateConfig::new(&options);
+
+            assert_eq!(
+                config.validate_create_mode(true).unwrap(),
+                Some(PartialUpdateMode::Basic)
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_create_mode_accepts_ignore_delete() {
+        for value in ["true", "false"] {
+            let options = partial_update_options(&[(IGNORE_DELETE_OPTION, value)]);
+            let config = PartialUpdateConfig::new(&options);
+
+            assert_eq!(
+                config.validate_create_mode(true).unwrap(),
+                Some(PartialUpdateMode::Basic)
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_create_mode_ignores_non_pk_tables() {
         let options = partial_update_options(&[(IGNORE_DELETE_OPTION, "true")]);
         let config = PartialUpdateConfig::new(&options);
@@ -168,10 +196,10 @@ mod tests {
     #[test]
     fn test_validate_create_mode_rejects_unsupported_partial_update_options() {
         for key in [
-            IGNORE_DELETE_OPTION,
-            "partial-update.ignore-delete",
             PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION,
             PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION,
+            "deduplicate.ignore-delete",
+            "fields.price.ignore-delete",
             "fields.price.sequence-group",
             "fields.price.aggregate-function",
             FIELDS_DEFAULT_AGG_FUNCTION_OPTION,

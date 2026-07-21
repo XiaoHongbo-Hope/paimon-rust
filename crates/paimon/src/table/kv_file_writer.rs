@@ -30,13 +30,13 @@ use crate::arrow::format::create_format_writer;
 use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, DataFileMeta, DataType,
-    MergeEngine, PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME,
-    VALUE_KIND_FIELD_NAME,
+    extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions, DataFileMeta,
+    DataType, MergeEngine, PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW,
+    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::prepared_files::PreparedFiles;
 use crate::Result;
-use arrow_array::{Array, Int64Array, Int8Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt32Array};
 use arrow_ord::sort::{lexsort_to_indices, SortColumn, SortOptions};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -49,6 +49,7 @@ use std::sync::Arc;
 pub(crate) struct KeyValueFileWriter {
     file_io: FileIO,
     config: KeyValueWriteConfig,
+    ignore_delete: bool,
     /// Next sequence number to assign (bucket-local, always auto-incremented).
     next_sequence_number: i64,
     /// Buffered batches (user schema).
@@ -105,6 +106,8 @@ impl KeyValueFileWriter {
         config: KeyValueWriteConfig,
         next_sequence_number: i64,
     ) -> Result<Self> {
+        let ignore_delete = config.merge_engine == MergeEngine::PartialUpdate
+            && CoreOptions::new(&config.table_options).ignore_delete();
         if config.merge_engine == MergeEngine::PartialUpdate {
             PartialUpdateConfig::new(&config.table_options)
                 .validate_runtime_mode(true, &config.table_name)?;
@@ -136,6 +139,7 @@ impl KeyValueFileWriter {
         Ok(Self {
             file_io,
             config,
+            ignore_delete,
             next_sequence_number,
             buffer: Vec::new(),
             buffer_bytes: 0,
@@ -147,6 +151,13 @@ impl KeyValueFileWriter {
     /// Buffer a RecordBatch. Flushes when buffer exceeds write_buffer_size.
     /// Sequence numbers are assigned per-bucket on flush, matching Java Paimon behavior.
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Filter before byte accounting and buffering so ignored retracts do
+        // not consume write-buffer memory or automatic sequence numbers.
+        let batch = if self.ignore_delete {
+            Self::filter_retract_rows(batch)?
+        } else {
+            batch.clone()
+        };
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -155,7 +166,7 @@ impl KeyValueFileWriter {
             .iter()
             .map(|c| c.get_buffer_memory_size())
             .sum();
-        self.buffer.push(batch.clone());
+        self.buffer.push(batch);
         self.buffer_bytes += batch_bytes;
 
         if self.buffer_bytes as i64 >= self.config.write_buffer_size {
@@ -308,6 +319,44 @@ impl KeyValueFileWriter {
             self.written_changelog_files.push(changelog_file);
         }
         Ok(())
+    }
+
+    fn filter_retract_rows(batch: &RecordBatch) -> Result<RecordBatch> {
+        let Some(vk_idx) = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == VALUE_KIND_FIELD_NAME)
+        else {
+            return Ok(batch.clone());
+        };
+        let value_kinds = batch
+            .column(vk_idx)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "_VALUE_KIND column must be Int8".to_string(),
+                source: None,
+            })?;
+        let keep = BooleanArray::from(
+            (0..batch.num_rows())
+                .map(|row| {
+                    let value = if value_kinds.is_null(row) {
+                        RowKind::Insert.to_value()
+                    } else {
+                        value_kinds.value(row)
+                    };
+                    RowKind::from_value(value).map(|kind| kind.is_add())
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+
+        arrow_select::filter::filter_record_batch(batch, &keep).map_err(|e| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to filter ignored retract rows: {e}"),
+                source: None,
+            }
+        })
     }
 
     async fn write_indexed_file(
@@ -551,7 +600,8 @@ impl KeyValueFileWriter {
     /// the read-side `PartialUpdateMergeFunction`: rows are visited in
     /// ascending (sequence fields, auto-seq) order and every column keeps its
     /// latest non-null value; a column that is null in every row stays null.
-    /// DELETE / UPDATE_BEFORE rows are rejected, matching the read side.
+    /// DELETE / UPDATE_BEFORE rows are rejected defensively. When
+    /// `ignore-delete=true`, `write` filters them before buffering.
     ///
     /// Returns the merged batch (user schema, in primary-key order) and its
     /// `_SEQUENCE_NUMBER` column; each merged row keeps the highest sequence
@@ -864,6 +914,138 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_flush_partial_update_ignore_delete_skips_retract_only_batch() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            Arc::new(ArrowField::new(
+                VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            )),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int8Array::from(vec![1, 3])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config
+            .table_options
+            .insert("ignore-delete".to_string(), "true".to_string());
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 7)
+                .unwrap();
+
+        writer.write(&batch).await.unwrap();
+        assert!(writer.buffer.is_empty());
+        assert_eq!(writer.buffer_bytes, 0);
+        assert_eq!(writer.next_sequence_number, 7);
+
+        let prepared = writer.prepare_commit().await.unwrap();
+
+        assert!(prepared.data_files.is_empty());
+        assert!(prepared.changelog_files.is_empty());
+        assert_eq!(writer.next_sequence_number, 7);
+    }
+
+    #[tokio::test]
+    async fn test_flush_partial_update_ignore_delete_filters_data_and_changelog() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            Arc::new(ArrowField::new(
+                VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            )),
+            Arc::new(ArrowField::new("value", ArrowDataType::Int32, true)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int8Array::from(vec![0, 3, 1])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int32Array::from(vec![Some(100), None, None]))
+                    as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.input_changelog = true;
+        config.table_options.insert(
+            "partial-update.ignore-delete".to_string(),
+            "true".to_string(),
+        );
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 7)
+                .unwrap();
+
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+
+        assert_eq!(prepared.data_files.len(), 1);
+        assert_eq!(prepared.changelog_files.len(), 1);
+        for file in prepared
+            .data_files
+            .iter()
+            .chain(prepared.changelog_files.iter())
+        {
+            assert_eq!(file.row_count, 1);
+            assert_eq!(file.min_sequence_number, 7);
+            assert_eq!(file.max_sequence_number, 7);
+            assert_eq!(file.delete_row_count, Some(0));
+        }
+        assert_eq!(writer.next_sequence_number, 8);
+    }
+
+    #[tokio::test]
+    async fn test_flush_partial_update_explicit_false_rejects_retract() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            Arc::new(ArrowField::new(
+                VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            )),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int8Array::from(vec![3])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config
+            .table_options
+            .insert("ignore-delete".to_string(), "false".to_string());
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+
+        writer.write(&batch).await.unwrap();
+        let err = match writer.prepare_commit().await {
+            Ok(_) => panic!("explicit ignore-delete=false must reject retract rows"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("does not support DELETE or UPDATE_BEFORE")
+        ));
     }
 
     /// Partial-update merges each key group down to one row at flush: every
