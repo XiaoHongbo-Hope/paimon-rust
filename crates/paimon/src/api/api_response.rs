@@ -19,7 +19,7 @@
 //!
 //! This module contains all response structures used in REST API calls.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::catalog::{Function, FunctionDefinition, ViewSchema};
@@ -266,31 +266,78 @@ impl GetDatabaseResponse {
     }
 }
 
-/// Response containing configuration defaults.
+/// Response containing server-provided configuration defaults and overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigResponse {
     /// Default configuration values.
+    #[serde(default, deserialize_with = "deserialize_config_defaults")]
     pub defaults: HashMap<String, String>,
+    /// Configuration values that override client-provided options.
+    ///
+    /// A null value removes the corresponding option after all maps are merged.
+    #[serde(default, deserialize_with = "deserialize_null_to_default")]
+    pub overrides: HashMap<String, Option<String>>,
+}
+
+fn deserialize_null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_config_defaults<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let defaults =
+        Option::<HashMap<String, Option<String>>>::deserialize(deserializer)?.unwrap_or_default();
+    // Java filters null values after merging. Defaults have the lowest precedence, so dropping
+    // their null entries here produces the same result while preserving the existing field type.
+    Ok(defaults
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect())
 }
 
 impl ConfigResponse {
     /// Create a new ConfigResponse.
     pub fn new(defaults: HashMap<String, String>) -> Self {
-        Self { defaults }
+        Self {
+            defaults,
+            overrides: HashMap::new(),
+        }
     }
 
-    /// Merge these defaults with the provided Options.
-    /// User options take precedence over defaults.
+    /// Merge server defaults and overrides with the provided Options.
+    /// Overrides take precedence over user options, which take precedence over defaults.
     pub fn merge_options(&self, options: &crate::common::Options) -> crate::common::Options {
         let mut merged = self.defaults.clone();
         merged.extend(options.to_map().clone());
+        self.apply_overrides(&mut merged);
         crate::common::Options::from_map(merged)
     }
 
-    /// Convert to Options struct.
+    /// Convert server-provided defaults and overrides to Options.
     pub fn to_options(&self) -> crate::common::Options {
-        crate::common::Options::from_map(self.defaults.clone())
+        let mut options = self.defaults.clone();
+        self.apply_overrides(&mut options);
+        crate::common::Options::from_map(options)
+    }
+
+    fn apply_overrides(&self, options: &mut HashMap<String, String>) {
+        for (key, value) in &self.overrides {
+            match value {
+                Some(value) => {
+                    options.insert(key.clone(), value.clone());
+                }
+                None => {
+                    options.remove(key);
+                }
+            }
+        }
     }
 }
 
@@ -449,6 +496,116 @@ impl AuthTableQueryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_response_overrides_client_options() {
+        let response: ConfigResponse = serde_json::from_str(
+            r#"{
+                "defaults": {
+                    "default-only": "default",
+                    "client-wins": "default",
+                    "override-wins": "default"
+                },
+                "overrides": {
+                    "override-only": "override",
+                    "override-wins": "override"
+                }
+            }"#,
+        )
+        .unwrap();
+        let client_options = crate::common::Options::from_map(HashMap::from([
+            ("client-only".to_string(), "client".to_string()),
+            ("client-wins".to_string(), "client".to_string()),
+            ("override-wins".to_string(), "client".to_string()),
+        ]));
+
+        let merged = response.merge_options(&client_options);
+
+        assert_eq!(merged.get("default-only"), Some(&"default".to_string()));
+        assert_eq!(merged.get("client-only"), Some(&"client".to_string()));
+        assert_eq!(merged.get("client-wins"), Some(&"client".to_string()));
+        assert_eq!(merged.get("override-only"), Some(&"override".to_string()));
+        assert_eq!(merged.get("override-wins"), Some(&"override".to_string()));
+    }
+
+    #[test]
+    fn test_config_response_without_overrides_is_backward_compatible() {
+        let response: ConfigResponse =
+            serde_json::from_str(r#"{"defaults": {"warehouse": "s3://warehouse"}}"#).unwrap();
+
+        assert!(response.overrides.is_empty());
+        assert_eq!(
+            response.to_options().get("warehouse"),
+            Some(&"s3://warehouse".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_response_accepts_null_maps() {
+        let response: ConfigResponse =
+            serde_json::from_str(r#"{"defaults": null, "overrides": null}"#).unwrap();
+        let client_options = crate::common::Options::from_map(HashMap::from([(
+            "client-only".to_string(),
+            "client".to_string(),
+        )]));
+
+        let merged = response.merge_options(&client_options);
+
+        assert_eq!(merged.get("client-only"), Some(&"client".to_string()));
+    }
+
+    #[test]
+    fn test_config_response_filters_null_values_after_merge() {
+        let response: ConfigResponse = serde_json::from_str(
+            r#"{
+                "defaults": {
+                    "default-null": null,
+                    "client-replaces-null": null,
+                    "override-removes": "default",
+                    "override-wins": "default"
+                },
+                "overrides": {
+                    "override-null-only": null,
+                    "override-removes": null,
+                    "override-wins": "override"
+                }
+            }"#,
+        )
+        .unwrap();
+        let client_options = crate::common::Options::from_map(HashMap::from([
+            ("client-only".to_string(), "client".to_string()),
+            ("client-replaces-null".to_string(), "client".to_string()),
+            ("override-removes".to_string(), "client".to_string()),
+            ("override-wins".to_string(), "client".to_string()),
+        ]));
+
+        let merged = response.merge_options(&client_options);
+
+        assert!(!merged.contains("default-null"));
+        assert_eq!(
+            merged.get("client-replaces-null"),
+            Some(&"client".to_string())
+        );
+        assert_eq!(merged.get("client-only"), Some(&"client".to_string()));
+        assert!(!merged.contains("override-null-only"));
+        assert!(!merged.contains("override-removes"));
+        assert_eq!(merged.get("override-wins"), Some(&"override".to_string()));
+    }
+
+    #[test]
+    fn test_config_response_to_options_applies_overrides() {
+        let response: ConfigResponse = serde_json::from_str(
+            r#"{
+                "defaults": {"data-token.enabled": "false"},
+                "overrides": {"data-token.enabled": "true"}
+            }"#,
+        )
+        .unwrap();
+
+        let options = response.to_options();
+
+        assert_eq!(options.get("data-token.enabled"), Some(&"true".to_string()));
+    }
 
     #[test]
     fn test_auth_table_query_response_deserialization() {
