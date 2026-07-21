@@ -43,7 +43,7 @@ pub(crate) struct DataFileReader {
     table_fields: Vec<DataField>,
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
-    row_filter: bool,
+    row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     blob_as_descriptor: bool,
     batch_size: Option<usize>,
 }
@@ -64,7 +64,7 @@ impl DataFileReader {
             table_fields,
             read_type,
             predicates,
-            row_filter: true,
+            row_filter_factory: None,
             blob_as_descriptor: false,
             batch_size: None,
         }
@@ -80,8 +80,11 @@ impl DataFileReader {
         self
     }
 
-    pub(crate) fn with_row_filter(mut self, row_filter: bool) -> Self {
-        self.row_filter = row_filter;
+    pub(crate) fn with_row_filter_factory(
+        mut self,
+        factory: Arc<dyn crate::arrow::RowFilterFactory>,
+    ) -> Self {
+        self.row_filter_factory = Some(factory);
         self
     }
 
@@ -104,12 +107,14 @@ impl DataFileReader {
     /// matching `reject_row_id_with_predicates`'s notion. Consumed by
     /// `pk_vector_position_read` (materialization read path).
     pub(super) fn has_row_filtering_predicate(&self) -> bool {
-        self.predicates
-            .iter()
-            .any(|p| !matches!(p, Predicate::AlwaysTrue))
+        self.row_filter_factory.is_some()
+            || self
+                .predicates
+                .iter()
+                .any(|p| !matches!(p, Predicate::AlwaysTrue))
     }
 
-    /// Reject projecting `_ROW_ID` alongside an exact or pruning predicate.
+    /// Reject projecting `_ROW_ID` alongside an exact predicate.
     /// `_ROW_ID` is assigned positionally from emitted batch row counts, so
     /// residual filtering or row-group/page pruning would desync it. (`_ROW_ID`
     /// predicates travel via `row_ranges`, so they do not trip this.)
@@ -128,9 +133,8 @@ impl DataFileReader {
             .any(|p| !matches!(p, Predicate::AlwaysTrue));
         if projects_row_id && has_row_filtering_predicate {
             return Err(crate::Error::Unsupported {
-                message:
-                    "reading _ROW_ID together with a data or pruning predicate is not supported yet"
-                        .to_string(),
+                message: "reading _ROW_ID together with a data predicate is not supported yet"
+                    .to_string(),
             });
         }
         Ok(())
@@ -259,7 +263,18 @@ impl DataFileReader {
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
-        let row_filter = self.row_filter;
+        // The first version of the engine hook is deliberately limited to a
+        // schema-identical raw read. Schema-evolution readers retain their exact
+        // post-filter until expression adaptation is proven for that path.
+        // Positional `_ROW_ID` materialization must also see the unfiltered row
+        // stream, just like the predicate guard above.
+        let projects_row_id = self
+            .read_type
+            .iter()
+            .any(|field| field.name() == ROW_ID_FIELD_NAME);
+        let row_filter_factory = (data_fields.is_none() && !projects_row_id)
+            .then(|| self.row_filter_factory.clone())
+            .flatten();
         let file_io = self.file_io.clone();
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
@@ -297,12 +312,12 @@ impl DataFileReader {
                 &table_fields,
                 &file_fields,
             );
-            if remapped.is_empty() {
+            if remapped.is_empty() && row_filter_factory.is_none() {
                 None
             } else {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
-                    apply_row_filter: row_filter,
+                    row_filter_factory,
                     file_fields: file_fields.clone(),
                 })
             }
@@ -467,7 +482,6 @@ impl DataFileReader {
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
-        let row_filter = self.row_filter;
         let file_io = self.file_io.clone();
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
@@ -509,7 +523,7 @@ impl DataFileReader {
             } else {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
-                    apply_row_filter: row_filter,
+                    row_filter_factory: None,
                     file_fields: file_fields.clone(),
                 })
             }
@@ -1175,81 +1189,6 @@ mod row_tests {
         assert_eq!(ages, vec![30, 40, 50]);
     }
 
-    #[tokio::test]
-    async fn parquet_predicate_skips_row_groups_when_row_filtering_is_disabled() {
-        let fields = vec![field(0, "id", DataType::Int(IntType::new()))];
-        let schema = build_target_arrow_schema(&fields).unwrap();
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/parquet_pruning_only";
-        let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.parquet";
-        let file_path = format!("{bucket_path}/{file_name}");
-        let output = file_io.new_output(&file_path).unwrap();
-        let mut writer = create_format_writer(&output, schema.clone(), "zstd", 1, None, None, None)
-            .await
-            .unwrap();
-        writer
-            .write(
-                &RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
-        writer
-            .write(
-                &RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![100, 101]))])
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let file_size = writer.close().await.unwrap().file_size as i64;
-
-        let schema_id = 1;
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(bucket_path)
-            .with_total_buckets(1)
-            .with_data_files(vec![data_file(file_name, file_size, 4, schema_id)])
-            .build()
-            .unwrap();
-        let predicate = PredicateBuilder::new(&fields)
-            .greater_than("id", Datum::Int(100))
-            .unwrap();
-        let reader = DataFileReader::new(
-            file_io.clone(),
-            SchemaManager::new(file_io, table_path.to_string()),
-            schema_id,
-            fields.clone(),
-            fields,
-            vec![predicate],
-        )
-        .with_row_filter(false);
-        let batches = reader
-            .read(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let ids = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(ids, vec![100, 101]);
-    }
-
     /// Guard: projecting `_ROW_ID` together with a data predicate must fail
     /// loudly rather than assign wrong row ids. `_ROW_ID` is materialized
     /// positionally from post-filter batch row counts, so the readers' residual
@@ -1376,6 +1315,19 @@ mod tests {
     #[test]
     fn test_accessors_expose_read_type_and_row_filtering_predicate() {
         use crate::spec::{DataField, DataType, IntType};
+
+        #[derive(Debug)]
+        struct NoopRowFilterFactory;
+
+        impl crate::arrow::RowFilterFactory for NoopRowFilterFactory {
+            fn create(
+                &self,
+                _context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                Ok(Vec::new())
+            }
+        }
+
         let fields = vec![DataField::new(
             0,
             "id".to_string(),
@@ -1424,21 +1376,18 @@ mod tests {
             "a real (non-AlwaysTrue) predicate is row-filtering"
         );
 
-        let pruning = PredicateBuilder::new(&fields)
-            .equal("id", crate::spec::Datum::Int(10))
-            .unwrap();
-        let with_pruning = DataFileReader::new(
-            file_io,
-            schema_manager,
+        let with_external_filter = DataFileReader::new(
+            file_io.clone(),
+            schema_manager.clone(),
             1,
             fields.clone(),
-            fields,
-            vec![pruning],
+            fields.clone(),
+            vec![],
         )
-        .with_row_filter(false);
+        .with_row_filter_factory(Arc::new(NoopRowFilterFactory));
         assert!(
-            with_pruning.has_row_filtering_predicate(),
-            "a pruning predicate can skip physical rows"
+            with_external_filter.has_row_filtering_predicate(),
+            "an enabled external decoder filter can drop physical rows"
         );
     }
 

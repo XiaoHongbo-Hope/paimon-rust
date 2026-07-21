@@ -97,7 +97,7 @@ impl FormatFileReader for OrcFormatReader {
             (
                 FilePredicates {
                     predicates: fp.predicates.clone(),
-                    apply_row_filter: fp.apply_row_filter,
+                    row_filter_factory: None,
                     file_fields: fp.file_fields.clone(),
                 },
                 scan_fields,
@@ -425,7 +425,7 @@ mod tests {
     fn file_predicates(predicates: Vec<Predicate>, file_fields: Vec<DataField>) -> FilePredicates {
         FilePredicates {
             predicates,
-            apply_row_filter: true,
+            row_filter_factory: None,
             file_fields,
         }
     }

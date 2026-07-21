@@ -60,7 +60,7 @@ impl FormatFileReader for MosaicFormatReader {
         let read_fields = read_fields.to_vec();
         let predicates = predicates.map(|predicates| FilePredicates {
             predicates: predicates.predicates.clone(),
-            apply_row_filter: predicates.apply_row_filter,
+            row_filter_factory: None,
             file_fields: predicates.file_fields.clone(),
         });
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
@@ -868,7 +868,7 @@ mod tests {
     ) -> FilePredicates {
         FilePredicates {
             predicates,
-            apply_row_filter: true,
+            row_filter_factory: None,
             file_fields: fields,
         }
     }

@@ -38,7 +38,7 @@ pub(crate) struct FormatTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
-    row_filter: bool,
+    row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     limit: Option<usize>,
 }
 
@@ -53,7 +53,7 @@ impl<'a> FormatTableRead<'a> {
             table,
             read_type,
             data_predicates,
-            row_filter: true,
+            row_filter_factory: None,
             limit,
         }
     }
@@ -75,8 +75,11 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
-    pub(crate) fn with_row_filter(mut self, row_filter: bool) -> Self {
-        self.row_filter = row_filter;
+    pub(crate) fn with_row_filter_factory(
+        mut self,
+        factory: Arc<dyn crate::arrow::RowFilterFactory>,
+    ) -> Self {
+        self.row_filter_factory = Some(factory);
         self
     }
 
@@ -101,7 +104,7 @@ impl<'a> FormatTableRead<'a> {
         let schema_id = self.table.schema().id();
         let mut remaining = self.limit;
         let batch_size = Some(core_options.read_batch_size()?);
-        let row_filter = self.row_filter;
+        let row_filter_factory = self.row_filter_factory.clone();
 
         Ok(try_stream! {
             for split in splits {
@@ -109,7 +112,7 @@ impl<'a> FormatTableRead<'a> {
                     break;
                 }
 
-                let mut stream = DataFileReader::new(
+                let mut reader = DataFileReader::new(
                     file_io.clone(),
                     schema_manager.clone(),
                     schema_id,
@@ -117,9 +120,11 @@ impl<'a> FormatTableRead<'a> {
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )
-                .with_row_filter(row_filter)
-                .with_batch_size(batch_size)
-                .read(std::slice::from_ref(&split))?;
+                .with_batch_size(batch_size);
+                if let Some(factory) = &row_filter_factory {
+                    reader = reader.with_row_filter_factory(Arc::clone(factory));
+                }
+                let mut stream = reader.read(std::slice::from_ref(&split))?;
 
                 while let Some(batch) = stream.next().await {
                     if matches!(remaining, Some(0)) {
