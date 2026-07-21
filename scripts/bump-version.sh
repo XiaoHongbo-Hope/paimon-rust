@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Bump version in root Cargo.toml ([workspace.package] and [workspace.dependencies]).
+# Bump the workspace version and refresh locked release metadata.
 # Run from repo root.
 #
 # Usage: ./scripts/bump-version.sh <current_version> <next_version>
@@ -33,6 +33,7 @@ TO_VERSION="$2"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+PYTHON="${PYTHON:-python3}"
 
 if [ ! -f Cargo.toml ]; then
   echo "Cargo.toml not found. Run from repo root."
@@ -52,5 +53,10 @@ case "$(uname -s)" in
     ;;
 esac
 
-echo "Bumped version from ${FROM_VERSION} to ${TO_VERSION} in Cargo.toml"
-echo "Review with: git diff Cargo.toml"
+cargo update -p paimon --precise "${TO_VERSION}"
+PYTHONDONTWRITEBYTECODE=1 "${PYTHON}" scripts/dependencies.py generate
+PYTHONDONTWRITEBYTECODE=1 "${PYTHON}" scripts/dependencies.py verify
+
+echo "Bumped version from ${FROM_VERSION} to ${TO_VERSION}"
+echo "Updated Cargo.toml, Cargo.lock, and dependency reports"
+echo "Review with: git diff -- Cargo.toml Cargo.lock DEPENDENCIES.rust.tsv '**/DEPENDENCIES.rust.tsv'"
