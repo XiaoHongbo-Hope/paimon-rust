@@ -429,7 +429,7 @@ impl GlobalIndexScanner {
             .as_ref()
             .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry));
 
-        for (entry_idx, entry) in entries.iter().enumerate() {
+        for (entry_idx, (entry, meta)) in entries.iter().zip(metas).enumerate() {
             // Also check if between range may match
             let between_matches = between
                 .as_ref()
@@ -494,10 +494,7 @@ impl GlobalIndexScanner {
             let mut reader = if (between_matches && between_evaluated_for_entry)
                 || !matching_predicates.is_empty()
             {
-                Some(
-                    self.open_reader_for_entry(entry, metas[entry_idx], data_type)
-                        .await?,
-                )
+                Some(self.open_reader_for_entry(entry, meta, data_type).await?)
             } else {
                 None
             };
