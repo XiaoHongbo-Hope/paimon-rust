@@ -56,7 +56,7 @@ jobs:
           --tag "${RELEASE_TAG}"
           --pyproject bindings/python/pyproject.toml
 
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: bindings/python
           command: sdist
@@ -84,6 +84,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set Python release version
+        shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: >
@@ -91,7 +92,7 @@ jobs:
           --tag "${RELEASE_TAG}"
           --pyproject bindings/python/pyproject.toml
 
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: bindings/python
           target: ${{ matrix.target }}
@@ -174,7 +175,7 @@ jobs:
 
       - name: Publish to TestPyPI
         if: contains(github.ref, '-')
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
@@ -183,7 +184,7 @@ jobs:
 
       - name: Publish to PyPI
         if: ${{ !contains(github.ref, '-') }}
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           skip-existing: true
           packages-dir: bindings/python/dist
