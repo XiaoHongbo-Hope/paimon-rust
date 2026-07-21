@@ -26,53 +26,115 @@ if sys.version_info < (3, 11):
         f"Current: {sys.version}. Use python3.11+ or see docs for release requirements."
     )
 
+import difflib
 import subprocess
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from functools import cache
 
 from constants import PACKAGES, ROOT_DIR
 
+CARGO_DENY_VERSION = "0.19.6"
 
-def check_single_package(root):
-    pkg_dir = ROOT_DIR / root if root != "." else ROOT_DIR
-    if (pkg_dir / "Cargo.toml").exists():
-        print(f"Checking dependencies of {root}")
-        subprocess.run(
-            ["cargo", "deny", "check", "license"],
-            cwd=pkg_dir,
-            check=True,
+
+@cache
+def verify_cargo_deny() -> None:
+    output = subprocess.check_output(
+        ["cargo", "deny", "--version"], cwd=ROOT_DIR, text=True
+    ).strip()
+    actual = output.rsplit(" ", 1)[-1]
+    if actual != CARGO_DENY_VERSION:
+        raise RuntimeError(
+            f"cargo-deny {CARGO_DENY_VERSION} is required, found {output!r}"
         )
-    else:
-        print(f"Skipping {root} as Cargo.toml does not exist")
+
+
+def cargo_deny(spec, *args, capture_output=False):
+    verify_cargo_deny()
+    return subprocess.run(
+        [
+            "cargo",
+            "deny",
+            "--locked",
+            "--all-features",
+            "--manifest-path",
+            str(ROOT_DIR / spec.manifest_path),
+            *args,
+        ],
+        cwd=ROOT_DIR,
+        check=not capture_output,
+        capture_output=capture_output,
+        text=True,
+    )
+
+
+def check_single_package(spec):
+    print(f"Checking dependencies of {spec.output_dir}")
+    cargo_deny(spec, "check", "licenses")
 
 
 def check_deps():
-    for d in PACKAGES:
-        check_single_package(d)
+    checked = set()
+    for spec in PACKAGES:
+        if spec.manifest_path in checked:
+            continue
+        checked.add(spec.manifest_path)
+        check_single_package(spec)
 
 
-def generate_single_package(root):
-    pkg_dir = ROOT_DIR / root if root != "." else ROOT_DIR
-    if (pkg_dir / "Cargo.toml").exists():
-        print(f"Generating dependencies {root}")
-        result = subprocess.run(
-            ["cargo", "deny", "list", "-f", "tsv", "-t", "0.6"],
-            cwd=pkg_dir,
-            capture_output=True,
-            text=True,
+def dependency_report(spec):
+    result = cargo_deny(spec, "list", "-f", "tsv", "-t", "0.6", capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cargo deny list failed for {spec.manifest_path}: "
+            f"{result.stderr or result.stdout}"
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"cargo deny list failed in {root}: {result.stderr or result.stdout}"
-            )
-        out_file = pkg_dir / "DEPENDENCIES.rust.tsv"
-        out_file.write_text(result.stdout)
-    else:
-        print(f"Skipping {root} as Cargo.toml does not exist")
+    return result.stdout
+
+
+def output_file(spec):
+    output_dir = ROOT_DIR if spec.output_dir == "." else ROOT_DIR / spec.output_dir
+    return output_dir / "DEPENDENCIES.rust.tsv"
+
+
+def generate_single_package(spec):
+    print(f"Generating dependencies {spec.output_dir}")
+    out_file = output_file(spec)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_bytes(dependency_report(spec).encode("utf-8"))
 
 
 def generate_deps():
-    for d in PACKAGES:
-        generate_single_package(d)
+    for spec in PACKAGES:
+        generate_single_package(spec)
+
+
+def verify_deps():
+    failed = False
+    for spec in PACKAGES:
+        expected = dependency_report(spec)
+        out_file = output_file(spec)
+        if not out_file.exists():
+            print(f"Missing dependency report: {out_file.relative_to(ROOT_DIR)}")
+            failed = True
+            continue
+        expected_bytes = expected.encode("utf-8")
+        actual_bytes = out_file.read_bytes()
+        if actual_bytes == expected_bytes:
+            continue
+        failed = True
+        print(f"Stale dependency report: {out_file.relative_to(ROOT_DIR)}")
+        actual = actual_bytes.decode("utf-8")
+        diff = difflib.unified_diff(
+            actual.splitlines(),
+            expected.splitlines(),
+            fromfile=str(out_file.relative_to(ROOT_DIR)),
+            tofile=f"generated/{out_file.relative_to(ROOT_DIR)}",
+            lineterm="",
+        )
+        for line in list(diff)[:200]:
+            print(line)
+    if failed:
+        raise RuntimeError("dependency reports are missing or stale")
 
 
 if __name__ == "__main__":
@@ -89,6 +151,13 @@ if __name__ == "__main__":
         "generate", description="Generate dependencies", help="Generate dependencies"
     )
     parser_generate.set_defaults(func=generate_deps)
+
+    parser_verify = subparsers.add_parser(
+        "verify",
+        description="Verify committed dependency reports",
+        help="Verify committed dependency reports",
+    )
+    parser_verify.set_defaults(func=verify_deps)
 
     args = parser.parse_args()
     arg_dict = dict(vars(args))

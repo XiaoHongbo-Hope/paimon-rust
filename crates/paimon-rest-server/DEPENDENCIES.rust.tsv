@@ -30,6 +30,9 @@ atomic-waker@1.1.2		X									X
 autocfg@1.5.1		X									X				
 aws-lc-rs@1.17.3		X							X						
 aws-lc-sys@0.43.0		X			X				X		X	X			
+axum@0.7.9											X				
+axum-core@0.4.5											X				
+axum-macros@0.4.2											X				
 base64@0.22.1		X									X				
 bigdecimal@0.4.10		X									X				
 bitflags@2.13.1		X									X				
@@ -165,6 +168,7 @@ log@0.4.33		X									X
 lz4_flex@0.11.6											X				
 lz4_flex@0.13.1											X				
 lzokay-native@0.1.0											X				
+matchit@0.7.3					X						X				
 matrixmultiply@0.3.11		X									X				
 md-5@0.10.6		X									X				
 md-5@0.11.0		X									X				
@@ -196,8 +200,8 @@ orc-rust@0.8.0		X
 ordered-float@2.10.1											X				
 ordered-multimap@0.7.3											X				
 paimon@0.3.0		X													
-paimon-integration-tests@0.3.0		X													
 paimon-mosaic-core@0.2.0		X													
+paimon-rest-server@0.3.0		X													
 paimon-vindex-core@0.2.0		X													
 parquet@58.3.0		X													
 paste@1.0.15		X									X				
@@ -262,6 +266,7 @@ serde_bytes@0.11.19		X									X
 serde_core@1.0.229		X									X				
 serde_derive@1.0.229		X									X				
 serde_json@1.0.151		X									X				
+serde_path_to_error@0.1.20		X									X				
 serde_repr@0.1.21		X									X				
 serde_urlencoded@0.7.1		X									X				
 serde_with@3.21.0		X									X				
@@ -271,6 +276,7 @@ sha1@0.11.0		X									X
 sha2@0.10.9		X									X				
 sha2@0.11.0		X									X				
 shlex@2.0.1		X									X				
+signal-hook-registry@1.4.8		X									X				
 simba@0.9.1		X													
 simd-adler32@0.3.10											X				
 simd_cesu8@1.2.0		X									X				

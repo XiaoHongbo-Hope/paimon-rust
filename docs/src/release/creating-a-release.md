@@ -171,7 +171,7 @@ RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
 1. Install [cargo-deny](https://embarkstudios.github.io/cargo-deny/):
 
     ```bash
-    cargo install cargo-deny
+    cargo install cargo-deny --version 0.19.6 --locked
     ```
 
 2. Generate the dependency list (requires **Python 3.11+**):
@@ -179,15 +179,17 @@ RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
     ```bash
     git checkout main
     git pull
+    cargo fetch --locked
     python3 scripts/dependencies.py generate
+    python3 scripts/dependencies.py verify
     ```
 
-    This creates a `DEPENDENCIES.rust.tsv` file for the workspace root and each member crate.
+    This creates dependency reports for the workspace, each member crate, and the Go binding.
 
 3. Commit the result:
 
     ```bash
-    git add **/DEPENDENCIES*.tsv
+    git add Cargo.lock DEPENDENCIES.rust.tsv '**/DEPENDENCIES.rust.tsv'
     git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
     git push origin main
     ```
@@ -210,12 +212,12 @@ After cutting the release branch, bump `main` to the next version so that ongoin
 ```bash
 git checkout main
 ./scripts/bump-version.sh ${RELEASE_VERSION} ${NEXT_VERSION}
-git add Cargo.toml
+git add Cargo.toml Cargo.lock DEPENDENCIES.rust.tsv '**/DEPENDENCIES.rust.tsv'
 git commit -m "chore: bump version to ${NEXT_VERSION}"
 git push origin main
 ```
 
-The script updates `version` in root `Cargo.toml` (`[workspace.package]` and the `paimon` entry in `[workspace.dependencies]`). All member crates inherit the workspace version.
+The script updates `version` in root `Cargo.toml` (`[workspace.package]` and the `paimon` entry in `[workspace.dependencies]`), refreshes `Cargo.lock`, and regenerates the dependency reports. It requires Python 3.11+ and cargo-deny 0.19.6; set `PYTHON` when Python 3.11+ is not available as `python3`. All member crates inherit the workspace version.
 
 ### Optional: Create PRs for release blog and download page
 

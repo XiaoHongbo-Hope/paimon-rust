@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use opendal::services::FsConfig;
 use opendal::Operator;
+use opendal_service_fs::FsConfig;
 
 use crate::Result;
 
@@ -25,5 +25,5 @@ pub(crate) fn fs_config_build() -> Result<Operator> {
     let mut cfg = FsConfig::default();
     cfg.root = Some("/".to_string());
 
-    Ok(Operator::from_config(cfg)?.finish())
+    Ok(Operator::from_config(cfg)?)
 }

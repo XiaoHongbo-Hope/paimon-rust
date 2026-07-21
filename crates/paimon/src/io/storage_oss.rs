@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::OssConfig;
 use opendal::{Configurator, Operator};
+use opendal_service_oss::OssConfig;
 use url::Url;
 
 use crate::error::Error;
@@ -97,7 +97,7 @@ pub(crate) fn oss_config_build(cfg: &OssConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(Operator::new(builder)?.finish())
+    Ok(super::with_http_transport(Operator::new(builder)?))
 }
 
 #[cfg(test)]

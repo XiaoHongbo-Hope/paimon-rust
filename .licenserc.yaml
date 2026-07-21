@@ -23,6 +23,7 @@ header:
   paths-ignore:
     - "LICENSE"
     - "NOTICE"
+    - "Cargo.lock"
     - ".gitattributes"
     - ".github/PULL_REQUEST_TEMPLATE.md"
     - "crates/paimon/tests/**/*.json"

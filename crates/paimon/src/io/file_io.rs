@@ -246,7 +246,8 @@ impl FileIO {
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
 
-        op.remove_all(relative_path.as_ref())
+        op.delete_with(relative_path.as_ref())
+            .recursive(true)
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to delete directory '{path}'"),

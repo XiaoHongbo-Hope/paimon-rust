@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::AzdlsConfig;
 use opendal::{Configurator, Operator};
+use opendal_service_azdls::AzdlsConfig;
 use url::Url;
 
 use crate::error::Error;
@@ -68,7 +68,7 @@ pub(crate) fn azdls_config_build(cfg: &AzdlsStorageConfig, path: &str) -> Result
     let (cfg, relative_path) = azdls_config_for_path(cfg, path)?;
 
     let builder = cfg.into_builder();
-    let op = Operator::new(builder)?.finish();
+    let op = super::with_http_transport(Operator::new(builder)?);
 
     debug_assert_eq!(
         relative_path,

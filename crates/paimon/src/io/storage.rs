@@ -39,19 +39,19 @@ use std::sync::MutexGuard;
 
 #[cfg(feature = "storage-azdls")]
 use super::AzdlsStorageConfig;
+use opendal::Operator;
 #[cfg(feature = "storage-cos")]
-use opendal::services::CosConfig;
+use opendal_service_cos::CosConfig;
 #[cfg(feature = "storage-gcs")]
-use opendal::services::GcsConfig;
+use opendal_service_gcs::GcsConfig;
 #[cfg(feature = "storage-hdfs")]
-use opendal::services::HdfsNativeConfig;
+use opendal_service_hdfs_native::HdfsNativeConfig;
 #[cfg(feature = "storage-obs")]
-use opendal::services::ObsConfig;
+use opendal_service_obs::ObsConfig;
 #[cfg(feature = "storage-oss")]
-use opendal::services::OssConfig;
+use opendal_service_oss::OssConfig;
 #[cfg(feature = "storage-s3")]
-use opendal::services::S3Config;
-use opendal::{Operator, Scheme};
+use opendal_service_s3::S3Config;
 #[cfg(any(
     feature = "storage-cos",
     feature = "storage-gcs",
@@ -112,19 +112,18 @@ pub enum Storage {
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
         let (scheme_str, props) = file_io_builder.into_parts();
-        let scheme = Self::parse_scheme(&scheme_str)?;
-
-        match scheme {
+        let scheme = scheme_str.to_ascii_lowercase();
+        match scheme.as_str() {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory {
+            "memory" => Ok(Self::Memory {
                 op: super::memory_config_build()?,
             }),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs {
+            "file" | "fs" | "" => Ok(Self::LocalFs {
                 op: super::fs_config_build()?,
             }),
             #[cfg(feature = "storage-oss")]
-            Scheme::Oss => {
+            "oss" => {
                 let config = super::oss_config_parse(props)?;
                 Ok(Self::Oss {
                     config: Box::new(config),
@@ -132,7 +131,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-s3")]
-            Scheme::S3 => {
+            "s3" | "s3a" => {
                 let config = super::s3_config_parse(props)?;
                 Ok(Self::S3 {
                     config: Box::new(config),
@@ -140,7 +139,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-cos")]
-            Scheme::Cos => {
+            "cos" | "cosn" => {
                 let config = super::cos_config_parse(props)?;
                 Ok(Self::Cos {
                     config: Box::new(config),
@@ -148,7 +147,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-azdls")]
-            Scheme::Azdls => {
+            "abfs" | "abfss" | "az" | "azdfs" | "azdls" | "azure" => {
                 let config = super::azdls_config_parse(props)?;
                 Ok(Self::Azdls {
                     config: Box::new(config),
@@ -156,7 +155,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-obs")]
-            Scheme::Obs => {
+            "obs" => {
                 let config = super::obs_config_parse(props)?;
                 Ok(Self::Obs {
                     config: Box::new(config),
@@ -164,7 +163,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-gcs")]
-            Scheme::Gcs => {
+            "gcs" | "gs" => {
                 let config = super::gcs_config_parse(props)?;
                 Ok(Self::Gcs {
                     config: Box::new(config),
@@ -172,7 +171,7 @@ impl Storage {
                 })
             }
             #[cfg(feature = "storage-hdfs")]
-            Scheme::HdfsNative => {
+            "hdfs" | "hdfs-native" | "hdfs_native" => {
                 let config = super::hdfs_config_parse(props)?;
                 Ok(Self::Hdfs {
                     config: Box::new(config),
@@ -413,18 +412,109 @@ impl Storage {
             super::s3_config_build(config, path)
         })
     }
+}
 
-    fn parse_scheme(scheme: &str) -> crate::Result<Scheme> {
-        match scheme {
-            "memory" => Ok(Scheme::Memory),
-            "file" | "" => Ok(Scheme::Fs),
-            "s3" | "s3a" => Ok(Scheme::S3),
-            "cosn" => Ok(Scheme::Cos),
-            "abfs" | "abfss" | "az" | "azure" => Ok(Scheme::Azdls),
-            "gs" => Ok(Scheme::Gcs),
-            "hdfs" => Ok(Scheme::HdfsNative),
-            s => Ok(s.parse::<Scheme>()?),
+#[cfg(test)]
+mod scheme_tests {
+    use crate::error::Error;
+    use crate::io::{FileIOBuilder, Storage};
+
+    fn build(scheme: &str) -> Storage {
+        Storage::build(FileIOBuilder::new(scheme)).unwrap()
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[test]
+    fn memory_scheme_is_case_insensitive() {
+        for scheme in ["memory", "MEMORY"] {
+            assert!(matches!(build(scheme), Storage::Memory { .. }), "{scheme}");
         }
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[test]
+    fn local_fs_scheme_aliases_are_compatible() {
+        for scheme in ["", "file", "FILE", "fs", "FS"] {
+            assert!(matches!(build(scheme), Storage::LocalFs { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-oss")]
+    #[test]
+    fn oss_scheme_is_case_insensitive() {
+        for scheme in ["oss", "OSS"] {
+            let storage = Storage::build(FileIOBuilder::new(scheme).with_props([
+                ("fs.oss.endpoint", "https://oss-cn-hangzhou.aliyuncs.com"),
+                ("fs.oss.accessKeyId", "test-ak"),
+                ("fs.oss.accessKeySecret", "test-sk"),
+            ]))
+            .unwrap();
+            assert!(matches!(storage, Storage::Oss { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn s3_scheme_aliases_are_compatible() {
+        for scheme in ["s3", "S3", "s3a", "S3A"] {
+            assert!(matches!(build(scheme), Storage::S3 { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-cos")]
+    #[test]
+    fn cos_scheme_aliases_are_compatible() {
+        for scheme in ["cos", "COS", "cosn", "COSN"] {
+            assert!(matches!(build(scheme), Storage::Cos { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-azdls")]
+    #[test]
+    fn azdls_scheme_aliases_are_compatible() {
+        for scheme in [
+            "azdls", "AZDLS", "azdfs", "AZDFS", "abfs", "ABFS", "abfss", "ABFSS", "az", "AZ",
+            "azure", "AZURE",
+        ] {
+            assert!(matches!(build(scheme), Storage::Azdls { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-obs")]
+    #[test]
+    fn obs_scheme_is_case_insensitive() {
+        for scheme in ["obs", "OBS"] {
+            assert!(matches!(build(scheme), Storage::Obs { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-gcs")]
+    #[test]
+    fn gcs_scheme_aliases_are_compatible() {
+        for scheme in ["gcs", "GCS", "gs", "GS"] {
+            assert!(matches!(build(scheme), Storage::Gcs { .. }), "{scheme}");
+        }
+    }
+
+    #[cfg(feature = "storage-hdfs")]
+    #[test]
+    fn hdfs_native_scheme_aliases_are_compatible() {
+        for scheme in [
+            "hdfs",
+            "HDFS",
+            "hdfs-native",
+            "HDFS-NATIVE",
+            "hdfs_native",
+            "HDFS_NATIVE",
+        ] {
+            assert!(matches!(build(scheme), Storage::Hdfs { .. }), "{scheme}");
+        }
+    }
+
+    #[test]
+    fn unknown_scheme_is_rejected() {
+        let error = FileIOBuilder::new("unknown").build().unwrap_err();
+        assert!(matches!(error, Error::IoUnsupported { .. }));
     }
 }
 

@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use opendal::services::ObsConfig;
 use opendal::{Configurator, Operator};
+use opendal_service_obs::ObsConfig;
 use url::Url;
 
 use crate::error::Error;
@@ -38,7 +38,7 @@ const KEY_ALIASES: &[(&str, &str)] = &[
     ("fs.obs.secret_access_key", "fs.obs.secret.key"),
 ];
 
-#[allow(clippy::field_reassign_with_default)]
+#[allow(clippy::field_reassign_with_default, deprecated)]
 pub(crate) fn obs_config_parse(props: HashMap<String, String>) -> Result<ObsConfig> {
     let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.obs.", KEY_ALIASES);
 
@@ -63,7 +63,7 @@ pub(crate) fn obs_config_build(cfg: &ObsConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(Operator::new(builder)?.finish())
+    Ok(super::with_http_transport(Operator::new(builder)?))
 }
 
 #[cfg(test)]
