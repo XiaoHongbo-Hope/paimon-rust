@@ -174,7 +174,7 @@ impl GlobalIndexScanner {
             };
             let global_meta = match &entry.index_file.global_index_meta {
                 Some(m) => m,
-                None => continue,
+                None => return None,
             };
 
             let sorted_meta = global_meta
@@ -1797,6 +1797,37 @@ mod tests {
                 "missing or invalid index metadata must fall back to the normal table scan"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_missing_global_index_meta_falls_back() {
+        let (file_io, table_path, file_name, tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let second_file_name = "btree_int_100_no_compress_2.bin";
+        std::fs::copy(
+            tmp.path().join("index").join(&file_name),
+            tmp.path().join("index").join(second_file_name),
+        )
+        .unwrap();
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let valid_entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        let mut invalid_entry = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
+        invalid_entry.index_file.global_index_meta = None;
+
+        let result = evaluate_global_index_fast(
+            &file_io,
+            &table_path,
+            &[valid_entry, invalid_entry],
+            &[int_eq("id", 0, 50)],
+            &int_schema_fields(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "missing global index metadata must fall back to the normal table scan"
+        );
     }
 
     #[tokio::test]

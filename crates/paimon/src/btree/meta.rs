@@ -196,7 +196,14 @@ impl BTreeIndexMeta {
             == 1;
         pos += 1;
 
-        if data.len().saturating_sub(pos) >= 2 {
+        let trailer_len = data.len().saturating_sub(pos);
+        if trailer_len == 1 {
+            return Err(invalid_meta(
+                "BTreeIndexMeta null flags trailer is truncated",
+            ));
+        }
+
+        if trailer_len >= 2 {
             let format_version = data[pos];
             pos += 1;
             if format_version == FORMAT_VERSION_WITH_NULL_FLAGS {
@@ -288,5 +295,15 @@ mod tests {
             let error = BTreeIndexMeta::deserialize(&encoded).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn test_meta_rejects_truncated_null_flags_trailer() {
+        let meta = BTreeIndexMeta::new(Some(Vec::new()), Some(Vec::new()), true);
+        let mut encoded = meta.serialize();
+        assert_eq!(encoded.pop(), Some(0));
+
+        let error = BTreeIndexMeta::deserialize(&encoded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
