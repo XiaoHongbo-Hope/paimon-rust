@@ -114,6 +114,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install cargo-about
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-about@0.9.1
+
       - name: Set Python release version
         shell: bash
         run: >
@@ -121,8 +126,10 @@ jobs:
           --tag "${RELEASE_TAG}"
           --pyproject bindings/python/pyproject.toml
 
-      - name: Stage wheel legal files
-        run: python scripts/release_licenses.py --stage-python ${{ matrix.rust_target }}
+      - name: Generate wheel legal files
+        run: |
+          cargo fetch --locked
+          python3 scripts/release_licenses.py --stage-python ${{ matrix.rust_target }}
 
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -224,10 +231,11 @@ jobs:
         with:
           tool: cargo-about@0.9.1
 
-      - name: Verify generated release licenses
+      - name: Generate expected wheel legal files
         run: |
           cargo fetch --locked
-          python3 scripts/release_licenses.py --check
+          python3 scripts/release_licenses.py \
+            --generate-python-reports bindings/python/licenses
 
       - uses: actions/download-artifact@v8
         with:

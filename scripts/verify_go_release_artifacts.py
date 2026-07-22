@@ -86,21 +86,14 @@ def require_file(path: Path) -> None:
         raise ValueError(f"missing or empty release file: {path}")
 
 
-def require_equal(actual: Path, expected: Path) -> None:
-    require_file(actual)
-    require_file(expected)
-    if actual.read_bytes() != expected.read_bytes():
-        raise ValueError(f"{actual} does not match {expected}")
-
-
 def verify_avro_notice(content: str, description: str) -> None:
     for marker in AVRO_NOTICE_MARKERS:
         if marker not in content:
             raise ValueError(f"{description} is missing {marker!r}")
 
 
-def verify_report(report: Path, expected: Path, target: str) -> None:
-    require_equal(report, expected)
+def verify_report(report: Path, target: str) -> None:
+    require_file(report)
     report_text = report.read_text(encoding="utf-8")
     required_markers = (
         "<strong>Artifact:</strong> <code>go</code>",
@@ -145,16 +138,25 @@ def verify_target(root: Path, artifacts_dir: Path, target: str) -> None:
     artifact = ARTIFACTS[target]
     library = artifacts_dir / artifact.library
     report = artifacts_dir / artifact.report
-    expected_report = root / "bindings/go" / artifact.report
     verify_library(library, artifact)
-    verify_report(report, expected_report, target)
+    verify_report(report, target)
     print(f"verified {artifact.library}: {target}")
 
 
 def verify_release_legal_files(root: Path, artifacts_dir: Path) -> None:
-    for name in ("LICENSE", "NOTICE"):
-        require_equal(artifacts_dir / name, root / "bindings/go" / name)
-    notice = (artifacts_dir / "NOTICE").read_text(encoding="utf-8")
+    license_path = artifacts_dir / "LICENSE"
+    require_file(license_path)
+    license_content = license_path.read_text(encoding="utf-8")
+    apache_license = (root / "LICENSE").read_text(encoding="utf-8").rstrip()
+    if not license_content.startswith(apache_license + "\n"):
+        raise ValueError("binary LICENSE does not begin with the Apache License")
+    for artifact in ARTIFACTS.values():
+        if artifact.report not in license_content:
+            raise ValueError(f"binary LICENSE is missing {artifact.report}")
+
+    notice_path = artifacts_dir / "NOTICE"
+    require_file(notice_path)
+    notice = notice_path.read_text(encoding="utf-8")
     verify_avro_notice(notice, "NOTICE")
 
 

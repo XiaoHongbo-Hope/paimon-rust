@@ -25,6 +25,9 @@ OpenSSL 1.1.1w on aarch64 Linux. Both versions use the same license text.
 The XZ Utils 5.8.3 license is read from the locked `liblzma-sys` crate at
 `xz/COPYING.0BSD`.
 
+Target-specific Python and Go reports are generated in their binary build jobs.
+They are intentionally not committed or included in the ASF source archive.
+
 Sources:
 
 - <https://github.com/openssl/openssl/blob/OpenSSL_1_1_1k/LICENSE>

@@ -26,8 +26,6 @@ header:
     - "Cargo.lock"
     - ".gitattributes"
     - ".github/PULL_REQUEST_TEMPLATE.md"
-    - "bindings/go/THIRD-PARTY-LICENSES.*.html"
-    - "bindings/python/licenses/**/THIRD-PARTY-LICENSES.html"
     - "crates/paimon/tests/**/*.json"
     - "crates/paimon/testdata/**"
     - "third-party-licenses/openssl-1.1.1.LICENSE"

@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import argparse
-import difflib
 import html
 import json
 import re
@@ -81,13 +80,6 @@ class BundledComponent:
     required_features: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
-class NoticeComponent:
-    crate: str
-    notice_path: str
-    components: tuple[str, ...]
-
-
 ALLOC_CORRECTIONS = (
     LicenseCorrection(
         crates=("alloc-stdlib",),
@@ -145,29 +137,6 @@ PYTHON_MIT_CORRECTIONS = (
         license_path="LICENSE",
         license_name="MIT License (Tantivy workspace)",
         anchor="mit-tantivy-workspace",
-    ),
-)
-
-NOTICE_COMPONENTS = (
-    NoticeComponent(
-        crate="apache-avro",
-        notice_path="NOTICE",
-        components=("python", "go"),
-    ),
-    NoticeComponent(
-        crate="arrow",
-        notice_path="NOTICE.txt",
-        components=("python", "go"),
-    ),
-    NoticeComponent(
-        crate="datafusion",
-        notice_path="NOTICE.txt",
-        components=("python",),
-    ),
-    NoticeComponent(
-        crate="object_store",
-        notice_path="NOTICE.txt",
-        components=("python", "go"),
     ),
 )
 
@@ -310,7 +279,34 @@ def cargo_metadata(root: Path, report: Report) -> dict:
         cwd=root,
         text=True,
     )
-    return json.loads(output)
+    metadata = json.loads(output)
+    tree = subprocess.check_output(
+        [
+            "cargo",
+            "tree",
+            "--locked",
+            "--manifest-path",
+            report.manifest,
+            "--target",
+            report.target,
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ],
+        cwd=root,
+        text=True,
+    )
+    packages = set()
+    for line in tree.splitlines():
+        match = re.match(r"^([A-Za-z0-9_-]+) v([^ ]+)", line)
+        if match is None:
+            raise RuntimeError(f"unexpected cargo tree package line: {line!r}")
+        packages.add(match.groups())
+    metadata["normal_packages"] = packages
+    return metadata
 
 
 def generate_base_report(root: Path, report: Report, output: Path) -> str:
@@ -338,23 +334,12 @@ def generate_base_report(root: Path, report: Report, output: Path) -> str:
 
 
 def resolved_packages(metadata: dict) -> list[dict]:
-    root_id = metadata["resolve"]["root"]
-    if root_id is None:
-        raise RuntimeError("cargo metadata did not identify a root package")
-    nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
-    resolved = set()
-    pending = [root_id]
-    while pending:
-        package_id = pending.pop()
-        if package_id in resolved:
-            continue
-        resolved.add(package_id)
-        pending.extend(
-            dependency["pkg"]
-            for dependency in nodes[package_id]["deps"]
-            if any(kind["kind"] is None for kind in dependency["dep_kinds"])
-        )
-    return [package for package in metadata["packages"] if package["id"] in resolved]
+    normal_packages = metadata["normal_packages"]
+    return [
+        package
+        for package in metadata["packages"]
+        if (package["name"], package["version"]) in normal_packages
+    ]
 
 
 def package_by_name(
@@ -615,78 +600,174 @@ def notice_paragraphs(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"\n\s*\n", normalized) if part.strip()]
 
 
-def binary_notice(root: Path, component: str, metadata_by_target: list[dict]) -> str:
+def binary_notice(root: Path, metadata_by_target: list[dict]) -> str:
     paragraphs = notice_paragraphs((root / "NOTICE").read_text(encoding="utf-8"))
     seen_paragraphs = set(paragraphs)
-    seen_notices = set()
-
-    for notice_component in NOTICE_COMPONENTS:
-        if component not in notice_component.components:
-            continue
-        found = False
-        for metadata in metadata_by_target:
-            package = package_by_name(metadata, notice_component.crate, required=False)
-            if package is None:
-                continue
-            found = True
-            notice_file = (
-                Path(package["manifest_path"]).parent / notice_component.notice_path
+    seen_packages = set()
+    for metadata in metadata_by_target:
+        for package in resolved_packages(metadata):
+            package_key = (
+                package["name"],
+                package["version"],
+                package["manifest_path"],
             )
-            if not notice_file.is_file():
-                raise RuntimeError(f"dependency notice is missing: {notice_file}")
-            notice_text = notice_file.read_text(encoding="utf-8")
-            normalized_notice = "\n\n".join(notice_paragraphs(notice_text))
-            if normalized_notice in seen_notices:
+            if package_key in seen_packages:
                 continue
-            seen_notices.add(normalized_notice)
-            for paragraph in notice_paragraphs(notice_text):
-                if ASF_DEVELOPED_NOTICE.fullmatch(paragraph):
-                    continue
-                if paragraph in seen_paragraphs:
-                    continue
-                seen_paragraphs.add(paragraph)
-                paragraphs.append(paragraph)
-        if not found:
-            raise RuntimeError(
-                f"required NOTICE dependency is missing: {notice_component.crate}"
+            seen_packages.add(package_key)
+            package_dir = Path(package["manifest_path"]).parent
+            notice_files = sorted(
+                path
+                for path in package_dir.iterdir()
+                if path.is_file()
+                and path.name.lower() in {"notice", "notice.txt", "notice.md"}
             )
+            for notice_file in notice_files:
+                notice_text = notice_file.read_text(encoding="utf-8")
+                for paragraph in notice_paragraphs(notice_text):
+                    if ASF_DEVELOPED_NOTICE.fullmatch(paragraph):
+                        continue
+                    if paragraph in seen_paragraphs:
+                        continue
+                    seen_paragraphs.add(paragraph)
+                    paragraphs.append(paragraph)
 
     return "\n\n".join(paragraphs) + "\n"
 
 
-def generated_files(root: Path) -> dict[Path, str]:
-    verify_cargo_about(root)
+def verify_python_source_legal_files(root: Path) -> None:
     for name in ("LICENSE", "NOTICE"):
         source = root / name
         copy = root / "bindings/python" / name
         if source.read_bytes() != copy.read_bytes():
             raise RuntimeError(f"restore bindings/python/{name} before generation")
+    source_report = root / "bindings/python/THIRD-PARTY-LICENSES.html"
+    report_text = source_report.read_text(encoding="utf-8")
+    for marker in (
+        "Python source distribution licenses",
+        "contains no compiled native library",
+    ):
+        if marker not in report_text:
+            raise RuntimeError(f"Python source license report is missing {marker!r}")
+
+
+def generate_reports(
+    root: Path, reports: list[Report]
+) -> tuple[dict[Report, str], dict[Report, dict]]:
+    verify_cargo_about(root)
     result = {}
     metadata_by_report = {}
     with tempfile.TemporaryDirectory(prefix="paimon-rust-license-reports-") as temp:
         temp_root = Path(temp)
-        for index, report in enumerate(report_specs()):
+        for index, report in enumerate(reports):
             print(f"generating {report.component} license report for {report.target}")
             base = generate_base_report(
                 root, report, temp_root / f"report-{index}.html"
             )
             metadata = cargo_metadata(root, report)
-            metadata_by_report[(report.component, report.target)] = metadata
-            result[root / report.output] = complete_report(root, base, report, metadata)
+            metadata_by_report[report] = metadata
+            result[report] = complete_report(root, base, report, metadata)
+    return result, metadata_by_report
 
+
+def python_binary_files(
+    root: Path, target: str, report: str, metadata: dict
+) -> dict[str, str]:
     apache_license = (root / "LICENSE").read_text(encoding="utf-8")
-    for target in PYTHON_TARGETS:
-        license_dir = root / "bindings/python/licenses" / target
-        result[license_dir / "LICENSE"] = binary_license(
+    return {
+        "LICENSE": binary_license(
             apache_license,
             f"This binary wheel bundles the Rust native library for {target}.",
             ["THIRD-PARTY-LICENSES.html"],
+        ),
+        "NOTICE": binary_notice(root, [metadata]),
+        "THIRD-PARTY-LICENSES.html": report,
+    }
+
+
+def python_target_files(root: Path, target: str, output_dir: Path) -> dict[Path, str]:
+    if target not in PYTHON_TARGETS:
+        raise ValueError(f"unsupported Python release target: {target}")
+    verify_python_source_legal_files(root)
+    report = next(
+        item
+        for item in report_specs()
+        if item.component == "python" and item.target == target
+    )
+    reports, metadata = generate_reports(root, [report])
+    return {
+        output_dir / name: content
+        for name, content in python_binary_files(
+            root, target, reports[report], metadata[report]
+        ).items()
+    }
+
+
+def python_verification_files(root: Path, output_dir: Path) -> dict[Path, str]:
+    verify_python_source_legal_files(root)
+    reports = [report for report in report_specs() if report.component == "python"]
+    generated, metadata = generate_reports(root, reports)
+    result = {}
+    for report in reports:
+        target_dir = output_dir / report.target
+        result.update(
+            {
+                target_dir / name: content
+                for name, content in python_binary_files(
+                    root,
+                    report.target,
+                    generated[report],
+                    metadata[report],
+                ).items()
+            }
         )
-        result[license_dir / "NOTICE"] = binary_notice(
-            root,
-            "python",
-            [metadata_by_report[("python", target)]],
+    return result
+
+
+def go_target_files(root: Path, target: str, output_dir: Path) -> dict[Path, str]:
+    if target not in GO_REPORTS:
+        raise ValueError(f"unsupported Go release target: {target}")
+    report = next(
+        item
+        for item in report_specs()
+        if item.component == "go" and item.target == target
+    )
+    generated, _ = generate_reports(root, [report])
+    return {output_dir / GO_REPORTS[target]: generated[report]}
+
+
+def go_release_files(root: Path, output_dir: Path) -> dict[Path, str]:
+    reports = [report for report in report_specs() if report.component == "go"]
+    generated, metadata = generate_reports(root, reports)
+    apache_license = (root / "LICENSE").read_text(encoding="utf-8")
+    result = {
+        output_dir / GO_REPORTS[report.target]: generated[report] for report in reports
+    }
+    result[output_dir / "LICENSE"] = binary_license(
+        apache_license,
+        "This Go module bundles Rust native libraries for four release targets.",
+        list(GO_REPORTS.values()),
+    )
+    result[output_dir / "NOTICE"] = binary_notice(
+        root, [metadata[report] for report in reports]
+    )
+    return result
+
+
+def generated_files(root: Path) -> dict[Path, str]:
+    verify_python_source_legal_files(root)
+    reports = report_specs()
+    generated, metadata = generate_reports(root, reports)
+    result = {root / report.output: generated[report] for report in reports}
+
+    apache_license = (root / "LICENSE").read_text(encoding="utf-8")
+    python_reports = [report for report in reports if report.component == "python"]
+    for report in python_reports:
+        license_dir = root / "bindings/python/licenses" / report.target
+        files = python_binary_files(
+            root, report.target, generated[report], metadata[report]
         )
+        for name in ("LICENSE", "NOTICE"):
+            result[license_dir / name] = files[name]
 
     go_reports = list(GO_REPORTS.values())
     result[root / "bindings/go/LICENSE"] = binary_license(
@@ -696,56 +777,64 @@ def generated_files(root: Path) -> dict[Path, str]:
     )
     result[root / "bindings/go/NOTICE"] = binary_notice(
         root,
-        "go",
-        [metadata_by_report[("go", target)] for target in GO_REPORTS],
+        [
+            metadata[report]
+            for report in reports
+            if report.component == "go"
+        ],
     )
     return result
 
 
-def check_files(files: dict[Path, str], root: Path) -> int:
-    failed = False
-    for path, expected in files.items():
-        if not path.is_file():
-            print(f"missing generated license file: {path.relative_to(root)}")
-            failed = True
-            continue
-        expected_bytes = expected.encode("utf-8")
-        actual_bytes = path.read_bytes()
-        if actual_bytes == expected_bytes:
-            continue
-        failed = True
-        print(f"stale generated license file: {path.relative_to(root)}")
-        actual = actual_bytes.decode("utf-8")
-        diff = difflib.unified_diff(
-            actual.splitlines(),
-            expected.splitlines(),
-            fromfile=str(path.relative_to(root)),
-            tofile=f"generated/{path.relative_to(root)}",
-            lineterm="",
+def check_generated_files(files: dict[Path, str], root: Path) -> None:
+    relative_paths = [str(path.relative_to(root)) for path in files]
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "--", *relative_paths], cwd=root, text=True
+    ).splitlines()
+    if tracked:
+        raise RuntimeError(
+            "generated binary legal files must not be tracked: "
+            + ", ".join(tracked)
         )
-        for line in list(diff)[:200]:
-            print(line)
-    return 1 if failed else 0
+
+    python_paths = [
+        relative
+        for relative in relative_paths
+        if relative.startswith("bindings/python/licenses/")
+    ]
+    for relative in python_paths:
+        attribute = subprocess.check_output(
+            ["git", "check-attr", "export-ignore", "--", relative],
+            cwd=root,
+            text=True,
+        ).strip()
+        if not attribute.endswith(": set"):
+            raise RuntimeError(f"generated binary legal file is not export-ignored: {relative}")
+
+    print(f"validated {len(files)} generated binary legal files")
 
 
 def write_files(files: dict[Path, str], root: Path) -> None:
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content.encode("utf-8"))
-        print(f"generated {path.relative_to(root)}")
+        display_path = path.relative_to(root) if path.is_relative_to(root) else path
+        print(f"generated {display_path}")
+
+
+def verify_existing_go_reports(files: dict[Path, str]) -> None:
+    report_names = set(GO_REPORTS.values())
+    for path, expected in files.items():
+        if path.name not in report_names:
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"missing generated Go report: {path}")
+        if path.read_bytes() != expected.encode("utf-8"):
+            raise RuntimeError(f"generated Go report differs from release input: {path}")
 
 
 def stage_python(root: Path, target: str) -> None:
-    if target not in PYTHON_TARGETS:
-        raise ValueError(f"unsupported Python release target: {target}")
-    source_dir = root / "bindings/python/licenses" / target
-    destination_dir = root / "bindings/python"
-    for name in ("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html"):
-        source = source_dir / name
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        (destination_dir / name).write_bytes(source.read_bytes())
-        print(f"staged {source.relative_to(root)}")
+    write_files(python_target_files(root, target, root / "bindings/python"), root)
 
 
 def main() -> int:
@@ -754,12 +843,28 @@ def main() -> int:
     group.add_argument(
         "--check",
         action="store_true",
-        help="fail if committed legal files differ from reproducible output",
+        help="validate reproducible binary legal output without writing it",
     )
     group.add_argument(
         "--stage-python",
         metavar="TARGET",
         help="stage one target's legal files for a maturin wheel build",
+    )
+    group.add_argument(
+        "--generate-python-reports",
+        metavar="DIRECTORY",
+        help="generate all target legal files for final wheel verification",
+    )
+    group.add_argument(
+        "--generate-go-report",
+        nargs=2,
+        metavar=("TARGET", "DIRECTORY"),
+        help="generate one target report for a Go build job",
+    )
+    group.add_argument(
+        "--generate-go-release",
+        metavar="DIRECTORY",
+        help="verify Go target reports and generate aggregate legal files",
     )
     args = parser.parse_args()
     root = repository_root()
@@ -768,13 +873,41 @@ def main() -> int:
         if args.stage_python:
             stage_python(root, args.stage_python)
             return 0
+        if args.generate_python_reports:
+            files = python_verification_files(
+                root, Path(args.generate_python_reports).resolve()
+            )
+            write_files(files, root)
+            return 0
+        if args.generate_go_report:
+            target, directory = args.generate_go_report
+            files = go_target_files(root, target, Path(directory).resolve())
+            write_files(files, root)
+            return 0
+        if args.generate_go_release:
+            files = go_release_files(root, Path(args.generate_go_release).resolve())
+            verify_existing_go_reports(files)
+            write_files(
+                {
+                    path: content
+                    for path, content in files.items()
+                    if path.name in {"LICENSE", "NOTICE"}
+                },
+                root,
+            )
+            return 0
         files = generated_files(root)
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         print(f"release license generation failed: {error}", file=sys.stderr)
         return 1
 
     if args.check:
-        return check_files(files, root)
+        try:
+            check_generated_files(files, root)
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"release license generation failed: {error}", file=sys.stderr)
+            return 1
+        return 0
     write_files(files, root)
     return 0
 

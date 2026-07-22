@@ -25,9 +25,11 @@ import csv
 import hashlib
 import io
 import re
+import stat
 import sys
 import tarfile
 import tomllib
+import unicodedata
 import zipfile
 from email import policy
 from email.message import Message
@@ -70,13 +72,60 @@ def require(condition: bool, message: str) -> None:
         raise VerificationError(message)
 
 
-def normalized_relative_path(value: str, description: str) -> PurePosixPath:
+def normalized_relative_path(
+    value: str, description: str, allow_trailing_slash: bool = False
+) -> PurePosixPath:
     require(bool(value), f"empty {description}")
     require("\\" not in value, f"invalid {description}: {value!r}")
-    path = PurePosixPath(value)
+    require(
+        re.match(r"^[A-Za-z]:", value) is None,
+        f"Windows drive {description}: {value!r}",
+    )
+    candidate = value[:-1] if allow_trailing_slash and value.endswith("/") else value
+    path = PurePosixPath(candidate)
     require(not path.is_absolute(), f"absolute {description}: {value!r}")
     require(".." not in path.parts, f"unsafe {description}: {value!r}")
+    canonical = path.as_posix()
+    require(
+        value == canonical
+        or (allow_trailing_slash and value == f"{canonical}/"),
+        f"non-canonical {description}: {value!r}",
+    )
     return path
+
+
+def portable_path_key(path: PurePosixPath) -> str:
+    return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
+def index_tar_members(
+    members: list[tarfile.TarInfo], description: str
+) -> dict[str, tarfile.TarInfo]:
+    result = {}
+    portable_names = set()
+    for member in members:
+        require(
+            member.isfile() or member.isdir(),
+            f"{description} has a link or special member: {member.name}",
+        )
+        normalized = normalized_relative_path(
+            member.name,
+            f"{description} member",
+            allow_trailing_slash=member.isdir(),
+        )
+        name = normalized.as_posix()
+        require(
+            name not in result,
+            f"{description} has duplicate normalized member: {name}",
+        )
+        portable_name = portable_path_key(normalized)
+        require(
+            portable_name not in portable_names,
+            f"{description} has a portable path collision: {name}",
+        )
+        result[name] = member
+        portable_names.add(portable_name)
+    return result
 
 
 def verify_record(
@@ -290,6 +339,8 @@ def is_native_library(name: str) -> bool:
 def verify_wheel(path: Path) -> tuple[str, str]:
     target = target_from_wheel_name(path)
     expected_dir = PYTHON_DIR / "licenses" / target
+    if not expected_dir.is_dir():
+        expected_dir = PYTHON_DIR
     filename_prefix = "pypaimon_rust-"
     filename_head = path.name.removesuffix(".whl").rsplit("-", 3)[0]
     require(
@@ -306,11 +357,21 @@ def verify_wheel(path: Path) -> tuple[str, str]:
     with archive:
         infos = [info for info in archive.infolist() if not info.is_dir()]
         names = [info.filename for info in infos]
-        require(
-            len(names) == len(set(names)), f"wheel has duplicate members: {path.name}"
-        )
-        for name in names:
-            normalized_relative_path(name, "wheel member")
+        portable_names = set()
+        for info in infos:
+            mode = info.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+            require(
+                file_type in {0, stat.S_IFREG},
+                f"wheel has a link or special member: {info.filename}",
+            )
+            normalized = normalized_relative_path(info.filename, "wheel member")
+            key = portable_path_key(normalized)
+            require(
+                key not in portable_names,
+                f"wheel has a portable path collision: {path.name}:{info.filename}",
+            )
+            portable_names.add(key)
         bad_member = archive.testzip()
         require(bad_member is None, f"wheel has a corrupt member: {bad_member}")
 
@@ -459,20 +520,17 @@ def verify_sdist(path: Path) -> str:
         raise VerificationError(f"cannot open sdist {path}: {error}") from error
 
     with archive:
-        members = archive.getmembers()
-        names = [member.name for member in members]
-        require(
-            len(names) == len(set(names)), f"sdist has duplicate members: {path.name}"
+        members_by_name = index_tar_members(
+            archive.getmembers(), f"sdist {path.name}"
         )
-        for name in names:
-            normalized_relative_path(name, "sdist member")
+        names = list(members_by_name)
         roots = {PurePosixPath(name).parts[0] for name in names}
         require(len(roots) == 1, f"sdist must have one root directory: {path.name}")
         root = roots.pop()
 
         def read_member(name: str) -> bytes:
             try:
-                member = archive.getmember(name)
+                member = members_by_name[name]
             except KeyError as error:
                 raise VerificationError(
                     f"sdist is missing {name}: {path.name}"

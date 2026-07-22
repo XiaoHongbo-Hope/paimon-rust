@@ -39,6 +39,51 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect release license inputs
+        id: release_license_inputs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="origin/$BASE_REF"
+          elif [[ -n "$BEFORE_SHA" && ! "$BEFORE_SHA" =~ ^0+$ ]] && \
+            git cat-file -e "$BEFORE_SHA^{commit}"; then
+            base="$BEFORE_SHA"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --quiet "$base" HEAD -- \
+            .gitattributes \
+            LICENSE \
+            NOTICE \
+            ':(glob)**/LICENSE' \
+            ':(glob)**/LICENSE.*' \
+            ':(glob)**/NOTICE' \
+            ':(glob)**/NOTICE.*' \
+            Cargo.lock \
+            about.hbs \
+            about.toml \
+            bindings/go/LICENSE \
+            bindings/go/NOTICE \
+            ':(glob)bindings/go/THIRD-PARTY-LICENSES.*.html' \
+            bindings/python/licenses \
+            bindings/python/THIRD-PARTY-LICENSES.html \
+            scripts/release_licenses.py \
+            third-party-licenses \
+            ':(glob)**/Cargo.toml'; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Validate .asf.yaml
         run: python3 scripts/validate_asf_yaml.py
@@ -46,12 +91,16 @@ jobs:
       - name: Check License Header
         uses: apache/skywalking-eyes/header@v0.8.0
 
+      - name: Test release artifact verifiers
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
           tool: cargo-deny@0.19.6
 
       - name: Install cargo-about
+        if: steps.release_license_inputs.outputs.changed == 'true'
         uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
           tool: cargo-about@0.9.1
@@ -66,6 +115,7 @@ jobs:
         run: python3 scripts/dependencies.py verify
 
       - name: Verify release license files
+        if: steps.release_license_inputs.outputs.changed == 'true'
         run: python3 scripts/release_licenses.py --check
 
       - name: Format
