@@ -1374,10 +1374,7 @@ mod tests {
 
     #[allow(dead_code)]
     mod blob_test_utils {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../blob_test_utils.rs"
-        ));
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));
     }
 
     #[tokio::test]
