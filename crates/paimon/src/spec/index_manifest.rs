@@ -27,10 +27,9 @@ use crate::Result;
 ///
 /// Must match the serde layout of `IndexManifestEntry`.
 ///
-/// Note: `_FILE_SIZE` and `_ROW_COUNT` are declared as Avro `long` to match
-/// Java Paimon's schema, while the Rust `IndexFileMeta` fields are `i32`.
-/// `serde_avro_fast` transparently coerces between integer widths during
-/// serialization/deserialization, so the mismatch is intentional.
+/// Note: `_FILE_SIZE` is an Avro `long` and Rust `i64`, matching Java Paimon's
+/// schema. `_ROW_COUNT` remains an Avro `long` for Java compatibility while
+/// the Rust `IndexFileMeta` field is still `i32`.
 pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
     "type": "record",
     "name": "org.apache.paimon.avro.generated.record",
@@ -343,6 +342,32 @@ mod tests {
                 .source_meta,
             None
         );
+    }
+
+    #[test]
+    fn file_size_above_i32_max_round_trips_through_index_manifest() {
+        let file_size = i64::from(i32::MAX) + 1;
+        let entry: IndexManifestEntry = serde_json::from_value(serde_json::json!({
+            "_VERSION": 1,
+            "_KIND": 0,
+            "_PARTITION": [0, 0, 0, 0],
+            "_BUCKET": 0,
+            "_INDEX_TYPE": "TEST",
+            "_FILE_NAME": "index",
+            "_FILE_SIZE": file_size,
+            "_ROW_COUNT": 1
+        }))
+        .unwrap();
+
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            INDEX_MANIFEST_ENTRY_SCHEMA,
+            std::slice::from_ref(&entry),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, vec![entry]);
     }
 
     #[test]

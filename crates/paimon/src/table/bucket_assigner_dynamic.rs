@@ -80,10 +80,10 @@ impl HashIndexFile {
             buf.extend_from_slice(&h.to_be_bytes());
         }
 
-        let file_size: i32 = buf
+        let file_size: i64 = buf
             .len()
             .try_into()
-            .expect("hash index file size exceeds i32::MAX");
+            .expect("hash index file size exceeds i64::MAX");
         let output = file_io.new_output(&path)?;
         output.write(bytes::Bytes::from(buf)).await?;
 

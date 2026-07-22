@@ -63,7 +63,7 @@ pub struct IndexFileMeta {
     pub file_name: String,
 
     #[serde(rename = "_FILE_SIZE")]
-    pub file_size: i32,
+    pub file_size: i64,
 
     #[serde(rename = "_ROW_COUNT")]
     pub row_count: i32,

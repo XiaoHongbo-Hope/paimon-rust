@@ -284,7 +284,7 @@ async fn build_table(vectors: &[[f32; DIM]]) -> (tempfile::TempDir, Table) {
     let index_file = IndexFileMeta {
         index_type: INDEX_TYPE.to_string(),
         file_name: index_file_name,
-        file_size: i32::try_from(index_file_size).unwrap(),
+        file_size: i64::try_from(index_file_size).unwrap(),
         row_count: i32::try_from(row_count).unwrap(),
         deletion_vectors_ranges: None,
         global_index_meta: Some(GlobalIndexMeta {

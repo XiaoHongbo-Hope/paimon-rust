@@ -286,10 +286,7 @@ async fn test_table_indexes_system_table() {
         assert_eq!(buckets.value(row), expected.bucket);
         assert_eq!(index_types.value(row), expected.index_file.index_type);
         assert_eq!(file_names.value(row), expected.index_file.file_name);
-        assert_eq!(
-            file_sizes.value(row),
-            i64::from(expected.index_file.file_size)
-        );
+        assert_eq!(file_sizes.value(row), expected.index_file.file_size);
         assert_eq!(
             row_counts.value(row),
             i64::from(expected.index_file.row_count)
