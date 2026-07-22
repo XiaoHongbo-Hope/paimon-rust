@@ -1240,6 +1240,33 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+
+        // Reopen the same table without an explicit global-index override and
+        // verify that the regular scan path still uses the committed index.
+        let mut options = table.schema().options().clone();
+        assert_eq!(
+            options.remove("global-index.enabled"),
+            Some("true".to_string())
+        );
+        let scan_table = Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().to_string(),
+            table.schema().copy_with_replaced_options(options),
+            None,
+        );
+        let predicate = PredicateBuilder::new(scan_table.schema().fields())
+            .equal("name", crate::spec::Datum::String("alice".to_string()))
+            .unwrap();
+        let mut read_builder = scan_table.new_read_builder();
+        read_builder.with_filter(predicate);
+        let plan = read_builder.new_scan().plan().await.unwrap();
+
+        assert_eq!(plan.splits().len(), 1);
+        assert_eq!(
+            plan.splits()[0].row_ranges(),
+            Some(&[RowRange::new(0, 0), RowRange::new(2, 2)][..])
+        );
     }
 
     #[tokio::test]

@@ -540,7 +540,7 @@ impl<'a> CoreOptions<'a> {
         self.options
             .get(GLOBAL_INDEX_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
@@ -1357,6 +1357,17 @@ mod tests {
                 HashMap::from([(GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(), raw.to_string())]);
             let core = CoreOptions::new(&options);
             assert_eq!(core.global_index_search_mode().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_global_index_enabled_defaults_and_overrides() {
+        assert!(CoreOptions::new(&HashMap::new()).global_index_enabled());
+
+        for (raw, expected) in [("true", true), ("false", false)] {
+            let options =
+                HashMap::from([(GLOBAL_INDEX_ENABLED_OPTION.to_string(), raw.to_string())]);
+            assert_eq!(CoreOptions::new(&options).global_index_enabled(), expected);
         }
     }
 
