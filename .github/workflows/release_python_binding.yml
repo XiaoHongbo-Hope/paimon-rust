@@ -53,40 +53,9 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Set Python release version
-        run: >
-          python3 scripts/python_release_version.py
-          --tag "${RELEASE_TAG}"
-          --pyproject bindings/python/pyproject.toml
-
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+      - uses: actions/setup-python@v6
         with:
-          working-directory: bindings/python
-          command: sdist
-          args: -o dist
-          before-script-linux: |
-            sudo apt-get update && sudo apt-get install -y libssl-dev
-
-      - name: Upload sdist
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-sdist
-          path: bindings/python/dist
-
-  wheels:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - { os: windows-latest }
-          - { os: macos-15-intel, target: "x86_64-apple-darwin" }
-          - { os: macos-latest, target: "aarch64-apple-darwin" }
-          - { os: ubuntu-latest, target: "x86_64" }
-          - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RELEASE_TAG }}
+          python-version: "3.11"
 
       - name: Set Python release version
         shell: bash
@@ -95,16 +64,77 @@ jobs:
           --tag "${RELEASE_TAG}"
           --pyproject bindings/python/pyproject.toml
 
+      - name: Verify Cargo lockfile
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
+          maturin-version: v1.14.1
+          working-directory: bindings/python
+          command: sdist
+          args: -o dist
+
+      - name: Verify sdist
+        run: python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: bindings/python/dist/*.tar.gz
+
+  wheels:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: "x86_64-pc-windows-msvc"
+            rust_target: "x86_64-pc-windows-msvc"
+          - os: macos-15-intel
+            target: "x86_64-apple-darwin"
+            rust_target: "x86_64-apple-darwin"
+          - os: macos-latest
+            target: "aarch64-apple-darwin"
+            rust_target: "aarch64-apple-darwin"
+          - os: ubuntu-latest
+            target: "x86_64-unknown-linux-gnu"
+            rust_target: "x86_64-unknown-linux-gnu"
+            manylinux: "manylinux2014"
+          - os: ubuntu-latest
+            target: "aarch64-unknown-linux-gnu"
+            rust_target: "aarch64-unknown-linux-gnu"
+            manylinux: "manylinux_2_28"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set Python release version
+        shell: bash
+        run: >
+          python3 scripts/python_release_version.py
+          --tag "${RELEASE_TAG}"
+          --pyproject bindings/python/pyproject.toml
+
+      - name: Stage wheel legal files
+        run: python scripts/release_licenses.py --stage-python ${{ matrix.rust_target }}
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
           working-directory: bindings/python
           target: ${{ matrix.target }}
           command: build
-          args: --release -o dist
+          args: --release --locked -o dist
           manylinux: ${{ matrix.manylinux || 'auto' }}
           before-script-linux: |
             # Install OpenSSL for x86_64 (manylinux2014 with OpenSSL 1.1)
-            if [ "${{ matrix.target }}" = "x86_64" ]; then
+            if [ "${{ matrix.rust_target }}" = "x86_64-unknown-linux-gnu" ]; then
               yum install -y openssl11-devel
               # Create symlinks so pkg-config finds openssl11 as openssl
               ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
@@ -113,15 +143,23 @@ jobs:
             fi
 
             # Install precompiled OpenSSL from Debian packages for aarch64
-            if [ "${{ matrix.target }}" = "aarch64" ]; then
+            if [ "${{ matrix.rust_target }}" = "aarch64-unknown-linux-gnu" ]; then
               set -e
               echo "Installing OpenSSL for aarch64 from Debian packages..."
 
               (cd /tmp
-              # Debian Bullseye arm64 packages (OpenSSL 1.1.1)
-              DEBIAN_MIRROR="http://ftp.debian.org/debian/pool/main/o/openssl"
-              curl -sLO "${DEBIAN_MIRROR}/libssl1.1_1.1.1w-0+deb11u1_arm64.deb"
-              curl -sLO "${DEBIAN_MIRROR}/libssl-dev_1.1.1w-0+deb11u1_arm64.deb"
+              DEBIAN_MIRROR="https://snapshot.debian.org/archive/debian/20231003T205808Z/pool/main/o/openssl"
+              LIBSSL_DEB="libssl1.1_1.1.1w-0+deb11u1_arm64.deb"
+              LIBSSL_SHA256="fe7a7d313c87e46e62e614a07137e4a476a79fc9e5aab7b23e8235211280fee3"
+              LIBSSL_DEV_DEB="libssl-dev_1.1.1w-0+deb11u1_arm64.deb"
+              LIBSSL_DEV_SHA256="6223f761bd4b961aa0c7c1662a6e99ab31150a1a7e6529d440428b361a9c8c4a"
+
+              curl --fail --location --show-error --silent \
+                --output "${LIBSSL_DEB}" "${DEBIAN_MIRROR}/${LIBSSL_DEB}"
+              curl --fail --location --show-error --silent \
+                --output "${LIBSSL_DEV_DEB}" "${DEBIAN_MIRROR}/${LIBSSL_DEV_DEB}"
+              printf '%s  %s\n' "${LIBSSL_SHA256}" "${LIBSSL_DEB}" | sha256sum -c -
+              printf '%s  %s\n' "${LIBSSL_DEV_SHA256}" "${LIBSSL_DEV_DEB}" | sha256sum -c -
 
               # Extract .deb packages (ar format)
               for deb in *.deb; do
@@ -156,11 +194,14 @@ jobs:
               export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
             fi
 
+      - name: Verify wheel
+        run: python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
+
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target || 'native' }}
-          path: bindings/python/dist
+          name: wheels-${{ matrix.os }}-${{ matrix.rust_target }}
+          path: bindings/python/dist/*.whl
 
   release:
     name: Publish to PyPI
@@ -170,11 +211,32 @@ jobs:
     needs: [sdist, wheels]
     if: startsWith(inputs.tag || github.ref_name, 'v')
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-about@0.9.1
+
+      - name: Verify generated release licenses
+        run: |
+          cargo fetch --locked
+          python3 scripts/release_licenses.py --check
+
       - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
           path: bindings/python/dist
+
+      - name: Verify release artifacts
+        run: python scripts/verify_python_wheels.py bindings/python/dist
 
       - name: Publish to TestPyPI
         if: contains(env.RELEASE_TAG, '-')

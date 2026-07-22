@@ -51,6 +51,11 @@ jobs:
         with:
           tool: cargo-deny@0.19.6
 
+      - name: Install cargo-about
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-about@0.9.1
+
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
@@ -59,6 +64,9 @@ jobs:
 
       - name: Verify dependency reports
         run: python3 scripts/dependencies.py verify
+
+      - name: Verify release license files
+        run: python3 scripts/release_licenses.py --check
 
       - name: Format
         run: cargo fmt --all -- --check

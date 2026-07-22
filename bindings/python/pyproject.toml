@@ -24,7 +24,8 @@ name = "pypaimon-rust"
 readme = "project-description.md"
 requires-python = ">=3.10,<4"
 dynamic = ["version"]
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -49,9 +50,13 @@ video = [
 module-name = "pypaimon_rust.pypaimon_rust"
 python-source = "python"
 include = [
-    { path = "LICENSE", format = ["sdist", "wheel"] },
-    { path = "NOTICE", format = ["sdist", "wheel"] },
+    { path = "LICENSE", format = "wheel" },
+    { path = "NOTICE", format = "wheel" },
+    { path = "THIRD-PARTY-LICENSES.html", format = "wheel" },
     { path = "python/pypaimon_rust/py.typed", format = ["sdist", "wheel"] },
+]
+exclude = [
+    { path = "licenses/**", format = "sdist" },
 ]
 
 [dependency-groups]
