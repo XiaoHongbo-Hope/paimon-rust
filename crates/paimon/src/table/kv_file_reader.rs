@@ -33,8 +33,8 @@ use super::sort_merge::{
 use crate::arrow::build_target_arrow_schema;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, DataField, DataType as PaimonDataType, MergeEngine, Predicate, TinyIntType,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    BigIntType, DataField, DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate,
+    TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
@@ -107,6 +107,45 @@ pub(super) fn retain_primary_key_conjuncts(
         .collect()
 }
 
+fn widen_partial_update_sequence_group_fields(
+    merge_engine: MergeEngine,
+    table_options: &HashMap<String, String>,
+    table_fields: &[DataField],
+    primary_keys: &[String],
+    mut user_fields: Vec<DataField>,
+) -> crate::Result<Vec<DataField>> {
+    if merge_engine != MergeEngine::PartialUpdate {
+        return Ok(user_fields);
+    }
+
+    let projected_fields = user_fields
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    let required_fields = PartialUpdateConfig::new(table_options).required_sequence_fields(
+        table_fields,
+        primary_keys,
+        &projected_fields,
+    )?;
+    for field_name in required_fields {
+        if user_fields.iter().any(|field| field.name() == field_name) {
+            continue;
+        }
+        let field = table_fields
+            .iter()
+            .find(|field| field.name() == field_name)
+            .cloned()
+            .ok_or_else(|| Error::UnexpectedError {
+                message: format!(
+                    "Partial-update sequence field '{field_name}' not found in table schema"
+                ),
+                source: None,
+            })?;
+        user_fields.push(field);
+    }
+    Ok(user_fields)
+}
+
 impl KeyValueFileReader {
     pub(crate) fn new(file_io: FileIO, config: KeyValueReadConfig) -> Self {
         let pushdown_predicates = retain_primary_key_conjuncts(
@@ -136,16 +175,22 @@ impl KeyValueFileReader {
         merge_engine: MergeEngine,
         table_options: &HashMap<String, String>,
         table_name: &str,
+        table_fields: &[DataField],
         merge_output_fields: &[DataField],
         primary_keys: &[String],
         sequence_fields: &[String],
     ) -> crate::Result<Box<dyn super::sort_merge::MergeFunction>> {
         match merge_engine {
             MergeEngine::Deduplicate => Ok(Box::new(DeduplicateMergeFunction)),
-            MergeEngine::PartialUpdate => Ok(Box::new(PartialUpdateMergeFunction::new(
-                table_options,
-                table_name,
-            )?)),
+            MergeEngine::PartialUpdate => Ok(Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    table_options,
+                    table_name,
+                    table_fields,
+                    merge_output_fields,
+                    primary_keys,
+                )?,
+            )),
             MergeEngine::FirstRow => Err(Error::Unsupported {
                 message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
             }),
@@ -242,6 +287,13 @@ impl KeyValueFileReader {
             &user_fields,
             residual_file_predicates.as_ref(),
         );
+        let user_fields = widen_partial_update_sequence_group_fields(
+            self.config.merge_engine,
+            &self.config.table_options,
+            &self.config.table_fields,
+            &self.config.primary_keys,
+            user_fields,
+        )?;
 
         // Internal read type: [_SEQ, _VK, user_fields...]
         let mut internal_read_type: Vec<DataField> = Vec::new();
@@ -413,6 +465,7 @@ impl KeyValueFileReader {
                         merge_engine,
                         &table_options,
                         &table_name,
+                        &table_fields,
                         &merge_output_fields,
                         &primary_keys,
                         &sequence_fields,
@@ -676,6 +729,36 @@ mod tests {
         let kept = retain_primary_key_conjuncts(&[Predicate::AlwaysTrue], &fields, &pks);
         assert_eq!(kept.len(), 1);
         assert!(matches!(&kept[0], Predicate::AlwaysTrue));
+    }
+
+    #[test]
+    fn widen_partial_update_projection_with_sequence_fields() {
+        let table_fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "price".to_string(),
+            ),
+        ]);
+
+        let widened = widen_partial_update_sequence_group_fields(
+            MergeEngine::PartialUpdate,
+            &options,
+            &table_fields,
+            &["id".to_string()],
+            vec![table_fields[2].clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            widened.iter().map(DataField::name).collect::<Vec<_>>(),
+            vec!["price", "version"]
+        );
     }
 
     #[tokio::test]
@@ -1145,6 +1228,94 @@ mod tests {
         assert_eq!(int_column(&batches, "id"), vec![1]);
         assert_eq!(int_column(&batches, "a"), vec![5]);
         assert_eq!(int_column(&batches, "b"), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn kv_read_partial_update_sequence_groups_with_projection() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_partial_update_sequence_groups";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("seq_a", DataType::Int(IntType::new()))
+            .column("value_a", DataType::Int(IntType::new()))
+            .column("seq_b", DataType::Int(IntType::new()))
+            .column("value_b", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_partial_update_sequence_groups_t"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq_a", ArrowDataType::Int32, true),
+            ArrowField::new("value_a", ArrowDataType::Int32, true),
+            ArrowField::new("seq_b", ArrowDataType::Int32, true),
+            ArrowField::new("value_b", ArrowDataType::Int32, true),
+        ]));
+        let make = |seq_a, value_a, seq_b, value_b| {
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(Int32Array::from(vec![seq_a])),
+                    Arc::new(Int32Array::from(vec![value_a])),
+                    Arc::new(Int32Array::from(vec![seq_b])),
+                    Arc::new(Int32Array::from(vec![value_b])),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &make(10, 100, 10, 1000)).await;
+        write_commit(&table, &make(9, 200, 11, 2000)).await;
+
+        let sequence_group_schema = table.schema().copy_with_options(HashMap::from([
+            (
+                "fields.seq_a.sequence-group".to_string(),
+                "value_a".to_string(),
+            ),
+            (
+                "fields.seq_b.sequence-group".to_string(),
+                "value_b".to_string(),
+            ),
+        ]));
+        let sequence_group_table = Table::new(
+            file_io,
+            Identifier::new("default", "kv_partial_update_sequence_groups_t"),
+            table_path.to_string(),
+            sequence_group_schema,
+            None,
+        );
+
+        let batches = read_rows(
+            &sequence_group_table,
+            Some(&["id", "value_a", "value_b"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(int_column(&batches, "value_a"), vec![100]);
+        assert_eq!(int_column(&batches, "value_b"), vec![2000]);
+        for batch in batches {
+            assert_eq!(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["id", "value_a", "value_b"]
+            );
+        }
     }
 
     /// An AlwaysFalse filter on a PK table must return nothing, end to end.

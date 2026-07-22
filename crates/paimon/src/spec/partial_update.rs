@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::spec::DataField;
 
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const PARTIAL_UPDATE_ENGINE: &str = "partial-update";
@@ -31,16 +33,32 @@ const FIELDS_PREFIX: &str = "fields.";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
 const AGGREGATION_FUNCTION_SUFFIX: &str = ".aggregate-function";
 
-/// Minimal partial-update mode recognized by the current Rust implementation.
+/// Partial-update mode recognized by the current Rust implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartialUpdateMode {
     Basic,
+    SequenceGroup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SequenceGroup {
+    pub(crate) sequence_fields: Vec<String>,
+    pub(crate) protected_fields: Vec<String>,
+}
+
+impl SequenceGroup {
+    fn option_key(&self) -> String {
+        format!(
+            "{FIELDS_PREFIX}{}{SEQUENCE_GROUP_SUFFIX}",
+            self.sequence_fields.join(",")
+        )
+    }
 }
 
 /// Partial-update-specific option inspection and validation.
 ///
-/// PR1 only recognizes the basic mode: `merge-engine=partial-update` on a PK
-/// table without delete, sequence-group, or aggregation controls.
+/// Reads support basic partial update and sequence groups. Table creation and
+/// writes remain restricted to basic partial update.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PartialUpdateConfig<'a> {
     options: &'a HashMap<String, String>,
@@ -72,7 +90,7 @@ impl<'a> PartialUpdateConfig<'a> {
         }
     }
 
-    pub(crate) fn validate_runtime_mode(
+    pub(crate) fn validate_write_mode(
         &self,
         has_primary_keys: bool,
         table_name: &str,
@@ -86,6 +104,143 @@ impl<'a> PartialUpdateConfig<'a> {
                 ),
             }),
         }
+    }
+
+    pub(crate) fn validate_read_mode(
+        &self,
+        has_primary_keys: bool,
+        table_name: &str,
+    ) -> crate::Result<Option<PartialUpdateMode>> {
+        if !has_primary_keys || !self.is_enabled() {
+            return Ok(None);
+        }
+
+        let unsupported_options = self.read_unsupported_option_keys();
+        if !unsupported_options.is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Table '{table_name}' uses merge-engine=partial-update options not supported by this build: {}",
+                    unsupported_options.join(", ")
+                ),
+            });
+        }
+
+        Ok(Some(if self.sequence_groups()?.is_empty() {
+            PartialUpdateMode::Basic
+        } else {
+            PartialUpdateMode::SequenceGroup
+        }))
+    }
+
+    pub(crate) fn sequence_groups(&self) -> crate::Result<Vec<SequenceGroup>> {
+        let mut options: Vec<(&String, &String)> = self
+            .options
+            .iter()
+            .filter(|(key, _)| is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX))
+            .collect();
+        options.sort_by_key(|(key, _)| *key);
+
+        options
+            .into_iter()
+            .map(|(key, value)| {
+                let sequence_fields = key
+                    .strip_prefix(FIELDS_PREFIX)
+                    .and_then(|key| key.strip_suffix(SEQUENCE_GROUP_SUFFIX))
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Invalid partial-update sequence-group option '{key}={value}'"
+                        ),
+                    })
+                    .and_then(|fields| parse_field_list(fields, key, value))?;
+                let protected_fields = parse_field_list(value, key, value)?;
+                Ok(SequenceGroup {
+                    sequence_fields,
+                    protected_fields,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn validated_sequence_groups(
+        &self,
+        fields: &[DataField],
+        primary_keys: &[String],
+    ) -> crate::Result<Vec<SequenceGroup>> {
+        let groups = self.sequence_groups()?;
+        let field_names: HashSet<&str> = fields.iter().map(DataField::name).collect();
+        let primary_keys: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        let mut protected_field_owners: HashMap<String, String> = HashMap::new();
+
+        for group in &groups {
+            let option_key = group.option_key();
+            for field in group
+                .sequence_fields
+                .iter()
+                .chain(group.protected_fields.iter())
+            {
+                if !field_names.contains(field.as_str()) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Field '{field}' referenced by partial-update sequence-group \
+                             option '{option_key}' does not exist in the table schema"
+                        ),
+                    });
+                }
+                if primary_keys.contains(field.as_str()) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "The sequence-group '{option_key}' contains primary key field \
+                             '{field}', which is not allowed. Primary key columns cannot be put \
+                             in sequence-group."
+                        ),
+                    });
+                }
+            }
+            for field in &group.protected_fields {
+                if let Some(previous_option) =
+                    protected_field_owners.insert(field.clone(), option_key.clone())
+                {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Field '{field}' is protected by multiple sequence groups: \
+                             '{previous_option}' and '{option_key}'"
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(groups)
+    }
+
+    pub(crate) fn required_sequence_fields(
+        &self,
+        fields: &[DataField],
+        primary_keys: &[String],
+        projected_fields: &[String],
+    ) -> crate::Result<Vec<String>> {
+        let groups = self.validated_sequence_groups(fields, primary_keys)?;
+        let projected: HashSet<&str> = projected_fields.iter().map(String::as_str).collect();
+        let mut required = Vec::new();
+        let mut seen = HashSet::new();
+
+        for group in groups {
+            let group_is_projected = group
+                .sequence_fields
+                .iter()
+                .chain(group.protected_fields.iter())
+                .any(|field| projected.contains(field.as_str()));
+            if !group_is_projected {
+                continue;
+            }
+            for field in group.sequence_fields {
+                if seen.insert(field.clone()) {
+                    required.push(field);
+                }
+            }
+        }
+
+        Ok(required)
     }
 
     fn validated_mode(
@@ -114,6 +269,20 @@ impl<'a> PartialUpdateConfig<'a> {
         keys.sort();
         keys
     }
+
+    fn read_unsupported_option_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .options
+            .keys()
+            .filter(|key| {
+                is_unsupported_partial_update_option(key)
+                    && !is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
+            })
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
 }
 
 fn is_unsupported_partial_update_option(key: &str) -> bool {
@@ -131,9 +300,33 @@ fn is_fields_option_with_suffix(key: &str, suffix: &str) -> bool {
     key.starts_with(FIELDS_PREFIX) && key.ends_with(suffix)
 }
 
+fn parse_field_list(
+    value: &str,
+    option_key: &str,
+    option_value: &str,
+) -> crate::Result<Vec<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|field| {
+            if field.is_empty() {
+                Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid partial-update sequence-group option \
+                         '{option_key}={option_value}': empty field name"
+                    ),
+                })
+            } else {
+                Ok(field.to_string())
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::{DataField, DataType, IntType};
 
     fn partial_update_options(extra: &[(&str, &str)]) -> HashMap<String, String> {
         let mut options = HashMap::from([(
@@ -216,15 +409,159 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_runtime_mode_rejects_unsupported_partial_update_options() {
+    fn test_validate_write_mode_rejects_unsupported_partial_update_options() {
         let options =
             partial_update_options(&[("fields.price.aggregate-function", "last_non_null")]);
         let config = PartialUpdateConfig::new(&options);
-        let err = config.validate_runtime_mode(true, "default.t").unwrap_err();
+        let err = config.validate_write_mode(true, "default.t").unwrap_err();
 
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("fields.price.aggregate-function")),
             "expected runtime rejection to mention the unsupported option, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_read_mode_accepts_sequence_group() {
+        let options =
+            partial_update_options(&[("fields.updated_at.sequence-group", "price,quantity")]);
+        let config = PartialUpdateConfig::new(&options);
+
+        assert_eq!(
+            config.validate_read_mode(true, "default.t").unwrap(),
+            Some(PartialUpdateMode::SequenceGroup)
+        );
+    }
+
+    #[test]
+    fn test_parse_sequence_groups() {
+        let options = partial_update_options(&[
+            (
+                "fields.event_time,source_order.sequence-group",
+                "price,quantity",
+            ),
+            ("fields.profile_version.sequence-group", "name,address"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+
+        assert_eq!(
+            config.sequence_groups().unwrap(),
+            vec![
+                SequenceGroup {
+                    sequence_fields: vec!["event_time".to_string(), "source_order".to_string()],
+                    protected_fields: vec!["price".to_string(), "quantity".to_string()],
+                },
+                SequenceGroup {
+                    sequence_fields: vec!["profile_version".to_string()],
+                    protected_fields: vec!["name".to_string(), "address".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_sequence_groups_rejects_empty_field_names() {
+        for (key, value) in [
+            ("fields.version,,source.sequence-group", "price"),
+            ("fields.version.sequence-group", "price,,quantity"),
+        ] {
+            let options = partial_update_options(&[(key, value)]);
+            let config = PartialUpdateConfig::new(&options);
+
+            let err = config.sequence_groups().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains(key) && message.contains("empty field name")),
+                "expected malformed field list to be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_sequence_groups_rejects_primary_key() {
+        let options = partial_update_options(&[("fields.version.sequence-group", "id,price")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_sequence_groups(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("fields.version.sequence-group")
+                    && message.contains("primary key field 'id'")),
+            "expected primary-key conflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_sequence_groups_rejects_duplicate_protected_field() {
+        let options = partial_update_options(&[
+            ("fields.version_a.sequence-group", "price"),
+            ("fields.version_b.sequence-group", "price"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version_a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "version_b".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_sequence_groups(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("price") && message.contains("multiple sequence groups")),
+            "expected duplicate protected-field error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_required_sequence_fields_for_projection() {
+        let options = partial_update_options(&[
+            (
+                "fields.event_time,source_order.sequence-group",
+                "price,quantity",
+            ),
+            ("fields.profile_version.sequence-group", "name,address"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "event_time".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "source_order".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "price".to_string(), DataType::Int(IntType::new())),
+            DataField::new(4, "quantity".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                5,
+                "profile_version".to_string(),
+                DataType::Int(IntType::new()),
+            ),
+            DataField::new(6, "name".to_string(), DataType::Int(IntType::new())),
+            DataField::new(7, "address".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        assert_eq!(
+            config
+                .required_sequence_fields(
+                    &fields,
+                    &["id".to_string()],
+                    &["price".to_string(), "name".to_string()],
+                )
+                .unwrap(),
+            vec![
+                "event_time".to_string(),
+                "source_order".to_string(),
+                "profile_version".to_string(),
+            ]
         );
     }
 }

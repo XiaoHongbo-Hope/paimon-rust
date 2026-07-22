@@ -1886,8 +1886,16 @@ Set either `'ignore-delete' = 'true'` or
 `UPDATE_BEFORE` rows during writes and when reading existing files. The default
 and an explicit `false` continue to reject these retract rows. Once enabled on
 an existing partial-update table, `ignore-delete` cannot be changed back to
-`false`. Advanced partial-update features such as sequence groups, partial
-aggregation, and remove-record-on-delete are not supported.
+`false`.
+
+Rust can read existing partial-update tables that define
+`fields.<sequence-field>.sequence-group=<protected-fields>`. Single and
+composite sequence fields, multiple independent groups, and projected reads are
+supported. Rows whose sequence tuple is entirely null do not update the group;
+an accepted group update can set protected fields to null. Rust table creation
+and writes still reject sequence-group options because write-side group merging
+is not implemented. Partial aggregation inside sequence groups and
+remove-record options are also not supported.
 
 Rust can read fully materialized compacted files from deletion-vector-enabled
 partial-update and aggregation tables. Every split must be raw-convertible,

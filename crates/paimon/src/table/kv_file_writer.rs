@@ -110,7 +110,7 @@ impl KeyValueFileWriter {
             && CoreOptions::new(&config.table_options).ignore_delete();
         if config.merge_engine == MergeEngine::PartialUpdate {
             PartialUpdateConfig::new(&config.table_options)
-                .validate_runtime_mode(true, &config.table_name)?;
+                .validate_write_mode(true, &config.table_name)?;
 
             if config.deletion_vectors_enabled {
                 return Err(crate::Error::Unsupported {
