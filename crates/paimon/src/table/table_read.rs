@@ -369,13 +369,9 @@ impl<'a> PaimonTableRead<'a> {
         core_options.ensure_read_authorized()?;
         let merge_engine = core_options.merge_engine()?;
 
-        // PK table with Deduplicate engine: splits that may hold multiple
-        // versions of a key need KeyValueFileReader for sort-merge dedup;
-        // splits marked raw convertible by scan planning — and all compacted
-        // files of deletion-vector tables, where DVs mask stale versions —
-        // use the faster DataFileReader.
-        // PartialUpdate / Aggregation always go through KeyValueFileReader so
-        // that per-key materialization can run on the read side.
+        // Route supported PK merge engines through the split-aware reader.
+        // Deduplicate may mix raw and KV splits. Partial-update and aggregation
+        // use KV reads normally, but fully materialized DV plans can read raw.
         if has_primary_keys
             && matches!(
                 merge_engine,
@@ -395,28 +391,57 @@ impl<'a> PaimonTableRead<'a> {
     /// Read PK table. For `Deduplicate`, splits marked raw convertible by scan
     /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
     /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
-    /// dedup. Deletion-vector tables are exempt: their stale versions are
-    /// masked by DVs, and KeyValueFileReader does not support DVs, so they keep
-    /// the plain level-0 dispatch. `PartialUpdate` and `Aggregation` always go
-    /// through KeyValueFileReader because their merge semantics require per-key
-    /// materialization even for compacted runs.
+    /// dedup. A fully materialized deletion-vector plan for `PartialUpdate` or
+    /// `Aggregation` can also be read raw because DVs already mask stale rows.
+    /// Plans that still need any per-key merge fail closed because mixing raw
+    /// and merged outputs would produce incorrect results.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        let merge_engine = core_options.merge_engine()?;
+        let dv_enabled = core_options.deletion_vectors_enabled();
         if matches!(
-            core_options.merge_engine()?,
+            merge_engine,
+            MergeEngine::PartialUpdate | MergeEngine::Aggregation
+        ) && !dv_enabled
+        {
+            return self.read_kv(data_splits, core_options);
+        }
+
+        if matches!(
+            merge_engine,
             MergeEngine::PartialUpdate | MergeEngine::Aggregation
         ) {
-            return self.read_kv(data_splits, core_options);
+            let merge_engine_name = match merge_engine {
+                MergeEngine::PartialUpdate => "partial-update",
+                MergeEngine::Aggregation => "aggregation",
+                _ => unreachable!("guarded by partial-update/aggregation match"),
+            };
+            if core_options.deletion_vectors_merge_on_read() {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "merge-engine={merge_engine_name} with deletion-vectors.merge-on-read=true is not supported"
+                    ),
+                });
+            }
+            if !data_splits
+                .iter()
+                .all(DataSplit::is_fully_materialized_pk_dv)
+            {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "merge-engine={merge_engine_name} with deletion vectors can only read fully materialized compacted splits"
+                    ),
+                });
+            }
+            return self.read_raw(data_splits);
         }
 
         // Deletion-vector tables read raw by design: stale versions of a key
         // are masked by DVs, not merged, and KeyValueFileReader does not
         // support DVs. Keep the plain level-0 dispatch for them.
-        let dv_enabled = core_options.deletion_vectors_enabled();
-
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {

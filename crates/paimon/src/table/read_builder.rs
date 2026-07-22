@@ -639,14 +639,17 @@ mod tests {
     }
 
     use crate::catalog::Identifier;
+    use crate::deletion_vector::DeletionVector;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         BinaryRow, DataField, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema,
         VarCharType,
     };
-    use crate::table::{query_auth_table, DataSplitBuilder, Table};
+    use crate::table::{query_auth_table, DataSplitBuilder, DeletionFile, Table};
     use arrow_array::{Int32Array, RecordBatch};
+    use bytes::Bytes;
     use futures::TryStreamExt;
+    use roaring::RoaringBitmap;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -675,6 +678,31 @@ mod tests {
             .collect()
     }
 
+    async fn write_test_deletion_file(
+        file_io: &crate::io::FileIO,
+        path: &str,
+        deleted_rows: &[u32],
+    ) -> DeletionFile {
+        let bitmap = deleted_rows.iter().copied().collect::<RoaringBitmap>();
+        let bytes = DeletionVector::from_bitmap(bitmap)
+            .serialize_to_bytes()
+            .unwrap();
+        let bitmap_length = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+
+        DeletionFile::new(
+            path.to_string(),
+            0,
+            bitmap_length as i64,
+            Some(deleted_rows.len() as i64),
+        )
+    }
+
     fn simple_table() -> Table {
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
@@ -695,7 +723,7 @@ mod tests {
         )
     }
 
-    fn partial_update_dv_pk_table() -> Table {
+    fn dv_pk_table(table_path: &str, merge_engine: &str) -> Table {
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
@@ -703,7 +731,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("value", DataType::Int(IntType::new()))
                 .primary_key(["id"])
-                .option("merge-engine", "partial-update")
+                .option("merge-engine", merge_engine)
                 .option("deletion-vectors.enabled", "true")
                 .build()
                 .unwrap(),
@@ -711,10 +739,52 @@ mod tests {
         Table::new(
             file_io,
             Identifier::new("default", "partial_update_dv_t"),
-            "/tmp/test-partial-update-dv-read-builder".to_string(),
+            table_path.to_string(),
             table_schema,
             None,
         )
+    }
+
+    async fn read_compacted_dv_table(merge_engine: &str) -> Vec<RecordBatch> {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        let index_dir = tempdir.path().join("index");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        fs::create_dir_all(&index_dir).unwrap();
+
+        let data_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &data_path,
+            vec![("id", vec![1, 2, 3]), ("value", vec![10, 20, 30])],
+            None,
+        );
+        let file_size = fs::metadata(&data_path).unwrap().len() as i64;
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let deletion_file =
+            write_test_deletion_file(&file_io, &local_file_path(&index_dir.join("dv")), &[1]).await;
+
+        let table = dv_pk_table(&table_path, merge_engine);
+        let mut data_file =
+            test_data_file::<crate::spec::DataFileMeta>("data.parquet", 3, file_size);
+        data_file.delete_row_count = Some(0);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1540,33 +1610,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_direct_table_read_rejects_partial_update_with_deletion_vectors() {
-        let table = partial_update_dv_pk_table();
+    async fn test_direct_table_read_reads_compacted_partial_update_with_deletion_vectors() {
+        let batches = read_compacted_dv_table("partial-update").await;
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![1, 3]);
+        assert_eq!(collect_int_column(&batches, "value"), vec![10, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_direct_table_read_reads_compacted_aggregation_with_deletion_vectors() {
+        let batches = read_compacted_dv_table("aggregation").await;
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![1, 3]);
+        assert_eq!(collect_int_column(&batches, "value"), vec![10, 30]);
+    }
+
+    #[test]
+    fn test_direct_table_read_rejects_partial_update_dv_merge_on_read() {
+        let table = dv_pk_table(
+            "/tmp/test-partial-update-dv-merge-on-read",
+            "partial-update",
+        )
+        .copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".to_string(),
+            "true".to_string(),
+        )]));
+        let mut data_file = test_data_file::<crate::spec::DataFileMeta>("data.parquet", 1, 0);
+        data_file.delete_row_count = Some(0);
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
-            .with_bucket_path("/tmp/test-partial-update-dv-read-builder/bucket-0".to_string())
+            .with_bucket_path("/tmp/test-partial-update-dv-merge-on-read/bucket-0".to_string())
             .with_total_buckets(1)
-            .with_data_files(vec![test_data_file("data.parquet", 1, 0)])
-            .with_data_deletion_files(vec![Some(crate::table::source::DeletionFile::new(
-                "/tmp/test-partial-update-dv-read-builder/index/dv".to_string(),
-                0,
-                0,
-                None,
-            ))])
+            .with_data_files(vec![data_file])
             .build()
             .unwrap();
-        let err = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_err();
 
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion vectors")),
-            "expected partial-update+DV read to fail fast with Unsupported, got {err:?}"
-        );
+        let result =
+            TableRead::new(&table, table.schema().fields().to_vec(), Vec::new()).to_arrow(&[split]);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::Unsupported { ref message })
+                if message.contains("merge-on-read")
+        ));
     }
 }

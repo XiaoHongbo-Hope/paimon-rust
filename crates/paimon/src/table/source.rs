@@ -525,6 +525,20 @@ impl DataSplit {
         self.raw_convertible
     }
 
+    /// Whether this primary-key split is safe to read raw when deletion
+    /// vectors provide row-level filtering.
+    ///
+    /// This is deliberately stronger than [`Self::raw_convertible`]: direct
+    /// or deserialized splits may bypass scan planning, so every file must
+    /// also be compacted and known not to contain retract rows.
+    pub(crate) fn is_fully_materialized_pk_dv(&self) -> bool {
+        self.raw_convertible
+            && self
+                .data_files
+                .iter()
+                .all(|file| file.level != 0 && file.delete_row_count == Some(0))
+    }
+
     /// Returns the deletion file for the data file at the given index, if any. `None` at that index means no deletion file.
     pub fn deletion_file_for_data_file_index(&self, index: usize) -> Option<&DeletionFile> {
         self.data_deletion_files
@@ -1316,6 +1330,36 @@ mod tests {
     fn test_merged_row_count_raw_convertible_sums_physical_rows() {
         let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
         assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    #[test]
+    fn test_fully_materialized_pk_dv_requires_compacted_files() {
+        let mut level_zero = file("a", 10, None);
+        level_zero.level = 0;
+        level_zero.delete_row_count = Some(0);
+
+        assert!(!split(vec![level_zero], true).is_fully_materialized_pk_dv());
+    }
+
+    #[test]
+    fn test_fully_materialized_pk_dv_requires_raw_convertible() {
+        let mut compacted = file("a", 10, None);
+        compacted.delete_row_count = Some(0);
+
+        assert!(!split(vec![compacted], false).is_fully_materialized_pk_dv());
+    }
+
+    #[test]
+    fn test_fully_materialized_pk_dv_requires_known_zero_delete_rows() {
+        let unknown = file("unknown", 10, None);
+        let mut retracts = file("retracts", 10, None);
+        retracts.delete_row_count = Some(1);
+        let mut materialized = file("materialized", 10, None);
+        materialized.delete_row_count = Some(0);
+
+        assert!(!split(vec![unknown], true).is_fully_materialized_pk_dv());
+        assert!(!split(vec![retracts], true).is_fully_materialized_pk_dv());
+        assert!(split(vec![materialized], true).is_fully_materialized_pk_dv());
     }
 
     #[test]
