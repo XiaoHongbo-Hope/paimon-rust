@@ -33,7 +33,7 @@ use crate::spec::{
     Predicate, PredicateOperator,
 };
 use crate::table::{DeletionFile, RowRange, Table};
-use crate::Result;
+use crate::{Error, Result};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -82,7 +82,7 @@ struct GlobalIndexEntry {
     index_type: GlobalIndexFileKind,
     file_size: i64,
     row_range_start: i64,
-    meta: Option<BTreeIndexMeta>,
+    meta: BTreeIndexMeta,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +151,7 @@ impl OpenedGlobalIndexReader {
 
 impl GlobalIndexScanner {
     /// Create a scanner from index manifest entries.
-    /// Returns `None` if there are no global index entries.
+    /// Returns `Ok(None)` if there are no global index entries.
     pub(crate) fn create(
         file_io: &FileIO,
         table_path: &str,
@@ -159,7 +159,7 @@ impl GlobalIndexScanner {
         bitmap_fallback_scan_max_size: i64,
         index_entries: &[IndexManifestEntry],
         schema_fields: &[DataField],
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         let mut entries_by_field: std::collections::HashMap<i32, Vec<GlobalIndexEntry>> =
             std::collections::HashMap::new();
         let mut coverage_by_field: HashMap<i32, Vec<RowRange>> = HashMap::new();
@@ -172,12 +172,37 @@ impl GlobalIndexScanner {
             else {
                 continue;
             };
-            let global_meta = entry.index_file.global_index_meta.as_ref()?;
+            let global_meta =
+                entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!(
+                            "Missing global index metadata for sorted index file '{}'",
+                            entry.index_file.file_name
+                        ),
+                        source: None,
+                    })?;
 
-            let sorted_meta = global_meta
+            let index_meta = global_meta
                 .index_meta
                 .as_ref()
-                .and_then(|bytes| BTreeIndexMeta::deserialize(bytes).ok());
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Missing sorted global index metadata for file '{}'",
+                        entry.index_file.file_name
+                    ),
+                    source: None,
+                })?;
+            let sorted_meta =
+                BTreeIndexMeta::deserialize(index_meta).map_err(|error| Error::DataInvalid {
+                    message: format!(
+                        "Invalid sorted global index metadata for file '{}'",
+                        entry.index_file.file_name
+                    ),
+                    source: Some(Box::new(error)),
+                })?;
 
             let resolved = GlobalIndexEntry {
                 file_name: entry.index_file.file_name.clone(),
@@ -212,10 +237,10 @@ impl GlobalIndexScanner {
         }
 
         if entries_by_field.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        Some(Self {
+        Ok(Some(Self {
             file_io: file_io.clone(),
             table_path: table_path.trim_end_matches('/').to_string(),
             btree_fallback_scan_max_size,
@@ -224,7 +249,7 @@ impl GlobalIndexScanner {
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
             reader_cache: Mutex::new(HashMap::new()),
-        })
+        }))
     }
 
     /// Evaluate a predicate against the global indexes and return matching row ranges.
@@ -360,14 +385,6 @@ impl GlobalIndexScanner {
         entries: &[GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<Option<Vec<RowRange>>> {
-        let Some(metas) = entries
-            .iter()
-            .map(|entry| entry.meta.as_ref())
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Ok(None);
-        };
-
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
 
@@ -395,9 +412,9 @@ impl GlobalIndexScanner {
         let predicate_matches: Vec<Vec<bool>> = pruning_info
             .iter()
             .map(|(op, cmp, serialized)| {
-                metas
+                entries
                     .iter()
-                    .map(|meta| meta.may_match(*op, serialized, cmp))
+                    .map(|entry| entry.meta.may_match(*op, serialized, cmp))
                     .collect()
             })
             .collect();
@@ -415,9 +432,9 @@ impl GlobalIndexScanner {
                 let cmp = make_key_comparator(b.data_type);
                 let from_key = serialize_datum(b.from, b.data_type);
                 let to_key = serialize_datum(b.to, b.data_type);
-                metas
+                entries
                     .iter()
-                    .map(|meta| meta.may_match_between(&from_key, &to_key, &cmp))
+                    .map(|entry| entry.meta.may_match_between(&from_key, &to_key, &cmp))
                     .collect()
             }
             None => Vec::new(),
@@ -426,7 +443,7 @@ impl GlobalIndexScanner {
             .as_ref()
             .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry));
 
-        for (entry_idx, (entry, meta)) in entries.iter().zip(metas).enumerate() {
+        for (entry_idx, entry) in entries.iter().enumerate() {
             // Also check if between range may match
             let between_matches = between
                 .as_ref()
@@ -491,7 +508,10 @@ impl GlobalIndexScanner {
             let mut reader = if (between_matches && between_evaluated_for_entry)
                 || !matching_predicates.is_empty()
             {
-                Some(self.open_reader_for_entry(entry, meta, data_type).await?)
+                Some(
+                    self.open_reader_for_entry(entry, &entry.meta, data_type)
+                        .await?,
+                )
             } else {
                 None
             };
@@ -1204,7 +1224,7 @@ pub(crate) async fn evaluate_global_index(
         evaluation.bitmap_fallback_scan_max_size,
         evaluation.index_entries,
         evaluation.schema_fields,
-    ) {
+    )? {
         Some(s) => s,
         None => return Ok(None),
     };
@@ -1549,6 +1569,7 @@ mod tests {
             &entries,
             &fields,
         )
+        .expect("create scanner")
         .expect("scanner");
 
         let ranges = scanner
@@ -1576,6 +1597,7 @@ mod tests {
             &entries,
             &fields,
         )
+        .expect("create scanner")
         .expect("scanner");
 
         let ranges = scanner
@@ -1603,6 +1625,7 @@ mod tests {
             &entries,
             &fields,
         )
+        .expect("create scanner")
         .expect("scanner");
 
         let ranges = scanner
@@ -1637,6 +1660,7 @@ mod tests {
             &entries,
             &fields,
         )
+        .expect("create scanner")
         .expect("scanner");
         let predicate = Predicate::and(vec![int_eq("id", 0, 7), int_eq("value", 1, 8)]);
 
@@ -1660,6 +1684,7 @@ mod tests {
             &entries,
             &fields,
         )
+        .expect("create scanner")
         .expect("scanner");
         let predicate = Predicate::and(vec![int_eq("id", 0, 7), int_eq("value", 1, 8)]);
 
@@ -1689,6 +1714,7 @@ mod tests {
             &[entry],
             &fields,
         )
+        .expect("create scanner")
         .expect("scanner");
 
         let ranges = scanner
@@ -1753,7 +1779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_or_invalid_index_meta_falls_back() {
+    async fn test_missing_index_meta_returns_error() {
         let (file_io, table_path, file_name, tmp) =
             setup_testdata_table("btree_int_100_no_compress.bin");
         let second_file_name = "btree_int_100_no_compress_2.bin";
@@ -1763,38 +1789,75 @@ mod tests {
         )
         .unwrap();
         let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
-        let mut invalid_meta = vec![0; 9];
-        invalid_meta[..4].copy_from_slice(&10i32.to_le_bytes());
+        let valid_entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        let mut invalid_entry = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
+        invalid_entry
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .index_meta = None;
 
-        for index_meta in [None, Some(invalid_meta)] {
-            let valid_entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
-            let mut invalid_entry = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
-            invalid_entry
-                .index_file
-                .global_index_meta
-                .as_mut()
-                .unwrap()
-                .index_meta = index_meta;
+        let error = evaluate_global_index_fast(
+            &file_io,
+            &table_path,
+            &[valid_entry, invalid_entry],
+            &[int_eq("id", 0, 50)],
+            &int_schema_fields(),
+        )
+        .await
+        .expect_err("missing sorted index metadata must fail the scan");
 
-            let result = evaluate_global_index_fast(
-                &file_io,
-                &table_path,
-                &[valid_entry, invalid_entry],
-                &[int_eq("id", 0, 50)],
-                &int_schema_fields(),
-            )
-            .await
-            .unwrap();
-
-            assert!(
-                result.is_none(),
-                "missing or invalid index metadata must fall back to the normal table scan"
-            );
-        }
+        assert!(matches!(
+            error,
+            crate::Error::DataInvalid { message, .. }
+                if message.contains(second_file_name)
+        ));
     }
 
     #[tokio::test]
-    async fn test_missing_global_index_meta_falls_back() {
+    async fn test_invalid_index_meta_returns_error() {
+        let (file_io, table_path, file_name, tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let second_file_name = "btree_int_100_no_compress_2.bin";
+        std::fs::copy(
+            tmp.path().join("index").join(&file_name),
+            tmp.path().join("index").join(second_file_name),
+        )
+        .unwrap();
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let valid_entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        let mut invalid_entry = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
+        let mut invalid_meta = vec![0; 9];
+        invalid_meta[..4].copy_from_slice(&10i32.to_le_bytes());
+        invalid_entry
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .index_meta = Some(invalid_meta);
+
+        let error = evaluate_global_index_fast(
+            &file_io,
+            &table_path,
+            &[valid_entry, invalid_entry],
+            &[int_eq("id", 0, 50)],
+            &int_schema_fields(),
+        )
+        .await
+        .expect_err("invalid sorted index metadata must fail the scan");
+
+        assert!(matches!(
+            error,
+            crate::Error::DataInvalid {
+                message,
+                source: Some(_),
+            } if message.contains(second_file_name)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_global_index_meta_returns_error() {
         let (file_io, table_path, file_name, tmp) =
             setup_testdata_table("btree_int_100_no_compress.bin");
         let second_file_name = "btree_int_100_no_compress_2.bin";
@@ -1808,7 +1871,7 @@ mod tests {
         let mut invalid_entry = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
         invalid_entry.index_file.global_index_meta = None;
 
-        let result = evaluate_global_index_fast(
+        let error = evaluate_global_index_fast(
             &file_io,
             &table_path,
             &[valid_entry, invalid_entry],
@@ -1816,12 +1879,13 @@ mod tests {
             &int_schema_fields(),
         )
         .await
-        .unwrap();
+        .expect_err("missing global index metadata must fail the scan");
 
-        assert!(
-            result.is_none(),
-            "missing global index metadata must fall back to the normal table scan"
-        );
+        assert!(matches!(
+            error,
+            crate::Error::DataInvalid { message, .. }
+                if message.contains(second_file_name)
+        ));
     }
 
     #[tokio::test]
