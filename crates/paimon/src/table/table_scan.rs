@@ -1325,17 +1325,20 @@ impl<'a> PaimonTableScan<'a> {
             entry.1.push(file);
         }
 
-        let global_index_search_mode = if data_evolution_enabled
+        let global_index_settings = if data_evolution_enabled
             && core_options.global_index_enabled()
             && !self.data_predicates.is_empty()
         {
-            Some(core_options.global_index_search_mode()?)
+            Some((
+                core_options.global_index_search_mode()?,
+                core_options.global_index_thread_num()?,
+            ))
         } else {
             None
         };
         let global_index_detail_data_ranges = if matches!(
-            global_index_search_mode,
-            Some(GlobalIndexSearchMode::Detail)
+            global_index_settings,
+            Some((GlobalIndexSearchMode::Detail, _))
         ) {
             global_index_detail_data_ranges(&groups)
         } else {
@@ -1390,7 +1393,7 @@ impl<'a> PaimonTableScan<'a> {
                 // Use pushed-down row_ranges first; otherwise try global index.
                 let row_ranges = if self.row_ranges.is_some() {
                     self.row_ranges.clone()
-                } else if let Some(search_mode) = global_index_search_mode {
+                } else if let Some((search_mode, global_index_thread_num)) = global_index_settings {
                     super::global_index_scanner::evaluate_global_index(
                         super::global_index_scanner::GlobalIndexEvaluation {
                             file_io,
@@ -1399,6 +1402,7 @@ impl<'a> PaimonTableScan<'a> {
                             predicates: &self.data_predicates,
                             schema_fields: self.table.schema().fields(),
                             search_mode,
+                            global_index_thread_num,
                             btree_fallback_scan_max_size: btree_index_fallback_scan_max_size,
                             bitmap_fallback_scan_max_size: bitmap_index_fallback_scan_max_size,
                             next_row_id: snapshot.next_row_id(),

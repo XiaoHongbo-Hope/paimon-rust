@@ -578,10 +578,10 @@ impl<'a> CoreOptions<'a> {
 
     /// Maximum number of concurrent tasks for global-index I/O, mirroring Java
     /// `CoreOptions.GLOBAL_INDEX_THREAD_NUM` (key `global-index.thread-num`,
-    /// default 32). Used as the fan-out limit for the primary-key vector search
-    /// (per-bucket and per-exact-file). A value of `1` reproduces strict
-    /// sequential execution. A non-positive value is a misconfiguration and fails
-    /// loud rather than being silently clamped.
+    /// default 32). Used as the per-operation fan-out limit for sorted BTree and
+    /// bitmap shard reads and for primary-key vector search. A value of `1`
+    /// reproduces strict sequential execution. A non-positive value is a
+    /// misconfiguration and fails loud rather than being silently clamped.
     pub fn global_index_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?
