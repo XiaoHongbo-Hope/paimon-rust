@@ -211,7 +211,7 @@ impl GlobalIndexScanner {
                     BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
                     _ => unreachable!("normalized sorted global index type"),
                 },
-                file_size: i64::from(entry.index_file.file_size),
+                file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
                 meta: sorted_meta,
             };

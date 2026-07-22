@@ -499,7 +499,7 @@ async fn collect_snapshot_files(
             file_set
                 .index_files
                 .entry(entry.index_file.file_name.clone())
-                .or_insert(entry.index_file.file_size as i64);
+                .or_insert(entry.index_file.file_size);
         }
     }
 

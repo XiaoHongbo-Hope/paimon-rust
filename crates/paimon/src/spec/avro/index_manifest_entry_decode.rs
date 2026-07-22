@@ -35,7 +35,7 @@ impl AvroRecordDecode for IndexManifestEntry {
         let mut bucket: Option<i32> = None;
         let mut index_type: Option<String> = None;
         let mut file_name: Option<String> = None;
-        let mut file_size: Option<i32> = None;
+        let mut file_size: Option<i64> = None;
         let mut row_count: Option<i32> = None;
         let mut deletion_vectors_ranges: Option<IndexMap<String, DeletionVectorMeta>> = None;
         let mut global_index_meta: Option<GlobalIndexMeta> = None;
@@ -60,7 +60,7 @@ impl AvroRecordDecode for IndexManifestEntry {
                 "_BUCKET" => bucket = Some(read_int_field(cursor, field.nullable)?),
                 "_INDEX_TYPE" => index_type = Some(read_string_field(cursor, field.nullable)?),
                 "_FILE_NAME" => file_name = Some(read_string_field(cursor, field.nullable)?),
-                "_FILE_SIZE" => file_size = Some(read_long_field(cursor, field.nullable)? as i32),
+                "_FILE_SIZE" => file_size = Some(read_long_field(cursor, field.nullable)?),
                 "_ROW_COUNT" => row_count = Some(read_long_field(cursor, field.nullable)? as i32),
                 "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
                     deletion_vectors_ranges = decode_nullable_dv_ranges(cursor, field.nullable)?;

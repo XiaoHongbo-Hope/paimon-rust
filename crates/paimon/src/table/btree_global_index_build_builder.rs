@@ -275,7 +275,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         Ok(IndexFileMeta {
             index_type: index_type.to_string(),
             file_name,
-            file_size: checked_i32(
+            file_size: checked_i64(
                 status.size,
                 "Index file is too large for Rust IndexFileMeta",
             )?,
@@ -733,8 +733,8 @@ fn sort_index_rows(rows: &mut [BTreeKeyRow], cmp: &dyn Fn(&[u8], &[u8]) -> Order
     });
 }
 
-fn checked_i32(value: u64, context: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::DataInvalid {
+fn checked_i64(value: u64, context: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::DataInvalid {
         message: format!("{context}: {value}"),
         source: None,
     })

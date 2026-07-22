@@ -230,7 +230,7 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
         Ok(IndexFileMeta {
             index_type: LUMINA_IDENTIFIER.to_string(),
             file_name,
-            file_size: checked_i32(
+            file_size: checked_i64(
                 status.size,
                 "Index file is too large for Rust IndexFileMeta",
             )?,
@@ -741,8 +741,8 @@ fn extract_vectors_from_batches(
     Ok(vectors)
 }
 
-fn checked_i32(value: u64, context: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::DataInvalid {
+fn checked_i64(value: u64, context: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::DataInvalid {
         message: format!("{context}: {value}"),
         source: None,
     })
@@ -1517,9 +1517,15 @@ mod tests {
     }
 
     #[test]
-    fn test_checked_metadata_conversion_rejects_large_file_size() {
-        let err = checked_i32(i32::MAX as u64 + 1, "Index file is too large")
-            .expect_err("large file size should fail");
+    fn test_checked_metadata_conversion_supports_i64_file_size() {
+        let above_i32_max = i32::MAX as u64 + 1;
+        assert_eq!(
+            checked_i64(above_i32_max, "Index file is too large").unwrap(),
+            i64::from(i32::MAX) + 1
+        );
+
+        let err = checked_i64(i64::MAX as u64 + 1, "Index file is too large")
+            .expect_err("file size above i64::MAX should fail");
         assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("too large")));
     }
 

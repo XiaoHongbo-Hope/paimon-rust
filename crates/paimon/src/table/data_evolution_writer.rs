@@ -689,7 +689,7 @@ impl DataEvolutionDeleteWriter {
             bytes.extend_from_slice(&serialized);
         }
 
-        let file_size = i32::try_from(bytes.len()).map_err(|_| crate::Error::DataInvalid {
+        let file_size = i64::try_from(bytes.len()).map_err(|_| crate::Error::DataInvalid {
             message: "Deletion-vector index file is too large".to_string(),
             source: None,
         })?;
