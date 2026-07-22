@@ -1923,7 +1923,7 @@ deletion vectors enabled.
 |---|---:|---|
 | `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
-| `global-index.enabled` | `false` | Enables global index metadata and global-index-aware reads. |
+| `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree range. |
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
