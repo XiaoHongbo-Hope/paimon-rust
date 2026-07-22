@@ -76,6 +76,8 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
   - `libpaimon_c.linux.arm64.so.zst`
   - `libpaimon_c.darwin.amd64.dylib.zst`
   - `libpaimon_c.darwin.arm64.dylib.zst`
+- Confirm `python3 scripts/release_licenses.py --check` can reproduce all binary
+  legal files from the locked dependency graph.
 - Confirm CI is green on `main` before publishing.
 
 ## Publish
@@ -91,16 +93,20 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
   - `linux/arm64`
   - `darwin/amd64`
   - `darwin/arm64`
+- Confirm each build job generates and verifies the target-specific legal report.
 - Confirm the workflow creates the annotated tag `bindings/go/v0.1.0`.
 - Confirm the workflow publishes a GitHub release for that tag.
 
 ## After Release
 
-- Confirm the release contains all four compressed shared-library assets.
+- Confirm the release contains LICENSE, NOTICE, four compressed shared libraries,
+  and four matching third-party license reports.
 - Confirm the tag resolves to a commit that contains:
   - `bindings/go/go.mod`
   - `bindings/go/RELEASE.md`
   - the four `libpaimon_c.*.zst` files
+  - `bindings/go/LICENSE` and `bindings/go/NOTICE`
+  - the four `bindings/go/THIRD-PARTY-LICENSES.*.html` files
 - Record which Rust release tag or baseline commit this Go binding release was
   built from.
 - Verify module resolution from a clean environment:

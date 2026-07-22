@@ -15,23 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-header:
-  license:
-    spdx-id: Apache-2.0
-    copyright-owner: Apache Software Foundation
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "bzip2-1.0.6",
+]
 
-  paths-ignore:
-    - "LICENSE"
-    - "NOTICE"
-    - "Cargo.lock"
-    - ".gitattributes"
-    - ".github/PULL_REQUEST_TEMPLATE.md"
-    - "crates/paimon/tests/**/*.json"
-    - "crates/paimon/testdata/**"
-    - "third-party-licenses/openssl-1.1.1.LICENSE"
-    - "**/go.sum"
-    - "**/DEPENDENCIES.*.tsv"
-    - ".devcontainer/devcontainer.json"
-    - "bindings/python/python/pypaimon_rust/py.typed"
-
-  comment: on-failure
+# Report linked runtime components only.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
