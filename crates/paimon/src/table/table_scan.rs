@@ -22,6 +22,7 @@
 
 use super::bucket_filter::compute_target_buckets;
 use super::format_table_scan::FormatTableScan;
+use super::global_index_scanner::RowRangeIndex;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
@@ -33,8 +34,8 @@ use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
-    DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, ManifestEntry,
-    PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
+    ManifestEntry, PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
@@ -64,6 +65,7 @@ struct ManifestReadCounters {
     pruned_by_partition: usize,
     after_entry_pruning: usize,
     pruned_by_level: usize,
+    pruned_by_row_ranges: usize,
     pruned_by_data_stats: usize,
     after_manifest_filters: usize,
 }
@@ -75,6 +77,7 @@ impl ManifestReadCounters {
         self.pruned_by_partition += other.pruned_by_partition;
         self.after_entry_pruning += other.after_entry_pruning;
         self.pruned_by_level += other.pruned_by_level;
+        self.pruned_by_row_ranges += other.pruned_by_row_ranges;
         self.pruned_by_data_stats += other.pruned_by_data_stats;
         self.after_manifest_filters += other.after_manifest_filters;
     }
@@ -122,6 +125,7 @@ async fn read_all_manifest_entries(
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
     bucket_function_type: BucketFunctionType,
+    row_range_index: Option<&RowRangeIndex>,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let (mut manifest_files, delta) = futures::try_join!(
@@ -157,6 +161,14 @@ async fn read_all_manifest_entries(
     if let Some(trace) = trace.as_deref_mut() {
         trace.manifest_files_before_partition_pruning = manifest_files_before_partition_pruning;
         trace.manifest_files_after_partition_pruning = manifest_files.len();
+    }
+
+    if let Some(index) = row_range_index {
+        let before = manifest_files.len();
+        manifest_files.retain(|meta| manifest_file_overlaps_row_range_index(meta, index));
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.manifest_files_pruned_by_row_ranges = before - manifest_files.len();
+        }
     }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
@@ -226,6 +238,12 @@ async fn read_all_manifest_entries(
                             counters.pruned_by_level += 1;
                             continue;
                         }
+                        if row_range_index.is_some_and(|index| {
+                            !data_file_overlaps_row_range_index(entry.file(), index)
+                        }) {
+                            counters.pruned_by_row_ranges += 1;
+                            continue;
+                        }
                         if !data_predicates.is_empty()
                             && !data_file_matches_predicates(
                                 entry.file(),
@@ -259,10 +277,37 @@ async fn read_all_manifest_entries(
         trace.manifest_entries_pruned_by_partition = counters.pruned_by_partition;
         trace.manifest_entries_after_entry_pruning = counters.after_entry_pruning;
         trace.manifest_entries_pruned_by_level = counters.pruned_by_level;
+        trace.manifest_entries_pruned_by_row_ranges = counters.pruned_by_row_ranges;
         trace.manifest_entries_pruned_by_data_stats = counters.pruned_by_data_stats;
         trace.manifest_entries_after_manifest_filters = counters.after_manifest_filters;
     }
     Ok(all_entries)
+}
+
+fn manifest_file_overlaps_row_range_index(
+    manifest: &crate::spec::ManifestFileMeta,
+    row_range_index: &RowRangeIndex,
+) -> bool {
+    match (manifest.min_row_id(), manifest.max_row_id()) {
+        (Some(min), Some(max)) if min <= max => row_range_index.intersects(min, max),
+        _ => true,
+    }
+}
+
+fn data_file_overlaps_row_range_index(
+    file: &DataFileMeta,
+    row_range_index: &RowRangeIndex,
+) -> bool {
+    let Some(first_row_id) = file.first_row_id else {
+        return true;
+    };
+    if file.row_count <= 0 {
+        return true;
+    }
+    let Some(last_row_id) = first_row_id.checked_add(file.row_count - 1) else {
+        return true;
+    };
+    row_range_index.intersects(first_row_id, last_row_id)
 }
 
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
@@ -408,16 +453,24 @@ impl LimitPushdownAccumulator {
 
 type BucketDataFileGroups = HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
 
-fn global_index_detail_data_ranges(groups: &BucketDataFileGroups) -> Vec<RowRange> {
-    let mut ranges = Vec::new();
-    for (_, data_files) in groups.values() {
-        for file in data_files {
-            if let Some((from, to)) = file.row_id_range() {
-                ranges.push(RowRange::new(from, to));
-            }
-        }
-    }
-    merge_row_ranges(ranges)
+#[derive(Clone, Copy)]
+struct GlobalIndexScanSettings {
+    search_mode: GlobalIndexSearchMode,
+    thread_num: usize,
+}
+
+fn global_index_detail_data_ranges(entries: &[ManifestEntry]) -> Vec<RowRange> {
+    merge_row_ranges(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .file()
+                    .row_id_range()
+                    .map(|(from, to)| RowRange::new(from, to))
+            })
+            .collect(),
+    )
 }
 
 fn should_skip_level_zero_for_scan(
@@ -937,12 +990,14 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: &Snapshot,
     ) -> crate::Result<Vec<ManifestEntry>> {
-        self.plan_manifest_entries_with_trace(snapshot, None).await
+        self.plan_manifest_entries_with_trace(snapshot, None, None)
+            .await
     }
 
     async fn plan_manifest_entries_with_trace(
         &self,
         snapshot: &Snapshot,
+        row_range_index: Option<&RowRangeIndex>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
@@ -1016,6 +1071,7 @@ impl<'a> PaimonTableScan<'a> {
             self.bucket_predicate.as_ref(),
             &bucket_key_fields,
             bucket_function_type,
+            row_range_index,
             trace.as_deref_mut(),
         )
         .await?;
@@ -1028,6 +1084,111 @@ impl<'a> PaimonTableScan<'a> {
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
         can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
+    }
+
+    fn global_index_scan_settings(
+        &self,
+        core_options: &CoreOptions,
+        data_evolution_enabled: bool,
+    ) -> crate::Result<Option<GlobalIndexScanSettings>> {
+        if data_evolution_enabled
+            && core_options.global_index_enabled()
+            && !self.data_predicates.is_empty()
+        {
+            Ok(Some(GlobalIndexScanSettings {
+                search_mode: core_options.global_index_search_mode()?,
+                thread_num: core_options.global_index_thread_num()?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn read_index_manifest_entries(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Option<Vec<IndexManifestEntry>>> {
+        let Some(index_manifest_name) = snapshot.index_manifest() else {
+            return Ok(None);
+        };
+        let table_path = self.table.location().trim_end_matches('/');
+        let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
+        Ok(Some(
+            IndexManifest::read(self.table.file_io(), &path).await?,
+        ))
+    }
+
+    async fn evaluate_global_index_row_ranges(
+        &self,
+        snapshot: &Snapshot,
+        index_entries: &[IndexManifestEntry],
+        settings: GlobalIndexScanSettings,
+        data_ranges: &[RowRange],
+    ) -> crate::Result<Option<Vec<RowRange>>> {
+        let core_options = CoreOptions::new(self.table.schema().options());
+        super::global_index_scanner::evaluate_global_index(
+            super::global_index_scanner::GlobalIndexEvaluation {
+                file_io: self.table.file_io(),
+                table_path: self.table.location().trim_end_matches('/'),
+                index_entries,
+                predicates: &self.data_predicates,
+                schema_fields: self.table.schema().fields(),
+                search_mode: settings.search_mode,
+                global_index_thread_num: settings.thread_num,
+                btree_fallback_scan_max_size: core_options.btree_index_fallback_scan_max_size()?,
+                bitmap_fallback_scan_max_size: core_options
+                    .bitmap_index_fallback_scan_max_size()?,
+                next_row_id: snapshot.next_row_id(),
+                data_ranges,
+            },
+        )
+        .await
+    }
+
+    async fn manifest_row_ranges(
+        &self,
+        snapshot: &Snapshot,
+        index_entries: Option<&[IndexManifestEntry]>,
+        settings: Option<GlobalIndexScanSettings>,
+    ) -> crate::Result<Option<Vec<RowRange>>> {
+        if self.row_ranges.is_some() {
+            return Ok(self.row_ranges.clone());
+        }
+        let (Some(index_entries), Some(settings)) = (index_entries, settings) else {
+            return Ok(None);
+        };
+        if settings.search_mode == GlobalIndexSearchMode::Detail {
+            return Ok(None);
+        }
+        self.evaluate_global_index_row_ranges(snapshot, index_entries, settings, &[])
+            .await
+    }
+
+    async fn effective_row_ranges(
+        &self,
+        snapshot: &Snapshot,
+        entries: &[ManifestEntry],
+        index_entries: Option<&[IndexManifestEntry]>,
+        settings: Option<GlobalIndexScanSettings>,
+        manifest_row_ranges: Option<Vec<RowRange>>,
+    ) -> crate::Result<Option<Vec<RowRange>>> {
+        if self.row_ranges.is_some()
+            || !matches!(
+                settings,
+                Some(GlobalIndexScanSettings {
+                    search_mode: GlobalIndexSearchMode::Detail,
+                    ..
+                })
+            )
+        {
+            return Ok(manifest_row_ranges);
+        }
+        let (Some(index_entries), Some(settings)) = (index_entries, settings) else {
+            return Ok(None);
+        };
+        let data_ranges = global_index_detail_data_ranges(entries);
+        self.evaluate_global_index_row_ranges(snapshot, index_entries, settings, &data_ranges)
+            .await
     }
 
     /// The predicate set that may prune WHOLE FILES by their stats.
@@ -1074,15 +1235,11 @@ impl<'a> PaimonTableScan<'a> {
     /// reads the delta manifest list and keeps ADD entries.
     pub(crate) async fn plan_snapshot_delta(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
-        let entries = self
-            .plan_manifest_list_entries(snapshot.delta_manifest_list())
-            .await?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        self.plan_snapshot_from_entries(
-            snapshot.clone(),
-            entries,
+        self.plan_snapshot_manifest_list(
+            snapshot,
+            snapshot.delta_manifest_list(),
             data_evolution_read_field_ids.as_ref(),
-            None,
         )
         .await
     }
@@ -1097,12 +1254,55 @@ impl<'a> PaimonTableScan<'a> {
         let Some(list_name) = snapshot.changelog_manifest_list() else {
             return Ok(Plan::new(Vec::new()));
         };
-        let entries = self.plan_manifest_list_entries(list_name).await?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        self.plan_snapshot_manifest_list(
+            snapshot,
+            list_name,
+            data_evolution_read_field_ids.as_ref(),
+        )
+        .await
+    }
+
+    async fn plan_snapshot_manifest_list(
+        &self,
+        snapshot: &Snapshot,
+        manifest_list_name: &str,
+        data_evolution_read_field_ids: Option<&HashSet<i32>>,
+    ) -> crate::Result<Plan> {
+        if matches!(self.limit, Some(0)) {
+            return Ok(Plan::new(Vec::new()));
+        }
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let data_evolution_enabled = core_options.data_evolution_enabled();
+        let global_index_settings =
+            self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
+        let index_entries = self.read_index_manifest_entries(snapshot).await?;
+        let manifest_row_ranges = self
+            .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
+            .await?;
+        let row_range_index = if data_evolution_enabled {
+            manifest_row_ranges.clone().map(RowRangeIndex::create)
+        } else {
+            None
+        };
+        let entries = self
+            .plan_manifest_list_entries(manifest_list_name, row_range_index.as_ref())
+            .await?;
+        let effective_row_ranges = self
+            .effective_row_ranges(
+                snapshot,
+                &entries,
+                index_entries.as_deref(),
+                global_index_settings,
+                manifest_row_ranges,
+            )
+            .await?;
         self.plan_snapshot_from_entries(
             snapshot.clone(),
             entries,
-            data_evolution_read_field_ids.as_ref(),
+            data_evolution_read_field_ids,
+            index_entries,
+            effective_row_ranges,
             None,
         )
         .await
@@ -1113,6 +1313,7 @@ impl<'a> PaimonTableScan<'a> {
     async fn plan_manifest_list_entries(
         &self,
         manifest_list_name: &str,
+        row_range_index: Option<&RowRangeIndex>,
     ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
@@ -1139,6 +1340,9 @@ impl<'a> PaimonTableScan<'a> {
                     pf.matches_manifest(&file_stats, &partition_fields)
                 });
             }
+        }
+        if let Some(index) = row_range_index {
+            manifest_metas.retain(|meta| manifest_file_overlaps_row_range_index(meta, index));
         }
 
         let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
@@ -1214,6 +1418,10 @@ impl<'a> PaimonTableScan<'a> {
         let entries = entries
             .into_iter()
             .filter(|entry| *entry.kind() == FileKind::Add)
+            .filter(|entry| {
+                row_range_index
+                    .is_none_or(|index| data_file_overlaps_row_range_index(entry.file(), index))
+            })
             .collect();
         Ok(entries)
     }
@@ -1224,11 +1432,50 @@ impl<'a> PaimonTableScan<'a> {
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        let entries = self
-            .plan_manifest_entries_with_trace(&snapshot, trace.as_deref_mut())
+        if matches!(self.limit, Some(0)) {
+            if let Some(trace) = trace {
+                trace.record_final_plan_with_limit(0, 0, 0, 0, true);
+            }
+            return Ok(Plan::new(Vec::new()));
+        }
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let data_evolution_enabled = core_options.data_evolution_enabled();
+        let global_index_settings =
+            self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
+        let index_entries = self.read_index_manifest_entries(&snapshot).await?;
+        let manifest_row_ranges = self
+            .manifest_row_ranges(&snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
-        self.plan_snapshot_from_entries(snapshot, entries, data_evolution_read_field_ids, trace)
-            .await
+        let row_range_index = if data_evolution_enabled {
+            manifest_row_ranges.clone().map(RowRangeIndex::create)
+        } else {
+            None
+        };
+        let entries = self
+            .plan_manifest_entries_with_trace(
+                &snapshot,
+                row_range_index.as_ref(),
+                trace.as_deref_mut(),
+            )
+            .await?;
+        let effective_row_ranges = self
+            .effective_row_ranges(
+                &snapshot,
+                &entries,
+                index_entries.as_deref(),
+                global_index_settings,
+                manifest_row_ranges,
+            )
+            .await?;
+        self.plan_snapshot_from_entries(
+            snapshot,
+            entries,
+            data_evolution_read_field_ids,
+            index_entries,
+            effective_row_ranges,
+            trace,
+        )
+        .await
     }
 
     async fn plan_snapshot_from_entries(
@@ -1236,9 +1483,10 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: Snapshot,
         entries: Vec<ManifestEntry>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        index_entries: Option<Vec<IndexManifestEntry>>,
+        effective_row_ranges: Option<Vec<RowRange>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        let file_io = self.table.file_io();
         let table_path = self.table.location();
         let table_schema_id = self.table.schema().id();
         let table_fields = self.table.schema().fields();
@@ -1325,30 +1573,6 @@ impl<'a> PaimonTableScan<'a> {
             entry.1.push(file);
         }
 
-        let global_index_settings = if data_evolution_enabled
-            && core_options.global_index_enabled()
-            && !self.data_predicates.is_empty()
-        {
-            Some((
-                core_options.global_index_search_mode()?,
-                core_options.global_index_thread_num()?,
-            ))
-        } else {
-            None
-        };
-        let global_index_detail_data_ranges = if matches!(
-            global_index_settings,
-            Some((GlobalIndexSearchMode::Detail, _))
-        ) {
-            global_index_detail_data_ranges(&groups)
-        } else {
-            Vec::new()
-        };
-        let btree_index_fallback_scan_max_size =
-            core_options.btree_index_fallback_scan_max_size()?;
-        let bitmap_index_fallback_scan_max_size =
-            core_options.bitmap_index_fallback_scan_max_size()?;
-
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
         let mut splits = Vec::with_capacity(groups.len());
@@ -1382,42 +1606,11 @@ impl<'a> PaimonTableScan<'a> {
             None
         };
 
-        // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
-        let (deletion_files_map, effective_row_ranges) =
-            if let Some(index_manifest_name) = snapshot.index_manifest() {
-                let index_manifest_path = format!("{base_path}/{MANIFEST_DIR}");
-                let path = format!("{index_manifest_path}/{index_manifest_name}");
-                let index_entries = IndexManifest::read(file_io, &path).await?;
-                let dv_map = build_deletion_files_map(&index_entries, base_path);
-
-                // Use pushed-down row_ranges first; otherwise try global index.
-                let row_ranges = if self.row_ranges.is_some() {
-                    self.row_ranges.clone()
-                } else if let Some((search_mode, global_index_thread_num)) = global_index_settings {
-                    super::global_index_scanner::evaluate_global_index(
-                        super::global_index_scanner::GlobalIndexEvaluation {
-                            file_io,
-                            table_path: base_path,
-                            index_entries: &index_entries,
-                            predicates: &self.data_predicates,
-                            schema_fields: self.table.schema().fields(),
-                            search_mode,
-                            global_index_thread_num,
-                            btree_fallback_scan_max_size: btree_index_fallback_scan_max_size,
-                            bitmap_fallback_scan_max_size: bitmap_index_fallback_scan_max_size,
-                            next_row_id: snapshot.next_row_id(),
-                            data_ranges: &global_index_detail_data_ranges,
-                        },
-                    )
-                    .await?
-                } else {
-                    None
-                };
-
-                (Some(dv_map), row_ranges)
-            } else {
-                (None, self.row_ranges.clone())
-            };
+        // The index manifest was read before data manifests so global-index row
+        // ranges can prune manifest I/O. Reuse it here for deletion vectors.
+        let deletion_files_map = index_entries
+            .as_deref()
+            .map(|entries| build_deletion_files_map(entries, base_path));
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
         let can_push_down_limit = self.can_push_down_limit_hint(effective_row_ranges.as_deref());
@@ -1442,13 +1635,37 @@ impl<'a> PaimonTableScan<'a> {
                 .as_ref()
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
-            // Data-evolution tables merge overlapping row-id groups column-wise during read.
-            // Keep that split boundary intact and only bin-pack single-file groups.
-            // Apply group-level predicate filtering after grouping by row_id range.
+            // Data-evolution reads merge overlapping row-id groups column-wise.
             let file_groups: Vec<SplitGroup> = if data_evolution_enabled {
+                // Prune files before grouping and stats, while retaining every sequence
+                // candidate that overlaps a selected row.
+                let (data_files, pruned_groups) = if let Some(ref ranges) = effective_row_ranges {
+                    let pruned_groups = if trace.is_some() {
+                        group_by_overlapping_row_id(data_files.clone())
+                            .iter()
+                            .filter(|group| {
+                                !group
+                                    .iter()
+                                    .any(|file| any_range_overlaps_file(ranges, file))
+                            })
+                            .count()
+                    } else {
+                        0
+                    };
+                    (
+                        data_files
+                            .into_iter()
+                            .filter(|file| any_range_overlaps_file(ranges, file))
+                            .collect(),
+                        pruned_groups,
+                    )
+                } else {
+                    (data_files, 0)
+                };
                 let row_id_groups = group_by_overlapping_row_id(data_files);
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.data_evolution_groups_before_stats += row_id_groups.len();
+                    trace.data_evolution_groups_pruned_by_row_ranges += pruned_groups;
                 }
 
                 // Filter groups by merged stats before splitting.
@@ -1470,21 +1687,6 @@ impl<'a> PaimonTableScan<'a> {
                         trace.data_evolution_groups_pruned_by_stats += before - groups.len();
                     }
                     groups
-                };
-
-                // Filter groups by row ID ranges.
-                let row_id_groups = if let Some(ref ranges) = effective_row_ranges {
-                    let before = row_id_groups.len();
-                    let groups = row_id_groups
-                        .into_iter()
-                        .filter(|group| group.iter().any(|f| any_range_overlaps_file(ranges, f)))
-                        .collect::<Vec<_>>();
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.data_evolution_groups_pruned_by_row_ranges += before - groups.len();
-                    }
-                    groups
-                } else {
-                    row_id_groups
                 };
 
                 let row_id_groups = if let Some(read_field_ids) = data_evolution_read_field_ids {
@@ -1651,20 +1853,21 @@ impl<'a> PaimonTableScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
+        data_file_overlaps_row_range_index, manifest_file_overlaps_row_range_index,
         prune_data_evolution_group_by_read_fields, should_skip_level_zero_for_scan,
-        LimitPushdownAccumulator, TableScan,
+        LimitPushdownAccumulator, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
         DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind, IndexFileMeta,
-        IndexManifestEntry, IntType, Predicate, PredicateBuilder, PredicateOperator,
-        Schema as PaimonSchema, TableSchema, VarCharType,
+        IndexManifestEntry, IntType, ManifestFileMeta, Predicate, PredicateBuilder,
+        PredicateOperator, Schema as PaimonSchema, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
-    use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
+    use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, RowRange};
     use crate::table::stats_filter::{
         data_evolution_group_matches_predicates, data_file_matches_predicates,
         group_by_overlapping_row_id,
@@ -1717,6 +1920,39 @@ mod tests {
         let mut file = make_evo_file(name, 10, row_count, max_seq, Some(first_row_id));
         file.write_cols = Some(write_cols.iter().map(|col| (*col).to_string()).collect());
         file
+    }
+
+    #[test]
+    fn test_row_range_manifest_filters_fail_open_without_valid_metadata() {
+        let index = RowRangeIndex::create(vec![RowRange::new(10, 20)]);
+        let stats = BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new());
+
+        let outside = ManifestFileMeta::new("outside".to_string(), 1, 1, 0, stats.clone(), 0)
+            .with_row_id_stats(Some(30), Some(40));
+        let missing = ManifestFileMeta::new("missing".to_string(), 1, 1, 0, stats.clone(), 0);
+        let invalid = ManifestFileMeta::new("invalid".to_string(), 1, 1, 0, stats, 0)
+            .with_row_id_stats(Some(40), Some(30));
+
+        assert!(!manifest_file_overlaps_row_range_index(&outside, &index));
+        assert!(manifest_file_overlaps_row_range_index(&missing, &index));
+        assert!(manifest_file_overlaps_row_range_index(&invalid, &index));
+
+        assert!(!data_file_overlaps_row_range_index(
+            &make_evo_file("outside", 1, 5, 0, Some(30)),
+            &index
+        ));
+        assert!(data_file_overlaps_row_range_index(
+            &make_evo_file("missing", 1, 5, 0, None),
+            &index
+        ));
+        assert!(data_file_overlaps_row_range_index(
+            &make_evo_file("invalid", 1, 0, 0, Some(30)),
+            &index
+        ));
+        assert!(data_file_overlaps_row_range_index(
+            &make_evo_file("overflow", 1, 2, 0, Some(i64::MAX)),
+            &index
+        ));
     }
 
     fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
@@ -2194,6 +2430,64 @@ mod tests {
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(groups.len(), 1);
         assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_row_ranges_prune_normal_groups() {
+        let table_path = "memory:/de_row_range_prune_normal_groups";
+        let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "name"));
+        setup_scan_trace_dirs(&table).await;
+
+        TableCommit::new(table.clone(), "row-range-prune-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    make_evo_file("a-new", 10, 101, 2, Some(0)),
+                    make_evo_file("a-old", 10, 101, 1, Some(0)),
+                    make_evo_file("b-new", 10, 101, 4, Some(400)),
+                    make_evo_file("b-old", 10, 101, 3, Some(400)),
+                ],
+            )])
+            .await
+            .unwrap();
+
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_row_ranges(vec![RowRange::new(0, 0)]);
+        let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+        let planned_files = plan
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(planned_files, vec!["a-new", "a-old"]);
+        assert_eq!(trace.manifest_entries_read, 4);
+        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 2);
+        assert_eq!(trace.manifest_entries_after_manifest_filters, 2);
+        assert_eq!(trace.manifest_entries_after_merge, 2);
+        assert_eq!(trace.data_evolution_groups_before_stats, 1);
+        assert_eq!(trace.data_evolution_groups_pruned_by_row_ranges, 0);
+
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let delta_plan = read_builder
+            .new_scan()
+            .plan_snapshot_delta(&snapshot)
+            .await
+            .unwrap();
+        let delta_files = delta_plan
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(delta_files, vec!["a-new", "a-old"]);
     }
 
     #[tokio::test]
