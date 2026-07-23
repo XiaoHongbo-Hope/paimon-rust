@@ -55,6 +55,7 @@ enum PickPolicy {
 struct PickValueAgg {
     policy: PickPolicy,
     arrow_type: ArrowDataType,
+    initialized: bool,
     /// 1-row Arrow array holding the currently-winning value; `None` means
     /// no winning row has been observed yet for the current group.
     winner: Option<ArrayRef>,
@@ -65,26 +66,72 @@ impl PickValueAgg {
         Ok(Self {
             policy,
             arrow_type: paimon_type_to_arrow(data_type)?,
+            initialized: false,
             winner: None,
         })
     }
 
-    fn should_replace(&self, is_null: bool) -> bool {
-        match self.policy {
-            PickPolicy::Last => true,
-            PickPolicy::First => self.winner.is_none(),
-            PickPolicy::LastNonNull => !is_null,
-            PickPolicy::FirstNonNull => self.winner.is_none() && !is_null,
-        }
-    }
-
     fn reset(&mut self) {
+        self.initialized = false;
         self.winner = None;
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) {
-        if self.should_replace(array.is_null(row_idx)) {
-            self.winner = Some(array.slice(row_idx, 1));
+        let is_null = array.is_null(row_idx);
+        match self.policy {
+            PickPolicy::Last => {
+                self.winner = Some(array.slice(row_idx, 1));
+            }
+            PickPolicy::First if !self.initialized => {
+                self.initialized = true;
+                self.winner = Some(array.slice(row_idx, 1));
+            }
+            PickPolicy::LastNonNull if !is_null => {
+                self.winner = Some(array.slice(row_idx, 1));
+            }
+            PickPolicy::FirstNonNull if !self.initialized && !is_null => {
+                self.initialized = true;
+                self.winner = Some(array.slice(row_idx, 1));
+            }
+            _ => {}
+        }
+    }
+
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) {
+        let is_null = array.is_null(row_idx);
+        match self.policy {
+            // Java default: last_value.agg(input, accumulator) returns the
+            // existing accumulator.
+            PickPolicy::Last => {}
+            // Java first_value returns the older input once the aggregator has
+            // already been initialized by the current accumulator.
+            PickPolicy::First => {
+                if self.initialized {
+                    self.winner = Some(array.slice(row_idx, 1));
+                } else {
+                    self.initialized = true;
+                }
+            }
+            // Java last_non_null_value keeps a non-null accumulator, otherwise
+            // it falls back to the older input.
+            PickPolicy::LastNonNull => {
+                if self.winner.is_none() && !is_null {
+                    self.winner = Some(array.slice(row_idx, 1));
+                }
+            }
+            // Preserve Java's stateful first_non_null_value behavior for
+            // aggReversed(accumulator, input) == agg(input, accumulator).
+            PickPolicy::FirstNonNull => {
+                let current_is_non_null = self
+                    .winner
+                    .as_ref()
+                    .is_some_and(|winner| !winner.is_null(0));
+                if !self.initialized && current_is_non_null {
+                    self.initialized = true;
+                } else {
+                    self.winner = Some(array.slice(row_idx, 1));
+                }
+            }
         }
     }
 
@@ -116,6 +163,10 @@ macro_rules! pick_agg {
             }
             fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
                 self.0.agg(array, row_idx);
+                Ok(())
+            }
+            fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+                self.0.agg_reversed(array, row_idx);
                 Ok(())
             }
             fn result(&self) -> crate::Result<ArrayRef> {
@@ -236,5 +287,54 @@ mod tests {
         agg.agg(&arr, 0).unwrap();
         agg.reset();
         assert!(agg.result().unwrap().is_null(0));
+    }
+
+    #[test]
+    fn test_last_value_reversed_keeps_current_value() {
+        let mut agg = LastValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![Some(10), Some(5)]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(10));
+    }
+
+    #[test]
+    fn test_first_value_reversed_uses_older_null() {
+        let mut agg = FirstValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![Some(10), None]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), None);
+    }
+
+    #[test]
+    fn test_last_non_null_reversed_fills_only_empty_accumulator() {
+        let mut agg = LastNonNullValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![None, Some(5), Some(3)]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        agg.agg_reversed(&arr, 2).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(5));
+    }
+
+    #[test]
+    fn test_first_non_null_reversed_matches_java_initialized_state() {
+        let mut agg = FirstNonNullValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![None, Some(7), Some(5)]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        agg.agg_reversed(&arr, 2).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(7));
+    }
+
+    #[test]
+    fn test_first_non_null_reversed_after_forward_initialization_uses_older_input() {
+        let mut agg = FirstNonNullValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![Some(10), None, Some(5)]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), None);
+        agg.agg_reversed(&arr, 2).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(5));
     }
 }

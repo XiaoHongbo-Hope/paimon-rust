@@ -67,6 +67,14 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// Accumulate one input cell.
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
 
+    /// Accumulate an input that sorts before the current accumulator.
+    ///
+    /// This mirrors Java `FieldAggregator#aggReversed(accumulator, input)`,
+    /// whose default semantics are `agg(input, accumulator)`. Implementations
+    /// must define this explicitly so order-sensitive aggregators cannot
+    /// silently fall back to forward accumulation.
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
+
     /// Materialize the current accumulator as a 1-row Arrow array.
     fn result(&self) -> crate::Result<ArrayRef>;
 }

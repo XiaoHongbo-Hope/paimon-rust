@@ -25,7 +25,7 @@
 //! produce misleading aggregated values.  A Decimal `sum` whose result no
 //! longer fits the declared precision yields a NULL cell, matching Java
 //! `DecimalUtils.add` / `Decimal.fromBigDecimal` (which return null on
-//! precision overflow rather than throwing).
+//! precision or backing `i128` overflow rather than throwing).
 //!
 //! `min` / `max` extend to every ordered Paimon type: numerics, Decimal,
 //! Date, Time, Timestamp, and Char/VarChar.  Comparison is by native value
@@ -166,17 +166,35 @@ impl FieldAggregator for SumAgg {
                 let v = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(acc.map_or(v, |prev| prev + v));
             }
-            SumState::Decimal128 { acc, .. } => {
+            SumState::Decimal128 { precision, acc, .. } => {
                 let v = downcast::<Decimal128Array>(array, &self.field_name)?.value(row_idx);
-                *acc = Some(match *acc {
-                    None => v,
-                    Some(prev) => prev
-                        .checked_add(v)
-                        .ok_or_else(|| overflow_error("sum", &self.field_name))?,
-                });
+                let next = match *acc {
+                    None => Some(v),
+                    Some(prev) => prev.checked_add(v),
+                };
+                *acc = next.filter(|value| decimal_fits_precision(*value, *precision));
             }
         }
         Ok(())
+    }
+
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        match &mut self.state {
+            SumState::F32(acc) => {
+                let v = downcast::<Float32Array>(array, &self.field_name)?.value(row_idx);
+                *acc = Some(acc.map_or(v, |prev| v + prev));
+                Ok(())
+            }
+            SumState::F64(acc) => {
+                let v = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
+                *acc = Some(acc.map_or(v, |prev| v + prev));
+                Ok(())
+            }
+            _ => self.agg(array, row_idx),
+        }
     }
 
     fn result(&self) -> crate::Result<ArrayRef> {
@@ -194,8 +212,9 @@ impl FieldAggregator for SumAgg {
             } => {
                 // Java parity: `DecimalUtils.add` -> `Decimal.fromBigDecimal`
                 // returns null when the summed value no longer fits the
-                // declared precision, so an overflowing sum yields a NULL cell
-                // rather than a silently out-of-range Decimal.
+                // declared precision (or the backing i128), so an overflowing
+                // sum yields a NULL cell rather than a silently out-of-range
+                // Decimal.
                 let fitted = acc.filter(|v| decimal_fits_precision(*v, *precision));
                 decimal_array(*precision, *scale, fitted, "sum", &self.field_name)?
             }
@@ -328,6 +347,25 @@ impl FieldAggregator for ProductAgg {
         Ok(())
     }
 
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        match &mut self.state {
+            ProductState::F32(acc) => {
+                let v = downcast::<Float32Array>(array, &self.field_name)?.value(row_idx);
+                *acc = Some(acc.map_or(v, |prev| v * prev));
+                Ok(())
+            }
+            ProductState::F64(acc) => {
+                let v = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
+                *acc = Some(acc.map_or(v, |prev| v * prev));
+                Ok(())
+            }
+            _ => self.agg(array, row_idx),
+        }
+    }
+
     fn result(&self) -> crate::Result<ArrayRef> {
         Ok(match &self.state {
             ProductState::I8(acc) => Arc::new(Int8Array::from(vec![*acc])),
@@ -415,6 +453,7 @@ fn agg_minmax(
     row_idx: usize,
     field_name: &str,
     keep_smaller: bool,
+    reversed: bool,
 ) -> crate::Result<()> {
     if array.is_null(row_idx) {
         return Ok(());
@@ -425,7 +464,18 @@ fn agg_minmax(
             *$acc = Some(match *$acc {
                 None => v,
                 Some(prev) => {
-                    if (keep_smaller && v < prev) || (!keep_smaller && v > prev) {
+                    let take_new = if keep_smaller {
+                        if reversed {
+                            v < prev
+                        } else {
+                            v <= prev
+                        }
+                    } else if reversed {
+                        v >= prev
+                    } else {
+                        v > prev
+                    };
+                    if take_new {
                         v
                     } else {
                         prev
@@ -451,8 +501,16 @@ fn agg_minmax(
                         (false, false) => v.total_cmp(&prev),
                     };
                     let take_new = if keep_smaller {
-                        // Java `FieldMinAgg` returns the input on ties.
-                        cmp.is_le()
+                        if reversed {
+                            cmp.is_lt()
+                        } else {
+                            // Java `FieldMinAgg` returns the input on ties.
+                            cmp.is_le()
+                        }
+                    } else if reversed {
+                        // Reversed max treats the older input as the
+                        // accumulator, so ties select it.
+                        cmp.is_ge()
                     } else {
                         // Java `FieldMaxAgg` retains the accumulator on ties.
                         cmp.is_gt()
@@ -495,7 +553,13 @@ fn agg_minmax(
                 None => v.to_string(),
                 Some(prev) => {
                     let take_new = if keep_smaller {
-                        v < prev.as_str()
+                        if reversed {
+                            v < prev.as_str()
+                        } else {
+                            v <= prev.as_str()
+                        }
+                    } else if reversed {
+                        v >= prev.as_str()
                     } else {
                         v > prev.as_str()
                     };
@@ -584,7 +648,25 @@ impl FieldAggregator for MinAgg {
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        agg_minmax(&mut self.state, array, row_idx, &self.field_name, true)
+        agg_minmax(
+            &mut self.state,
+            array,
+            row_idx,
+            &self.field_name,
+            true,
+            false,
+        )
+    }
+
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        agg_minmax(
+            &mut self.state,
+            array,
+            row_idx,
+            &self.field_name,
+            true,
+            true,
+        )
     }
 
     fn result(&self) -> crate::Result<ArrayRef> {
@@ -617,7 +699,25 @@ impl FieldAggregator for MaxAgg {
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        agg_minmax(&mut self.state, array, row_idx, &self.field_name, false)
+        agg_minmax(
+            &mut self.state,
+            array,
+            row_idx,
+            &self.field_name,
+            false,
+            false,
+        )
+    }
+
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        agg_minmax(
+            &mut self.state,
+            array,
+            row_idx,
+            &self.field_name,
+            false,
+            true,
+        )
     }
 
     fn result(&self) -> crate::Result<ArrayRef> {
@@ -870,6 +970,86 @@ mod tests {
     }
 
     #[test]
+    fn test_sum_decimal_recovers_after_intermediate_precision_overflow() {
+        let mut agg = sum_agg(DataType::Decimal(DecimalType::new(3, 0).unwrap()));
+        let mut builder = Decimal128Builder::with_capacity(3)
+            .with_precision_and_scale(3, 0)
+            .unwrap();
+        builder.append_value(900);
+        builder.append_value(200);
+        builder.append_value(-200);
+        let arr = builder.finish();
+
+        for i in 0..arr.len() {
+            agg.agg(&arr, i).unwrap();
+        }
+
+        let result = agg.result().unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            -200
+        );
+    }
+
+    #[test]
+    fn test_sum_decimal_recovers_after_intermediate_i128_overflow() {
+        let mut agg = sum_agg(DataType::Decimal(DecimalType::new(38, 0).unwrap()));
+        let max_decimal = 10_i128.pow(38) - 1;
+        let mut builder = Decimal128Builder::with_capacity(3)
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        builder.append_value(max_decimal);
+        builder.append_value(max_decimal);
+        builder.append_value(-max_decimal);
+        let arr = builder.finish();
+
+        for i in 0..arr.len() {
+            agg.agg(&arr, i).unwrap();
+        }
+
+        let result = agg.result().unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            -max_decimal
+        );
+    }
+
+    #[test]
+    fn test_sum_decimal_reversed_recovers_after_intermediate_i128_overflow() {
+        let mut agg = sum_agg(DataType::Decimal(DecimalType::new(38, 0).unwrap()));
+        let max_decimal = 10_i128.pow(38) - 1;
+        let mut builder = Decimal128Builder::with_capacity(3)
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        builder.append_value(max_decimal);
+        builder.append_value(max_decimal);
+        builder.append_value(-max_decimal);
+        let arr = builder.finish();
+
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        agg.agg_reversed(&arr, 2).unwrap();
+
+        let result = agg.result().unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            -max_decimal
+        );
+    }
+
+    #[test]
     fn test_product_int_aggregates() {
         let mut agg = ProductAgg::new("v", &DataType::Int(IntType::new())).unwrap();
         let arr = Int32Array::from(vec![Some(2), None, Some(3), Some(4)]);
@@ -877,6 +1057,15 @@ mod tests {
             agg.agg(&arr, i).unwrap();
         }
         assert_eq!(collect_i32(agg.result().unwrap()), Some(24));
+    }
+
+    #[test]
+    fn test_product_reversed_aggregates_input() {
+        let mut agg = ProductAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![Some(2), Some(3)]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(6));
     }
 
     #[test]
@@ -1022,6 +1211,41 @@ mod tests {
             assert_eq!(aggregate(&values, true).to_bits(), values[1].to_bits());
             assert_eq!(aggregate(&values, false).to_bits(), values[0].to_bits());
         }
+    }
+
+    #[test]
+    fn test_min_max_reversed_nan_ties_match_java_operand_order() {
+        let current = f32::from_bits(0xffc0_0001);
+        let older = f32::from_bits(0x7fc0_0002);
+        let arr = Float32Array::from(vec![Some(current), Some(older)]);
+
+        let mut min = min_agg(DataType::Float(FloatType::new()));
+        min.agg(&arr, 0).unwrap();
+        min.agg_reversed(&arr, 1).unwrap();
+        let min_result = min.result().unwrap();
+        assert_eq!(
+            min_result
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0)
+                .to_bits(),
+            current.to_bits()
+        );
+
+        let mut max = max_agg(DataType::Float(FloatType::new()));
+        max.agg(&arr, 0).unwrap();
+        max.agg_reversed(&arr, 1).unwrap();
+        let max_result = max.result().unwrap();
+        assert_eq!(
+            max_result
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0)
+                .to_bits(),
+            older.to_bits()
+        );
     }
 
     #[test]

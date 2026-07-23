@@ -43,6 +43,23 @@ fn list_agg_delimiter<'a>(field_name: &str, options: &'a HashMap<String, String>
         .unwrap_or(DEFAULT_DELIMITER)
 }
 
+fn java_is_blank(value: &str) -> bool {
+    value.chars().all(|ch| {
+        matches!(
+            ch,
+            '\u{0009}'..='\u{000d}'
+                | '\u{001c}'..='\u{0020}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{2006}'
+                | '\u{2008}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{205f}'
+                | '\u{3000}'
+        )
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct ListaggAgg {
     field_name: String,
@@ -103,6 +120,9 @@ impl FieldAggregator for ListaggAgg {
                 source: None,
             })?;
         let v = arr.value(row_idx);
+        if java_is_blank(v) {
+            return Ok(());
+        }
         match &mut self.acc {
             None => self.acc = Some(v.to_string()),
             Some(prev) => {
@@ -110,6 +130,32 @@ impl FieldAggregator for ListaggAgg {
                 prev.push_str(v);
             }
         }
+        Ok(())
+    }
+
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        let arr = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
+                    self.field_name,
+                    array.data_type()
+                ),
+                source: None,
+            })?;
+        let value = arr.value(row_idx);
+        if java_is_blank(value) {
+            return Ok(());
+        }
+        self.acc = Some(match self.acc.take() {
+            None => value.to_string(),
+            Some(current) => format!("{value}{}{current}", self.delimiter),
+        });
         Ok(())
     }
 
@@ -140,7 +186,7 @@ mod tests {
     #[test]
     fn test_listagg_default_delimiter_skips_null() {
         let mut agg = ListaggAgg::new("v", &varchar_type(), &HashMap::new()).unwrap();
-        let arr = StringArray::from(vec![Some("a"), None, Some("b"), Some("c")]);
+        let arr = StringArray::from(vec![Some("a"), None, Some(" "), Some("b"), Some("c")]);
         for i in 0..arr.len() {
             agg.agg(&arr, i).unwrap();
         }
@@ -227,5 +273,25 @@ mod tests {
         agg.agg(&arr, 0).unwrap();
         agg.reset();
         assert_eq!(collect(agg.result().unwrap()), None);
+    }
+
+    #[test]
+    fn test_listagg_reversed_prepends_non_blank_value() {
+        let mut agg = ListaggAgg::new("v", &varchar_type(), &HashMap::new()).unwrap();
+        let arr = StringArray::from(vec![Some("b"), Some("a"), Some(" ")]);
+        agg.agg(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
+        agg.agg_reversed(&arr, 2).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("a,b".to_string()));
+    }
+
+    #[test]
+    fn test_listagg_java_blank_semantics_preserve_non_breaking_space() {
+        let mut agg = ListaggAgg::new("v", &varchar_type(), &HashMap::new()).unwrap();
+        let arr = StringArray::from(vec![Some(" "), Some("\u{00a0}")]);
+        for i in 0..arr.len() {
+            agg.agg(&arr, i).unwrap();
+        }
+        assert_eq!(collect(agg.result().unwrap()), Some("\u{00a0}".to_string()));
     }
 }

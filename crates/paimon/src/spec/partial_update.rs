@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::aggregation::{is_known_aggregator_name, validate_aggregator_for_type};
 use crate::spec::DataField;
 
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
@@ -32,6 +33,11 @@ const FIELDS_DEFAULT_AGG_FUNCTION_OPTION: &str = "fields.default-aggregate-funct
 const FIELDS_PREFIX: &str = "fields.";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
 const AGGREGATION_FUNCTION_SUFFIX: &str = ".aggregate-function";
+const LIST_AGG_DELIMITER_SUFFIX: &str = ".list-agg-delimiter";
+const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
+const DISTINCT_SUFFIX: &str = ".distinct";
+const NESTED_KEY_SUFFIX: &str = ".nested-key";
+const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
 
 /// Partial-update mode recognized by the current Rust implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +63,8 @@ impl SequenceGroup {
 
 /// Partial-update-specific option inspection and validation.
 ///
-/// Reads support basic partial update and sequence groups. Table creation and
-/// writes remain restricted to basic partial update.
+/// Reads support basic partial update, sequence groups, and field aggregation.
+/// Table creation and writes remain restricted to basic partial update.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PartialUpdateConfig<'a> {
     options: &'a HashMap<String, String>,
@@ -243,6 +249,120 @@ impl<'a> PartialUpdateConfig<'a> {
         Ok(required)
     }
 
+    pub(crate) fn validated_aggregate_functions(
+        &self,
+        fields: &[DataField],
+        primary_keys: &[String],
+    ) -> crate::Result<HashMap<String, String>> {
+        let groups = self.validated_sequence_groups(fields, primary_keys)?;
+        let sequence_fields: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.sequence_fields.iter().map(String::as_str))
+            .collect();
+        let protected_fields: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.protected_fields.iter().map(String::as_str))
+            .collect();
+        let field_names: HashSet<&str> = fields.iter().map(DataField::name).collect();
+        let primary_keys: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+
+        for (key, value) in self
+            .options
+            .iter()
+            .filter(|(key, _)| is_fields_option_with_suffix(key, LIST_AGG_DELIMITER_SUFFIX))
+        {
+            let field_name = key
+                .strip_prefix(FIELDS_PREFIX)
+                .and_then(|key| key.strip_suffix(LIST_AGG_DELIMITER_SUFFIX))
+                .filter(|field| !field.is_empty())
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Invalid partial-update listagg option '{key}={value}'"),
+                })?;
+            if !field_names.contains(field_name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Aggregation field '{field_name}' referenced by '{key}' is not declared \
+                         in the table schema"
+                    ),
+                });
+            }
+        }
+
+        let mut per_field = HashMap::new();
+        for (key, value) in self
+            .options
+            .iter()
+            .filter(|(key, _)| is_fields_option_with_suffix(key, AGGREGATION_FUNCTION_SUFFIX))
+        {
+            let field_name = key
+                .strip_prefix(FIELDS_PREFIX)
+                .and_then(|key| key.strip_suffix(AGGREGATION_FUNCTION_SUFFIX))
+                .filter(|field| !field.is_empty())
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid partial-update aggregate-function option '{key}={value}'"
+                    ),
+                })?;
+            if !field_names.contains(field_name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Aggregation field '{field_name}' referenced by '{key}' is not declared \
+                         in the table schema"
+                    ),
+                });
+            }
+            if !is_known_aggregator_name(value) {
+                validate_aggregator_for_type(
+                    value,
+                    field_name,
+                    fields
+                        .iter()
+                        .find(|field| field.name() == field_name)
+                        .expect("field existence checked above")
+                        .data_type(),
+                )?;
+            }
+            per_field.insert(field_name, value.as_str());
+        }
+
+        let default = self
+            .options
+            .get(FIELDS_DEFAULT_AGG_FUNCTION_OPTION)
+            .map(String::as_str);
+        if let Some(default) = default {
+            if !is_known_aggregator_name(default) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Unknown aggregate function '{default}' configured via \
+                         '{FIELDS_DEFAULT_AGG_FUNCTION_OPTION}'"
+                    ),
+                });
+            }
+        }
+
+        let mut functions = HashMap::new();
+        for field in fields {
+            let field_name = field.name();
+            if sequence_fields.contains(field_name) || primary_keys.contains(field_name) {
+                continue;
+            }
+            let Some(function) = per_field.get(field_name).copied().or(default) else {
+                continue;
+            };
+            validate_aggregator_for_type(function, field_name, field.data_type())?;
+            if function != "last_non_null_value" && !protected_fields.contains(field_name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Must use sequence group for aggregate function '{function}' on field \
+                         '{field_name}'"
+                    ),
+                });
+            }
+            functions.insert(field_name.to_string(), function.to_string());
+        }
+        Ok(functions)
+    }
+
     fn validated_mode(
         &self,
         has_primary_keys: bool,
@@ -277,6 +397,9 @@ impl<'a> PartialUpdateConfig<'a> {
             .filter(|key| {
                 is_unsupported_partial_update_option(key)
                     && !is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
+                    && !is_fields_option_with_suffix(key, AGGREGATION_FUNCTION_SUFFIX)
+                    && !is_fields_option_with_suffix(key, LIST_AGG_DELIMITER_SUFFIX)
+                    && key.as_str() != FIELDS_DEFAULT_AGG_FUNCTION_OPTION
             })
             .cloned()
             .collect();
@@ -294,6 +417,11 @@ fn is_unsupported_partial_update_option(key: &str) -> bool {
         || key == FIELDS_DEFAULT_AGG_FUNCTION_OPTION
         || is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
         || is_fields_option_with_suffix(key, AGGREGATION_FUNCTION_SUFFIX)
+        || is_fields_option_with_suffix(key, LIST_AGG_DELIMITER_SUFFIX)
+        || is_fields_option_with_suffix(key, IGNORE_RETRACT_SUFFIX)
+        || is_fields_option_with_suffix(key, DISTINCT_SUFFIX)
+        || is_fields_option_with_suffix(key, NESTED_KEY_SUFFIX)
+        || is_fields_option_with_suffix(key, COUNT_LIMIT_SUFFIX)
 }
 
 fn is_fields_option_with_suffix(key: &str, suffix: &str) -> bool {
@@ -395,6 +523,11 @@ mod tests {
             "fields.price.ignore-delete",
             "fields.price.sequence-group",
             "fields.price.aggregate-function",
+            "fields.price.list-agg-delimiter",
+            "fields.price.ignore-retract",
+            "fields.price.distinct",
+            "fields.price.nested-key",
+            "fields.price.count-limit",
             FIELDS_DEFAULT_AGG_FUNCTION_OPTION,
         ] {
             let options = partial_update_options(&[(key, "value")]);
@@ -431,6 +564,51 @@ mod tests {
             config.validate_read_mode(true, "default.t").unwrap(),
             Some(PartialUpdateMode::SequenceGroup)
         );
+    }
+
+    #[test]
+    fn test_validate_read_mode_accepts_field_aggregation() {
+        let options =
+            partial_update_options(&[("fields.price.aggregate-function", "last_non_null_value")]);
+        let config = PartialUpdateConfig::new(&options);
+
+        assert_eq!(
+            config.validate_read_mode(true, "default.t").unwrap(),
+            Some(PartialUpdateMode::Basic)
+        );
+    }
+
+    #[test]
+    fn test_validate_read_mode_accepts_sequence_group_field_aggregation() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "price"),
+            ("fields.price.aggregate-function", "sum"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+
+        assert_eq!(
+            config.validate_read_mode(true, "default.t").unwrap(),
+            Some(PartialUpdateMode::SequenceGroup)
+        );
+    }
+
+    #[test]
+    fn test_validate_read_mode_rejects_unsupported_aggregation_modifiers() {
+        for key in [
+            "fields.price.ignore-retract",
+            "fields.price.distinct",
+            "fields.price.nested-key",
+            "fields.price.count-limit",
+        ] {
+            let options = partial_update_options(&[(key, "value")]);
+            let config = PartialUpdateConfig::new(&options);
+            let err = config.validate_read_mode(true, "default.t").unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message } if message.contains(key)),
+                "expected read-time rejection to mention '{key}', got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -562,6 +740,197 @@ mod tests {
                 "source_order".to_string(),
                 "profile_version".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_accepts_last_non_null_without_sequence_group() {
+        let options =
+            partial_update_options(&[("fields.price.aggregate-function", "last_non_null_value")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        assert_eq!(
+            config
+                .validated_aggregate_functions(&fields, &["id".to_string()])
+                .unwrap(),
+            HashMap::from([("price".to_string(), "last_non_null_value".to_string())])
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_non_last_without_sequence_group() {
+        let options = partial_update_options(&[("fields.price.aggregate-function", "sum")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sum")
+                    && message.contains("price")
+                    && message.contains("sequence group")),
+            "expected missing sequence-group error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_unknown_function() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "price"),
+            ("fields.price.aggregate-function", "sume"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sume") && message.contains("price")),
+            "expected unknown function error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_unknown_field() {
+        let options =
+            partial_update_options(&[("fields.prcie.aggregate-function", "last_non_null_value")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("prcie")
+                    && message.contains("fields.prcie.aggregate-function")),
+            "expected unknown field error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_unknown_listagg_delimiter_field() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "tag"),
+            ("fields.tag.aggregate-function", "listagg"),
+            ("fields.tga.list-agg-delimiter", "|"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "tag".to_string(),
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+            ),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("tga")
+                    && message.contains("fields.tga.list-agg-delimiter")),
+            "expected unknown delimiter field error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_incompatible_type() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "name"),
+            ("fields.name.aggregate-function", "sum"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "name".to_string(),
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+            ),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sum") && message.contains("name")),
+            "expected incompatible type error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_default_aggregate_function_applies_to_protected_fields() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "price"),
+            (FIELDS_DEFAULT_AGG_FUNCTION_OPTION, "sum"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        assert_eq!(
+            config
+                .validated_aggregate_functions(&fields, &["id".to_string()])
+                .unwrap(),
+            HashMap::from([("price".to_string(), "sum".to_string())])
+        );
+    }
+
+    #[test]
+    fn test_per_field_aggregate_function_overrides_default() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "price"),
+            ("fields.price.aggregate-function", "sum"),
+            (FIELDS_DEFAULT_AGG_FUNCTION_OPTION, "last_non_null_value"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "note".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        assert_eq!(
+            config
+                .validated_aggregate_functions(&fields, &["id".to_string()])
+                .unwrap(),
+            HashMap::from([
+                ("price".to_string(), "sum".to_string()),
+                ("note".to_string(), "last_non_null_value".to_string()),
+            ])
         );
     }
 }

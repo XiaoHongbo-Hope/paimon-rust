@@ -533,10 +533,12 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema};
+    use crate::spec::{
+        DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema, VarCharType,
+    };
     use crate::table::table_commit::TableCommit;
     use crate::table::{Table, TableWrite};
-    use arrow_array::{Array, Int32Array};
+    use arrow_array::{Array, Int32Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use std::sync::Arc;
@@ -1314,6 +1316,105 @@ mod tests {
                     .map(|field| field.name().as_str())
                     .collect::<Vec<_>>(),
                 vec!["id", "value_a", "value_b"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_read_partial_update_sequence_group_aggregation_with_projection() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_partial_update_sequence_group_aggregation";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("version", DataType::Int(IntType::new()))
+            .column("value", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_partial_update_sequence_group_aggregation_t"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("version", ArrowDataType::Int32, true),
+            ArrowField::new("value", ArrowDataType::Utf8, true),
+        ]));
+        let make = |id, version, value| {
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![id])),
+                    Arc::new(Int32Array::from(vec![version])),
+                    Arc::new(StringArray::from(vec![value])),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &make(1, 10, "b")).await;
+        write_commit(&table, &make(1, 9, "a")).await;
+        write_commit(&table, &make(1, 11, "c")).await;
+        write_commit(&table, &make(2, 5, "x")).await;
+        write_commit(&table, &make(2, 6, "y")).await;
+
+        let aggregation_schema = table.schema().copy_with_options(HashMap::from([
+            (
+                "fields.version.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "listagg".to_string(),
+            ),
+        ]));
+        let aggregation_table = Table::new(
+            file_io,
+            Identifier::new("default", "kv_partial_update_sequence_group_aggregation_t"),
+            table_path.to_string(),
+            aggregation_schema,
+            None,
+        );
+
+        let batches = read_rows(&aggregation_table, Some(&["id", "value"]), None).await;
+
+        let mut rows = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(batch.schema().index_of("id").unwrap())
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let index = batch.schema().index_of("value").unwrap();
+                let array = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..array.len())
+                    .map(|row| (ids.value(row), array.value(row).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.0);
+        assert_eq!(rows, vec![(1, "a,b,c".to_string()), (2, "x,y".to_string())]);
+        for batch in batches {
+            assert_eq!(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["id", "value"]
             );
         }
     }

@@ -82,6 +82,10 @@ impl FieldAggregator for BoolAndAgg {
         Ok(())
     }
 
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.agg(array, row_idx)
+    }
+
     fn result(&self) -> crate::Result<ArrayRef> {
         Ok(Arc::new(BooleanArray::from(vec![self.acc])))
     }
@@ -130,6 +134,10 @@ impl FieldAggregator for BoolOrAgg {
         let v = arr.value(row_idx);
         self.acc = Some(self.acc.map_or(v, |prev| prev || v));
         Ok(())
+    }
+
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.agg(array, row_idx)
     }
 
     fn result(&self) -> crate::Result<ArrayRef> {
@@ -195,6 +203,21 @@ mod tests {
             or_agg.agg(&arr, i).unwrap();
         }
         assert_eq!(collect(or_agg.result().unwrap()), None);
+    }
+
+    #[test]
+    fn test_bool_aggregators_accept_reversed_inputs() {
+        let arr = BooleanArray::from(vec![Some(true), Some(false)]);
+
+        let mut and_agg = BoolAndAgg::new("b", &DataType::Boolean(BooleanType::new())).unwrap();
+        and_agg.agg(&arr, 0).unwrap();
+        and_agg.agg_reversed(&arr, 1).unwrap();
+        assert_eq!(collect(and_agg.result().unwrap()), Some(false));
+
+        let mut or_agg = BoolOrAgg::new("b", &DataType::Boolean(BooleanType::new())).unwrap();
+        or_agg.agg(&arr, 1).unwrap();
+        or_agg.agg_reversed(&arr, 0).unwrap();
+        assert_eq!(collect(or_agg.result().unwrap()), Some(true));
     }
 
     #[test]

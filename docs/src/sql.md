@@ -1894,8 +1894,22 @@ composite sequence fields, multiple independent groups, and projected reads are
 supported. Rows whose sequence tuple is entirely null do not update the group;
 an accepted group update can set protected fields to null. Rust table creation
 and writes still reject sequence-group options because write-side group merging
-is not implemented. Partial aggregation inside sequence groups and
-remove-record options are also not supported.
+is not implemented.
+
+Existing partial-update tables may also configure
+`fields.<field>.aggregate-function` or
+`fields.default-aggregate-function`. Rust supports the same aggregate-function
+set as the basic aggregation engine: `sum`, `product`, `min`, `max`,
+`last_value`, `first_value`, `last_non_null_value`,
+`first_non_null_value`, `bool_and`, `bool_or`, and `listagg`.
+`last_non_null_value` may be used without a sequence group; other functions
+require the target field to be protected by a sequence group. When an older
+group sequence arrives after a newer one, order-sensitive functions use Java
+compatible reversed aggregation. Unknown functions and incompatible
+function/type combinations fail closed. Rust table creation and writes still
+reject partial-update aggregation options.
+
+Partial-update remove-record options and retract semantics are not supported.
 
 Rust can read fully materialized compacted files from deletion-vector-enabled
 partial-update and aggregation tables. Every split must be raw-convertible,

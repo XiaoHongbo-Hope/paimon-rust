@@ -182,17 +182,24 @@ impl MergeFunction for DeduplicateMergeFunction {
     }
 }
 
-/// Basic partial-update merge: for each non-key column, keep the latest
-/// non-null value ordered by user sequence (if configured) then system sequence.
+/// Partial-update merge: for each non-key column, keep the latest non-null
+/// value or apply its configured field aggregator.
+///
+/// Sequence-group aggregators use forward accumulation when the incoming
+/// group sequence is newer or equal and reversed accumulation when it is
+/// older, matching Java `PartialUpdateMergeFunction`.
 ///
 /// DELETE / UPDATE_BEFORE rows are ignored when `ignore-delete=true` and
 /// treated as unsupported otherwise.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
     sequence_groups: Vec<RuntimeSequenceGroup>,
     grouped_fields: HashSet<usize>,
+    aggregators: Option<Mutex<FieldAggregatorSlots>>,
 }
+
+type FieldAggregatorSlots = Vec<Option<Box<dyn FieldAggregator>>>;
 
 #[derive(Debug, Clone)]
 struct RuntimeSequenceGroup {
@@ -211,6 +218,7 @@ impl PartialUpdateMergeFunction {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
             sequence_groups: Vec::new(),
             grouped_fields: HashSet::new(),
+            aggregators: None,
         })
     }
 
@@ -224,6 +232,8 @@ impl PartialUpdateMergeFunction {
         let config = PartialUpdateConfig::new(table_options);
         config.validate_read_mode(true, table_name)?;
         let groups = config.validated_sequence_groups(table_fields, primary_keys)?;
+        let aggregate_functions =
+            config.validated_aggregate_functions(table_fields, primary_keys)?;
         let field_indices: HashMap<&str, usize> = output_fields
             .iter()
             .enumerate()
@@ -275,11 +285,29 @@ impl PartialUpdateMergeFunction {
             })
             .copied()
             .collect();
+        let aggregators = output_fields
+            .iter()
+            .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
+                let Some(function) = aggregate_functions.get(field.name()) else {
+                    return Ok(None);
+                };
+                Ok(Some(new_aggregator(
+                    function,
+                    field.name(),
+                    field.data_type(),
+                    table_options,
+                )?))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
             sequence_groups,
             grouped_fields,
+            aggregators: aggregators
+                .iter()
+                .any(Option::is_some)
+                .then(|| Mutex::new(aggregators)),
         })
     }
 }
@@ -309,6 +337,18 @@ impl MergeFunction for PartialUpdateMergeFunction {
             vec![None; output_schema.fields().len()];
         let mut group_sequence_rows: Vec<Option<(usize, usize)>> =
             vec![None; self.sequence_groups.len()];
+        let mut aggregators = match &self.aggregators {
+            Some(aggregators) => Some(aggregators.lock().map_err(|e| Error::UnexpectedError {
+                message: format!("PartialUpdateMergeFunction aggregator mutex poisoned: {e}"),
+                source: None,
+            })?),
+            None => None,
+        };
+        if let Some(aggregators) = aggregators.as_mut() {
+            for aggregator in aggregators.iter_mut().flatten() {
+                aggregator.reset();
+            }
+        }
         let mut saw_add = false;
 
         for row_idx in ordered_row_indices {
@@ -329,7 +369,13 @@ impl MergeFunction for PartialUpdateMergeFunction {
                 }
                 let source_array = batch_buffer[row.batch_idx]
                     .column_for_output(output_col_idx, source_output_col_indices);
-                if !source_array.is_null(row.row_idx) {
+                if let Some(aggregator) = aggregators
+                    .as_mut()
+                    .and_then(|aggregators| aggregators.get_mut(output_col_idx))
+                    .and_then(Option::as_mut)
+                {
+                    aggregator.agg(source_array, row.row_idx)?;
+                } else if !source_array.is_null(row.row_idx) {
                     *selected = Some((row.batch_idx, row.row_idx));
                 }
             }
@@ -344,8 +390,8 @@ impl MergeFunction for PartialUpdateMergeFunction {
                     continue;
                 }
 
-                let should_advance = match group_sequence_rows[group_idx] {
-                    None => true,
+                let sequence_ordering = match group_sequence_rows[group_idx] {
+                    None => Ordering::Greater,
                     Some((current_batch_idx, current_row_idx)) => compare_sequence_group_rows(
                         row.batch_idx,
                         row.row_idx,
@@ -354,18 +400,34 @@ impl MergeFunction for PartialUpdateMergeFunction {
                         &group.sequence_indices,
                         batch_buffer,
                         source_output_col_indices,
-                    )?
-                    .is_ge(),
+                    )?,
                 };
+                let should_advance = sequence_ordering.is_ge();
+
+                for &output_col_idx in &group.protected_indices {
+                    if let Some(aggregator) = aggregators
+                        .as_mut()
+                        .and_then(|aggregators| aggregators.get_mut(output_col_idx))
+                        .and_then(Option::as_mut)
+                    {
+                        let source_array = batch_buffer[row.batch_idx]
+                            .column_for_output(output_col_idx, source_output_col_indices);
+                        if should_advance {
+                            aggregator.agg(source_array, row.row_idx)?;
+                        } else {
+                            aggregator.agg_reversed(source_array, row.row_idx)?;
+                        }
+                    } else if should_advance {
+                        selected_by_col[output_col_idx] = Some((row.batch_idx, row.row_idx));
+                    }
+                }
+
                 if !should_advance {
                     continue;
                 }
 
                 group_sequence_rows[group_idx] = Some((row.batch_idx, row.row_idx));
                 for &output_col_idx in &group.sequence_indices {
-                    selected_by_col[output_col_idx] = Some((row.batch_idx, row.row_idx));
-                }
-                for &output_col_idx in &group.protected_indices {
                     selected_by_col[output_col_idx] = Some((row.batch_idx, row.row_idx));
                 }
             }
@@ -380,23 +442,29 @@ impl MergeFunction for PartialUpdateMergeFunction {
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                Ok(match selected_by_col[output_col_idx] {
-                    Some((batch_idx, row_idx)) => batch_buffer[batch_idx]
-                        .column_for_output(output_col_idx, source_output_col_indices)
-                        .slice(row_idx, 1),
-                    None => {
-                        if !field.is_nullable() {
-                            return Err(Error::DataInvalid {
-                                message: format!(
-                                    "merge-engine=partial-update produced NULL for non-nullable field '{}'",
-                                    field.name()
-                                ),
-                                source: None,
-                            });
-                        }
-                        new_null_array(field.data_type(), 1)
-                    }
-                })
+                let column = match aggregators
+                    .as_ref()
+                    .and_then(|aggregators| aggregators.get(output_col_idx))
+                    .and_then(Option::as_ref)
+                {
+                    Some(aggregator) => aggregator.result()?,
+                    None => match selected_by_col[output_col_idx] {
+                        Some((batch_idx, row_idx)) => batch_buffer[batch_idx]
+                            .column_for_output(output_col_idx, source_output_col_indices)
+                            .slice(row_idx, 1),
+                        None => new_null_array(field.data_type(), 1),
+                    },
+                };
+                if !field.is_nullable() && column.is_null(0) {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "merge-engine=partial-update produced NULL for non-nullable field '{}'",
+                            field.name()
+                        ),
+                        source: None,
+                    });
+                }
+                Ok(column)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -2304,6 +2372,300 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partial_update_aggregation_composite_sequence_accepts_partial_null_tuple() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq_major", DataType::Int32, true),
+            Field::new("seq_minor", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("seq_major", DataType::Int32, true),
+            Field::new("seq_minor", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "seq_major".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "seq_minor".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                3,
+                "value".into(),
+                crate::spec::DataType::VarChar(VarCharType::string_type()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.seq_major,seq_minor.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "listagg".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(11), None])),
+                Arc::new(Int32Array::from(vec![Some(1), None, None])),
+                Arc::new(StringArray::from(vec![
+                    Some("base"),
+                    Some("partial"),
+                    Some("ignored"),
+                ])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4, 5],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let batch = &result[0];
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11
+        );
+        assert!(batch.column(2).is_null(0));
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "base,partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_last_non_null_aggregation_without_sequence_group() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "value".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "last_non_null_value".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(30), None])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            30
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_sequence_group_listagg_preserves_group_sequence_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("version", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("version", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "version".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "value".into(),
+                crate::spec::DataType::VarChar(VarCharType::string_type()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "listagg".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int8Array::from(vec![0, 0, 0, 0, 0])),
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    Some(12),
+                    Some(11),
+                    Some(12),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("b"),
+                    Some("d"),
+                    Some("c"),
+                    Some("e"),
+                    Some("ignored"),
+                ])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let batch = &result[0];
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            12
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "c,b,d,e"
+        );
+    }
+
+    #[tokio::test]
     async fn test_partial_update_merge_rejects_delete_like_rows() {
         let schema = make_schema();
         let output_schema = make_output_schema();
@@ -2515,6 +2877,49 @@ mod tests {
             Error::Unsupported { message }
             if message.contains("fields.price.aggregate-function")
         ));
+    }
+
+    #[test]
+    fn test_partial_update_new_with_schema_validates_aggregate_functions() {
+        let fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "version".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "value".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "sume".to_string(),
+            ),
+        ]);
+
+        let err = PartialUpdateMergeFunction::new_with_schema(
+            &options,
+            "default.t",
+            &fields,
+            &fields,
+            &["pk".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref message }
+                if message.contains("sume") && message.contains("value")),
+            "expected schema-aware aggregate validation, got {err:?}"
+        );
     }
 
     // ---------- AggregateMergeFunction ----------

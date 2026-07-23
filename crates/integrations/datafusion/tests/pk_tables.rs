@@ -38,6 +38,8 @@ use datafusion::arrow::datatypes::{
 };
 use paimon::catalog::Identifier;
 use paimon::Catalog;
+use paimon_datafusion::PaimonTableProvider;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ======================= Basic PK Write + Read =======================
@@ -175,6 +177,108 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
             (2, Some(200), Some("old-2".to_string())),
             (3, Some(30), None),
         ]
+    );
+}
+
+#[tokio::test]
+async fn test_pk_partial_update_sequence_group_aggregation_read_e2e() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_partial_update_aggregation (
+                id INT NOT NULL,
+                version INT,
+                amount INT,
+                tag STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'partial-update'
+            )",
+        )
+        .await
+        .unwrap();
+
+    for values in [
+        "(1, 10, 10, 'b'), (2, 5, 3, 'x')",
+        "(1, 9, 20, 'a'), (2, 4, 4, 'w')",
+        "(1, 11, 5, 'c')",
+    ] {
+        sql_context
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.t_partial_update_aggregation VALUES {values}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_partial_update_aggregation"))
+        .await
+        .unwrap()
+        .copy_with_options(HashMap::from([
+            (
+                "fields.version.sequence-group".to_string(),
+                "amount,tag".to_string(),
+            ),
+            (
+                "fields.amount.aggregate-function".to_string(),
+                "sum".to_string(),
+            ),
+            (
+                "fields.tag.aggregate-function".to_string(),
+                "listagg".to_string(),
+            ),
+        ]));
+    let provider = PaimonTableProvider::try_new(table).unwrap();
+    sql_context
+        .register_temp_table(
+            "paimon.test_db.t_partial_update_aggregation",
+            Arc::new(provider),
+        )
+        .unwrap();
+
+    let batches = sql_context
+        .sql(
+            "SELECT id
+             FROM paimon.test_db.t_partial_update_aggregation
+             WHERE amount = 7 AND tag = 'w,x'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let batch = &batches[0];
+    assert_eq!(
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id"]
     );
 }
 
