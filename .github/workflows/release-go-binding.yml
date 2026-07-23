@@ -151,7 +151,13 @@ jobs:
 
       - name: Install cargo-about on Intel macOS
         if: matrix.runner == 'macos-15-intel'
-        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+        shell: bash
+        run: |
+          if cargo-about --version 2>/dev/null | grep -Fqx 'cargo-about 0.9.1'; then
+            echo 'cargo-about 0.9.1 is already installed'
+          else
+            cargo install cargo-about --version 0.9.1 --locked --features cli --force
+          fi
 
       - name: Install zstd on Linux
         if: runner.os == 'Linux'
