@@ -23,6 +23,7 @@
 use super::bucket_filter::compute_target_buckets;
 use super::format_table_scan::FormatTableScan;
 use super::global_index_scanner::RowRangeIndex;
+use super::global_index_types::normalize_sorted_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
@@ -57,6 +58,7 @@ use std::sync::Arc;
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
 const INDEX_DIR: &str = "index";
+const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
 #[derive(Debug, Default)]
 struct ManifestReadCounters {
@@ -310,6 +312,16 @@ fn data_file_overlaps_row_range_index(
     row_range_index.intersects(first_row_id, last_row_id)
 }
 
+fn retain_index_manifest_entry(
+    entry: &IndexManifestEntry,
+    global_index_needed: bool,
+    deletion_vectors_needed: bool,
+) -> bool {
+    (deletion_vectors_needed && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+        || (global_index_needed
+            && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some())
+}
+
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
 /// Only considers ADD entries with index_type "DELETION_VECTORS" and their deletion_vectors_ranges.
 fn build_deletion_files_map(
@@ -325,7 +337,7 @@ fn build_deletion_files_map(
         if entry.kind != FileKind::Add {
             continue;
         }
-        if entry.index_file.index_type != "DELETION_VECTORS" {
+        if entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE {
             continue;
         }
         let ranges = match &entry.index_file.deletion_vectors_ranges {
@@ -1107,15 +1119,25 @@ impl<'a> PaimonTableScan<'a> {
     async fn read_index_manifest_entries(
         &self,
         snapshot: &Snapshot,
+        global_index_needed: bool,
+        deletion_vectors_needed: bool,
     ) -> crate::Result<Option<Vec<IndexManifestEntry>>> {
+        if !global_index_needed && !deletion_vectors_needed {
+            return Ok(None);
+        }
         let Some(index_manifest_name) = snapshot.index_manifest() else {
             return Ok(None);
         };
         let table_path = self.table.location().trim_end_matches('/');
         let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
-        Ok(Some(
-            IndexManifest::read(self.table.file_io(), &path).await?,
-        ))
+        let entries = IndexManifest::read(self.table.file_io(), &path)
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
+            })
+            .collect();
+        Ok(Some(entries))
     }
 
     async fn evaluate_global_index_row_ranges(
@@ -1276,7 +1298,13 @@ impl<'a> PaimonTableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let global_index_settings =
             self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
-        let index_entries = self.read_index_manifest_entries(snapshot).await?;
+        let index_entries = self
+            .read_index_manifest_entries(
+                snapshot,
+                global_index_settings.is_some(),
+                core_options.deletion_vectors_enabled(),
+            )
+            .await?;
         let manifest_row_ranges = self
             .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
@@ -1442,7 +1470,13 @@ impl<'a> PaimonTableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let global_index_settings =
             self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
-        let index_entries = self.read_index_manifest_entries(&snapshot).await?;
+        let index_entries = self
+            .read_index_manifest_entries(
+                &snapshot,
+                global_index_settings.is_some(),
+                core_options.deletion_vectors_enabled(),
+            )
+            .await?;
         let manifest_row_ranges = self
             .manifest_row_ranges(&snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
@@ -1854,16 +1888,17 @@ impl<'a> PaimonTableScan<'a> {
 mod tests {
     use super::{
         data_file_overlaps_row_range_index, manifest_file_overlaps_row_range_index,
-        prune_data_evolution_group_by_read_fields, should_skip_level_zero_for_scan,
-        LimitPushdownAccumulator, RowRangeIndex, TableScan,
+        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
+        should_skip_level_zero_for_scan, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
+        TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
-        DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind, IndexFileMeta,
-        IndexManifestEntry, IntType, ManifestFileMeta, Predicate, PredicateBuilder,
-        PredicateOperator, Schema as PaimonSchema, TableSchema, VarCharType,
+        CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind,
+        IndexFileMeta, IndexManifestEntry, IntType, ManifestFileMeta, Predicate, PredicateBuilder,
+        PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -3428,6 +3463,83 @@ mod tests {
             deletion_file,
             &DeletionFile::new("file:/tmp/table/index/index-file".into(), 11, 22, Some(33))
         );
+    }
+
+    #[test]
+    fn test_retain_index_manifest_entries_for_active_consumers() {
+        let entry = |index_type: &str| IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: Vec::new(),
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: index_type.to_string(),
+                file_name: format!("{index_type}.idx"),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                global_index_meta: None,
+            },
+        };
+        let entries = [
+            entry("DELETION_VECTORS"),
+            entry("btree"),
+            entry("bitmap"),
+            entry("HASH"),
+        ];
+        let retained = |global_index_needed, deletion_vectors_needed| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
+                })
+                .map(|entry| entry.index_file.index_type.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(retained(false, false).is_empty());
+        assert_eq!(retained(false, true), vec!["DELETION_VECTORS"]);
+        assert_eq!(retained(true, false), vec!["btree", "bitmap"]);
+        assert_eq!(
+            retained(true, true),
+            vec!["DELETION_VECTORS", "btree", "bitmap"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skip_index_manifest_without_active_consumer() {
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("test_db", "index_manifest_gate"),
+            "memory:/index_manifest_gate".to_string(),
+            TableSchema::new(
+                0,
+                &PaimonSchema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .index_manifest(Some("missing-index-manifest".to_string()))
+            .commit_user("test-user".to_string())
+            .commit_identifier(1)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1)
+            .build();
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None);
+
+        let entries = scan
+            .read_index_manifest_entries(&snapshot, false, false)
+            .await
+            .unwrap();
+        assert!(entries.is_none());
     }
 
     // ======================== Bucket predicate filtering ========================
