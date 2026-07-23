@@ -1461,34 +1461,21 @@ async fn test_case_insensitive_column_not_supported_via_sql() {
 mod fulltext_tests {
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use datafusion::arrow::array::Int32Array;
     use paimon::catalog::Identifier;
+    use paimon::spec::{GlobalIndexMeta, IndexFileMeta};
     use paimon::table::BranchManager;
-    use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+    use paimon::{Catalog, CatalogOptions, CommitMessage, FileSystemCatalog, Options, TableCommit};
     use paimon_datafusion::{register_full_text_search, SQLContext};
 
     use super::common::string_value;
-
-    /// Extract the bundled tar.gz into a temp dir and return (tempdir, warehouse_path).
-    fn extract_test_warehouse() -> (tempfile::TempDir, String) {
-        let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata/test_tantivy_fulltext.tar.gz");
-        let file = std::fs::File::open(&archive_path)
-            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", archive_path.display()));
-        let decoder = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-
-        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
-        let db_dir = tmp.path().join("default.db");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        archive.unpack(&db_dir).unwrap();
-
-        let warehouse = format!("file://{}", tmp.path().display());
-        (tmp, warehouse)
-    }
+    use paimon_ftindex_core::io::PosWriter;
+    use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
 
     async fn create_fulltext_context() -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
-        let (tmp, warehouse) = extract_test_warehouse();
+        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+        let warehouse = format!("file://{}", tmp.path().display());
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
@@ -1498,7 +1485,111 @@ mod fulltext_tests {
             .await
             .expect("Failed to register catalog");
         register_full_text_search(ctx.ctx(), catalog.clone(), "default");
+        run_fulltext_sql(
+            &ctx,
+            "CREATE TABLE paimon.default.test_fulltext (
+                id INT,
+                content STRING
+            ) WITH (
+                'row-tracking.enabled' = 'true',
+                'global-index.search-mode' = 'full'
+            )",
+        )
+        .await;
+        for insert in [
+            "INSERT INTO paimon.default.test_fulltext VALUES (0, 'alphaft lakehouse storage')",
+            "INSERT INTO paimon.default.test_fulltext VALUES (1, 'betafft gammaft full-text search')",
+            "INSERT INTO paimon.default.test_fulltext VALUES (2, 'alphaft supports indexed queries')",
+            "INSERT INTO paimon.default.test_fulltext VALUES (3, 'gammaft over raw fallback rows')",
+            "INSERT INTO paimon.default.test_fulltext VALUES (4, 'alphaft tables can be queried')",
+        ] {
+            run_fulltext_sql(&ctx, insert).await;
+        }
+        build_fulltext_index(catalog.as_ref()).await;
         (ctx, catalog, tmp)
+    }
+
+    async fn build_fulltext_index(catalog: &dyn Catalog) {
+        let table = catalog
+            .get_table(&Identifier::new("default", "test_fulltext"))
+            .await
+            .expect("table should exist");
+        let content_field_id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == "content")
+            .expect("content field")
+            .id();
+
+        let mut writer =
+            FullTextIndexWriter::new(FullTextIndexConfig::new().with_text_fields(["content"]))
+                .expect("full-text writer");
+        for (row_id, content) in [
+            (0, "alphaft lakehouse storage"),
+            (1, "betafft gammaft full-text search"),
+            (2, "alphaft supports indexed queries"),
+            (3, "gammaft over raw fallback rows"),
+            (4, "alphaft tables can be queried"),
+        ] {
+            writer
+                .add_document_fields(row_id, [("content", content)])
+                .expect("add full-text document");
+        }
+        let mut index_bytes = Vec::new();
+        writer
+            .write(&mut PosWriter::new(&mut index_bytes))
+            .expect("write full-text index");
+
+        let index_file_name = "ft-datafusion-fulltext.index";
+        table
+            .file_io()
+            .mkdirs(&format!(
+                "{}/index/",
+                table.location().trim_end_matches('/')
+            ))
+            .await
+            .expect("create index dir");
+        table
+            .file_io()
+            .new_output(&format!(
+                "{}/index/{index_file_name}",
+                table.location().trim_end_matches('/')
+            ))
+            .expect("index output")
+            .write(Bytes::from(index_bytes.clone()))
+            .await
+            .expect("write index file");
+
+        let mut message = CommitMessage::new(Vec::new(), 0, Vec::new());
+        message.new_index_files = vec![IndexFileMeta {
+            index_type: "full-text".to_string(),
+            file_name: index_file_name.to_string(),
+            file_size: i64::try_from(index_bytes.len()).unwrap(),
+            row_count: 5,
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: 0,
+                row_range_end: 4,
+                index_field_id: content_field_id,
+                extra_field_ids: None,
+                index_meta: None,
+                source_meta: None,
+            }),
+        }];
+        TableCommit::new(table, "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .expect("commit full-text index manifest");
+    }
+
+    async fn run_fulltext_sql(ctx: &SQLContext, sql: &str) {
+        ctx.sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to plan `{sql}`: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("Failed to execute `{sql}`: {e}"));
     }
 
     fn extract_id_content_rows(
@@ -1524,12 +1615,12 @@ mod fulltext_tests {
         rows
     }
 
-    /// Search for 'paimon' — rows 0, 2, 4 mention "paimon".
+    /// Search for 'alphaft' — rows 0, 2, 4 contain the token.
     #[tokio::test]
     async fn test_full_text_search_paimon() {
         let (ctx, _catalog, _tmp) = create_fulltext_context().await;
         let batches = ctx
-            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'paimon', 10)")
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_fulltext', 'content', 'alphaft', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -1541,14 +1632,14 @@ mod fulltext_tests {
         assert_eq!(
             ids,
             vec![0, 2, 4],
-            "Searching 'paimon' should match rows 0, 2, 4"
+            "Searching 'alphaft' should match rows 0, 2, 4"
         );
     }
 
     #[tokio::test]
     async fn test_full_text_search_branch() {
         let (ctx, catalog, _tmp) = create_fulltext_context().await;
-        let identifier = Identifier::new("default", "test_tantivy_fulltext");
+        let identifier = Identifier::new("default", "test_fulltext");
         let table = catalog.get_table(&identifier).await.expect("load table");
         let snapshot_manager = table.snapshot_manager();
         let snapshot = snapshot_manager
@@ -1572,7 +1663,7 @@ mod fulltext_tests {
             .expect("delete main snapshots");
 
         let batches = ctx
-            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext$branch_b1', 'content', 'paimon', 10)")
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_fulltext$branch_b1', 'content', 'alphaft', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -1584,12 +1675,12 @@ mod fulltext_tests {
         assert_eq!(ids, vec![0, 2, 4]);
     }
 
-    /// Search for 'tantivy' — only row 1.
+    /// Search for 'betafft' — only row 1.
     #[tokio::test]
-    async fn test_full_text_search_tantivy() {
+    async fn test_full_text_search_betafft() {
         let (ctx, _catalog, _tmp) = create_fulltext_context().await;
         let batches = ctx
-            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'tantivy', 10)")
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_fulltext', 'content', 'betafft', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -1598,15 +1689,15 @@ mod fulltext_tests {
 
         let rows = extract_id_content_rows(&batches);
         let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![1], "Searching 'tantivy' should match row 1");
+        assert_eq!(ids, vec![1], "Searching 'betafft' should match row 1");
     }
 
-    /// Search for 'search' — rows 1, 3 mention "full-text search".
+    /// Search for 'gammaft' — rows 1, 3 contain the token.
     #[tokio::test]
     async fn test_full_text_search_search() {
         let (ctx, _catalog, _tmp) = create_fulltext_context().await;
         let batches = ctx
-            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'search', 10)")
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_fulltext', 'content', 'gammaft', 10)")
             .await
             .expect("SQL should parse")
             .collect()
@@ -1615,8 +1706,11 @@ mod fulltext_tests {
 
         let rows = extract_id_content_rows(&batches);
         let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
-        assert!(ids.contains(&1), "Searching 'search' should match row 1");
-        assert!(ids.contains(&3), "Searching 'search' should match row 3");
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "Searching 'gammaft' should match rows 1, 3"
+        );
     }
 }
 

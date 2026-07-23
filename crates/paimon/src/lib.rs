@@ -32,13 +32,13 @@ mod deletion_vector;
 pub mod file_index;
 #[cfg(feature = "fulltext")]
 pub mod ftindex;
+#[cfg(feature = "fulltext")]
+pub mod full_text;
 pub mod io;
 pub mod lumina;
 mod predicate_stats;
 pub mod spec;
 pub mod table;
-#[cfg(feature = "fulltext")]
-pub mod tantivy;
 pub mod variant;
 pub mod vector_search;
 pub mod vindex;

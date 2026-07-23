@@ -15,18 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Full-text search types for global index.
-//!
-//! Reference: [org.apache.paimon.predicate.FullTextSearch](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/predicate/FullTextSearch.java)
-
 /// Full-text search predicate.
-///
-/// Reference: `org.apache.paimon.predicate.FullTextSearch`
 #[derive(Debug, Clone)]
 pub struct FullTextSearch {
     pub query_text: String,
     pub field_name: String,
     pub limit: usize,
+    pub include_row_ids: Option<roaring::RoaringTreemap>,
 }
 
 impl FullTextSearch {
@@ -50,7 +45,13 @@ impl FullTextSearch {
             query_text,
             field_name,
             limit,
+            include_row_ids: None,
         })
+    }
+
+    pub fn with_include_row_ids(mut self, include_row_ids: roaring::RoaringTreemap) -> Self {
+        self.include_row_ids = Some(include_row_ids);
+        self
     }
 }
 
@@ -108,8 +109,18 @@ impl SearchResult {
     pub fn or(&self, other: &SearchResult) -> Self {
         let mut row_ids = self.row_ids.clone();
         let mut scores = self.scores.clone();
-        row_ids.extend_from_slice(&other.row_ids);
-        scores.extend_from_slice(&other.scores);
+        row_ids.reserve(other.row_ids.len());
+        scores.reserve(other.scores.len());
+        let mut seen = row_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        for (&row_id, &score) in other.row_ids.iter().zip(&other.scores) {
+            if seen.insert(row_id) {
+                row_ids.push(row_id);
+                scores.push(score);
+            }
+        }
         Self { row_ids, scores }
     }
 
@@ -155,6 +166,31 @@ impl SearchResult {
         Ok(Self { row_ids, scores })
     }
 
+    pub(crate) fn without_row_ranges(
+        &self,
+        ranges: &[crate::table::RowRange],
+    ) -> crate::Result<Self> {
+        if ranges.is_empty() {
+            return Ok(self.clone());
+        }
+        let index = crate::table::global_index_scanner::RowRangeIndex::create(ranges.to_vec());
+        let mut row_ids = Vec::with_capacity(self.row_ids.len());
+        let mut scores = Vec::with_capacity(self.scores.len());
+        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
+            let row_id_i64 = i64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+                message: format!(
+                    "Full-text search row id {row_id} exceeds i64::MAX and cannot be checked against row ranges"
+                ),
+                source: None,
+            })?;
+            if !index.intersects(row_id_i64, row_id_i64) {
+                row_ids.push(row_id);
+                scores.push(score);
+            }
+        }
+        Ok(Self { row_ids, scores })
+    }
+
     /// Convert to sorted, merged row ranges.
     pub fn to_row_ranges(&self) -> Vec<crate::table::RowRange> {
         if self.row_ids.is_empty() {
@@ -191,6 +227,18 @@ mod tests {
         assert_eq!(fts.query_text, "hello");
         assert_eq!(fts.limit, 10);
         assert_eq!(fts.field_name, "text");
+        assert!(fts.include_row_ids.is_none());
+    }
+
+    #[test]
+    fn test_full_text_search_clone_preserves_include_row_ids() {
+        let mut include_row_ids = roaring::RoaringTreemap::new();
+        include_row_ids.insert(42);
+        let search = FullTextSearch::new("hello".into(), 10, "text".into())
+            .unwrap()
+            .with_include_row_ids(include_row_ids.clone());
+
+        assert_eq!(search.clone().include_row_ids, Some(include_row_ids));
     }
 
     #[test]
@@ -210,6 +258,29 @@ mod tests {
             .without_deleted_row_ranges(Some(&deleted))
             .unwrap()
             .top_k(10);
+        assert_eq!(filtered.row_ids, vec![1, 4]);
+        assert_eq!(filtered.scores, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn test_search_result_or_preserves_left_score_and_order() {
+        let left = SearchResult::new(vec![1, 2], vec![0.4, 0.5]);
+        let right = SearchResult::new(vec![2, 3], vec![0.8, 0.6]);
+
+        let merged = left.or(&right);
+
+        assert_eq!(merged.row_ids, vec![1, 2, 3]);
+        assert_eq!(merged.scores, vec![0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn test_search_result_without_row_ranges() {
+        let result = SearchResult::new(vec![1, 2, 3, 4], vec![0.1, 0.9, 0.8, 0.2]);
+
+        let filtered = result
+            .without_row_ranges(&[crate::table::RowRange::new(2, 3)])
+            .unwrap();
+
         assert_eq!(filtered.row_ids, vec![1, 4]);
         assert_eq!(filtered.scores, vec![0.1, 0.2]);
     }

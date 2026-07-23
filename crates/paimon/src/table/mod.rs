@@ -43,6 +43,8 @@ mod format_table_read;
 mod format_table_scan;
 mod format_write_builder;
 #[cfg(feature = "fulltext")]
+mod full_text_index_adapter;
+#[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;

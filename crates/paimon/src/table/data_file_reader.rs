@@ -170,7 +170,7 @@ impl DataFileReader {
                         file_meta,
                         data_fields,
                         dv,
-                        None,
+                        split.row_ranges().map(|ranges| ranges.to_vec()),
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
