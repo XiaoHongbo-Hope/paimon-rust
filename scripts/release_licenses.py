@@ -61,6 +61,8 @@ class LicenseCorrection:
     license_path: str
     license_name: str
     anchor: str
+    license_from_repository: bool = False
+    expected_versions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,18 @@ COMMON_MIT_CORRECTIONS = (
 )
 
 PYTHON_MIT_CORRECTIONS = (
+    LicenseCorrection(
+        crates=("jieba-macros", "jieba-rs"),
+        license_crate="jieba-rs",
+        license_path="third-party-licenses/jieba-rs-0.10.3.LICENSE",
+        license_name="MIT License (jieba-rs workspace)",
+        anchor="mit-jieba-rs-workspace",
+        license_from_repository=True,
+        expected_versions=(
+            ("jieba-macros", "0.10.3"),
+            ("jieba-rs", "0.10.3"),
+        ),
+    ),
     LicenseCorrection(
         crates=(
             "ownedbytes",
@@ -342,14 +356,18 @@ def resolved_packages(metadata: dict) -> list[dict]:
     ]
 
 
-def package_by_name(
-    metadata: dict, crate_name: str, required: bool = True
-) -> dict | None:
-    matches = [
+def packages_by_name(metadata: dict, crate_name: str) -> list[dict]:
+    return [
         package
         for package in resolved_packages(metadata)
         if package["name"] == crate_name
     ]
+
+
+def package_by_name(
+    metadata: dict, crate_name: str, required: bool = True
+) -> dict | None:
+    matches = packages_by_name(metadata, crate_name)
     if not matches and not required:
         return None
     if len(matches) != 1:
@@ -371,25 +389,61 @@ def package_features(metadata: dict, package: dict) -> set[str]:
     return set(matches[0])
 
 
-def correction_html(metadata: dict, correction: LicenseCorrection) -> str:
+def correction_html(
+    root: Path, metadata: dict, correction: LicenseCorrection
+) -> str:
+    expected_versions = dict(correction.expected_versions)
     used_by = []
     for crate_name in correction.crates:
-        package = package_by_name(metadata, crate_name)
-        repository = package.get("repository") or (
-            f"https://crates.io/crates/{crate_name}"
-        )
-        used_by.append(
-            f'                    <li><a href="{html.escape(repository, quote=True)}">'
-            f"{html.escape(crate_name)} {html.escape(package['version'])}</a></li>"
-        )
+        packages = packages_by_name(metadata, crate_name)
+        if not packages:
+            raise RuntimeError(f"expected at least one resolved {crate_name} package")
+        for package in packages:
+            if correction.license_from_repository:
+                expected_version = expected_versions.get(crate_name)
+                if expected_version is None:
+                    raise RuntimeError(
+                        "repository-backed correction is missing an expected "
+                        f"version for {crate_name}"
+                    )
+                if package["version"] != expected_version:
+                    raise RuntimeError(
+                        f"expected {crate_name} {expected_version}, "
+                        f"found {package['version']}"
+                    )
+            repository = package.get("repository") or (
+                f"https://crates.io/crates/{crate_name}"
+            )
+            used_by.append(
+                f'                    <li><a href="{html.escape(repository, quote=True)}">'
+                f"{html.escape(crate_name)} {html.escape(package['version'])}</a></li>"
+            )
 
-    license_package = package_by_name(metadata, correction.license_crate)
-    license_file = (
-        Path(license_package["manifest_path"]).parent / correction.license_path
-    )
-    if not license_file.is_file():
-        raise RuntimeError(f"corrected license file is missing: {license_file}")
-    license_text = license_file.read_text(encoding="utf-8")
+    if correction.license_from_repository:
+        license_file = root / correction.license_path
+        if not license_file.is_file():
+            raise RuntimeError(f"corrected license file is missing: {license_file}")
+        license_text = license_file.read_text(encoding="utf-8")
+    else:
+        license_files = [
+            Path(package["manifest_path"]).parent / correction.license_path
+            for package in packages_by_name(metadata, correction.license_crate)
+        ]
+        if not license_files:
+            raise RuntimeError(
+                f"expected at least one resolved {correction.license_crate} package"
+            )
+        missing = [path for path in license_files if not path.is_file()]
+        if missing:
+            raise RuntimeError(f"corrected license file is missing: {missing[0]}")
+        license_texts = {
+            path.read_text(encoding="utf-8") for path in license_files
+        }
+        if len(license_texts) != 1:
+            raise RuntimeError(
+                f"corrected license files differ for {correction.license_crate}"
+            )
+        license_text = license_texts.pop()
 
     return "\n".join(
         [
@@ -407,6 +461,7 @@ def correction_html(metadata: dict, correction: LicenseCorrection) -> str:
 
 
 def replace_placeholder_entry(
+    root: Path,
     report_text: str,
     metadata: dict,
     marker: str,
@@ -441,7 +496,7 @@ def replace_placeholder_entry(
         )
 
     replacement = "\n".join(
-        correction_html(metadata, correction) for correction in corrections
+        correction_html(root, metadata, correction) for correction in corrections
     )
     return report_text[:entry_start] + replacement + report_text[entry_end:]
 
@@ -538,13 +593,13 @@ def complete_report(
     root: Path, base_report: str, report: Report, metadata: dict
 ) -> str:
     result = replace_placeholder_entry(
-        base_report, metadata, ALLOC_PLACEHOLDER, ALLOC_CORRECTIONS
+        root, base_report, metadata, ALLOC_PLACEHOLDER, ALLOC_CORRECTIONS
     )
     mit_corrections = COMMON_MIT_CORRECTIONS
     if report.component == "python":
         mit_corrections += PYTHON_MIT_CORRECTIONS
     result = replace_placeholder_entry(
-        result, metadata, MIT_PLACEHOLDER, mit_corrections
+        root, result, metadata, MIT_PLACEHOLDER, mit_corrections
     )
 
     for placeholder in LICENSE_PLACEHOLDERS:

@@ -25,6 +25,11 @@ OpenSSL 1.1.1w on aarch64 Linux. Both versions use the same license text.
 The XZ Utils 5.8.3 license is read from the locked `liblzma-sys` crate at
 `xz/COPYING.0BSD`.
 
+`jieba-rs-0.10.3.LICENSE` is the license file from the root of the upstream
+`jieba-rs` workspace at commit
+`c62e0df1f9dcc2cc1e014711c5aa4561ae260538`. It covers `jieba-rs` 0.10.3 and
+`jieba-macros` 0.10.3.
+
 Target-specific Python and Go reports are generated in their binary build jobs.
 They are intentionally not committed or included in the ASF source archive.
 
@@ -32,3 +37,4 @@ Sources:
 
 - <https://github.com/openssl/openssl/blob/OpenSSL_1_1_1k/LICENSE>
 - <https://github.com/openssl/openssl/blob/OpenSSL_1_1_1w/LICENSE>
+- <https://github.com/messense/jieba-rs/blob/c62e0df1f9dcc2cc1e014711c5aa4561ae260538/LICENSE>
