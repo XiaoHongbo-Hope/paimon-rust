@@ -1370,6 +1370,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_global_index_prunes_during_manifest_read() {
+        for (search_mode, expected_manifest_pruned, expected_entries_read) in
+            [("fast", 1, 1), ("full", 1, 1)]
+        {
+            let table_path = format!("memory:/test_global_index_manifest_pruning_{search_mode}");
+            let mut options = table_options("2");
+            options.insert(
+                "global-index.search-mode".to_string(),
+                search_mode.to_string(),
+            );
+            let table = test_table_with_path(&table_path, options);
+            setup_dirs(&table).await;
+
+            for (user, ids, names) in [
+                ("writer-1", vec![1, 2], vec!["alice", "bob"]),
+                ("writer-2", vec![3, 4], vec!["carol", "dave"]),
+            ] {
+                let mut table_write = TableWrite::new(&table, user.to_string()).unwrap();
+                table_write
+                    .write_arrow_batch(&data_batch(ids, names))
+                    .await
+                    .unwrap();
+                TableCommit::new(table.clone(), user.to_string())
+                    .commit(table_write.prepare_commit().await.unwrap())
+                    .await
+                    .unwrap();
+            }
+
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_column("name")
+                .execute()
+                .await
+                .unwrap();
+
+            let predicate = PredicateBuilder::new(table.schema().fields())
+                .equal("name", crate::spec::Datum::String("alice".to_string()))
+                .unwrap();
+            let mut read_builder = table.new_read_builder();
+            read_builder.with_filter(predicate);
+            let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+
+            assert_eq!(
+                plan.splits()
+                    .iter()
+                    .flat_map(|split| split.data_files())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                trace.manifest_files_pruned_by_row_ranges,
+                expected_manifest_pruned
+            );
+            assert_eq!(trace.manifest_entries_read, expected_entries_read);
+            assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
+            assert_eq!(
+                trace.manifest_entries_after_manifest_filters,
+                expected_entries_read
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
+        let table_path = "memory:/test_detail_manifest_pruning";
+        let mut options = table_options("2");
+        options.insert("global-index.search-mode".to_string(), "detail".to_string());
+        let table = test_table_with_path(table_path, options);
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "writer-1".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "writer-1".to_string())
+            .commit(table_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+
+        let mut table_write = TableWrite::new(&table, "writer-2".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![3, 4], vec!["alice", "dave"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "writer-2".to_string())
+            .commit(table_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", crate::spec::Datum::String("alice".to_string()))
+            .unwrap();
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_filter(predicate);
+        let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+        let planned_ranges = merge_row_ranges(
+            plan.splits()
+                .iter()
+                .flat_map(|split| split.row_ranges().unwrap_or_default())
+                .cloned()
+                .collect(),
+        );
+
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .flat_map(|split| split.data_files())
+                .count(),
+            2
+        );
+        assert_eq!(
+            planned_ranges,
+            vec![RowRange::new(0, 0), RowRange::new(2, 3)]
+        );
+        assert_eq!(trace.manifest_files_pruned_by_row_ranges, 0);
+        assert_eq!(trace.manifest_entries_read, 2);
+    }
+
+    #[tokio::test]
     async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
         let table_path = "memory:/test_bitmap_global_index_builder_e2e";
         let table = test_table_with_path(table_path, table_options("10"));

@@ -443,7 +443,11 @@ impl<'a> PaimonReadBuilder<'a> {
             self.limit,
             self.row_ranges.clone(),
         )
-        .with_projected_read_field_ids(projected_read_field_ids(&read_type))
+        .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
+            &read_type,
+            &self.filter.data_predicates,
+            self.table.schema().fields(),
+        ))
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
@@ -619,6 +623,28 @@ fn projected_read_field_ids(read_type: &Option<Vec<DataField>>) -> Option<HashSe
     read_type
         .as_ref()
         .map(|fields| projected_read_field_ids_from_fields(fields))
+}
+
+fn projected_read_field_ids_with_predicates(
+    read_type: &Option<Vec<DataField>>,
+    predicates: &[Predicate],
+    table_fields: &[DataField],
+) -> Option<HashSet<i32>> {
+    let mut field_ids = projected_read_field_ids(read_type)?;
+    let mut predicate_indices = Vec::new();
+    for predicate in predicates {
+        crate::arrow::residual::collect_predicate_field_indices(predicate, &mut predicate_indices);
+    }
+    for index in predicate_indices {
+        let Some(field) = table_fields.get(index) else {
+            // A malformed predicate must not make scan planning discard files.
+            return None;
+        };
+        if !is_system_projection_field(field.id()) {
+            field_ids.insert(field.id());
+        }
+    }
+    Some(field_ids)
 }
 
 pub(super) fn is_system_projection_field(field_id: i32) -> bool {
@@ -837,6 +863,21 @@ mod tests {
         assert_eq!(
             super::projected_read_field_ids_from_fields(&read_type),
             HashSet::new()
+        );
+    }
+
+    #[test]
+    fn test_projected_read_field_ids_include_predicate_only_fields() {
+        let fields = vec![
+            DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "payload".to_string(), DataType::Int(IntType::new())),
+        ];
+        let read_type = Some(vec![fields[0].clone()]);
+        let predicate = PredicateBuilder::new(&fields).is_null("payload").unwrap();
+
+        assert_eq!(
+            super::projected_read_field_ids_with_predicates(&read_type, &[predicate], &fields,),
+            Some(HashSet::from([1, 2]))
         );
     }
 
