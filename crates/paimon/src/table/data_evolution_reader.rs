@@ -1135,7 +1135,28 @@ fn open_source_stream(
     blob_as_descriptor: bool,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
+    let mut row_ranges = row_ranges;
     if let FieldSource::BlobBunch { bunch, read_fields } = source {
+        let selected_ranges = selected_absolute_row_ranges_for_file(
+            bunch.expected_first_row_id,
+            bunch.expected_row_count,
+            row_ranges.as_deref(),
+            anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
+        )?;
+        if let Some(selected_ranges) = selected_ranges.as_deref() {
+            let uncovered_ranges =
+                crate::table::source::exclude_row_ranges(selected_ranges, bunch.logical_ranges());
+            if !uncovered_ranges.is_empty() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Blob bunch logical row ranges {:?} do not cover effective selected row ranges {selected_ranges:?}; uncovered ranges are {uncovered_ranges:?}",
+                        bunch.logical_ranges()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
         // A single sequence group has no fallback work, so keep per-file lazy streaming.
         if !bunch.can_read_sequentially() {
             return blob_fallback::read(
@@ -1148,6 +1169,7 @@ fn open_source_stream(
                 anchor_deletion_vector.cloned(),
             );
         }
+        row_ranges = selected_ranges;
     }
 
     let file_reader = DataFileReader::new(
@@ -1175,13 +1197,7 @@ fn open_source_stream(
             )
         }
         FieldSource::BlobBunch { bunch, .. } => {
-            let selected_ranges = selected_absolute_row_ranges_for_file(
-                bunch.expected_first_row_id,
-                bunch.expected_row_count,
-                row_ranges.as_deref(),
-                anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
-            )?;
-            let files = match selected_ranges.as_deref() {
+            let files = match row_ranges.as_deref() {
                 Some(ranges) => bunch.files_overlapping(ranges)?,
                 None => bunch.files.clone(),
             };
@@ -1197,8 +1213,68 @@ fn open_source_stream(
         FieldSource::VectorBunch {
             bunch, data_fields, ..
         } => {
-            let files = match row_ranges.as_deref() {
-                Some(ranges) => bunch.files_overlapping(ranges),
+            let anchor = crate::table::source::data_evolution_anchor_file(split.data_files())?;
+            let first_row_id = anchor.first_row_id.ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "Data-evolution anchor file '{}' is missing first_row_id",
+                    anchor.file_name
+                ),
+                source: None,
+            })?;
+            let selected_ranges = selected_absolute_row_ranges_for_file(
+                first_row_id,
+                anchor.row_count,
+                row_ranges.as_deref(),
+                anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
+            )?;
+            let files = match selected_ranges.as_deref() {
+                Some([]) => Vec::new(),
+                Some(ranges) => {
+                    let covered_ranges = bunch
+                        .files
+                        .iter()
+                        .map(|file| {
+                            let first_row_id =
+                                file.first_row_id.ok_or_else(|| Error::DataInvalid {
+                                    message: format!(
+                                        "Vector file '{}' is missing first_row_id",
+                                        file.file_name
+                                    ),
+                                    source: None,
+                                })?;
+                            if file.row_count <= 0 {
+                                return Err(Error::DataInvalid {
+                                    message: format!(
+                                        "Vector file '{}' row count must be positive, got {}",
+                                        file.file_name, file.row_count
+                                    ),
+                                    source: None,
+                                });
+                            }
+                            let last_row_id = first_row_id
+                                .checked_add(file.row_count - 1)
+                                .ok_or_else(|| Error::DataInvalid {
+                                    message: format!(
+                                        "Vector file '{}' row range overflows i64",
+                                        file.file_name
+                                    ),
+                                    source: None,
+                                })?;
+                            Ok(RowRange::new(first_row_id, last_row_id))
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    let uncovered_ranges =
+                        crate::table::source::exclude_row_ranges(ranges, &covered_ranges);
+                    if !uncovered_ranges.is_empty() {
+                        return Err(Error::DataInvalid {
+                            message: format!(
+                                "Vector bunch does not cover effective selected row ranges {uncovered_ranges:?}"
+                            ),
+                            source: None,
+                        });
+                    }
+                    bunch.files_overlapping(ranges)
+                }
                 None => bunch.files.clone(),
             };
             read_bunch_files_stream(
@@ -1206,7 +1282,7 @@ fn open_source_stream(
                 split,
                 files,
                 data_fields.clone(),
-                row_ranges,
+                selected_ranges,
                 anchor_deletion_vector.cloned(),
             )
         }
@@ -3987,6 +4063,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_selected_blob_fallback_rejects_uncovered_non_deleted_range() {
+        use BlobFixtureValue::{Placeholder, Value};
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let latest_path = bucket_dir.join("blob-latest.blob");
+        let old_path = bucket_dir.join("blob-old.blob");
+        write_blob_file_with_values(&latest_path, &[Placeholder]);
+        write_blob_file_with_values(&old_path, &[Value(b"covered")]);
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "selected_blob_gap_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let deletion_path = format!("{}/index/dv-gap", local_file_path(tempdir.path()));
+        let deletion_file = write_test_deletion_file(&file_io, &deletion_path, &[1]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    4,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-latest.blob",
+                    2,
+                    1,
+                    2,
+                    latest_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-old.blob",
+                    2,
+                    1,
+                    1,
+                    old_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ),
+            ])
+            .with_data_deletion_files(vec![Some(deletion_file), None, None])
+            .with_row_ranges(vec![RowRange::new(1, 3)])
+            .build()
+            .unwrap();
+
+        // Row 0 is outside the selection and row 1 is deleted, so only the
+        // uncovered, selected, non-deleted row 3 must make the read fail.
+        for blob_as_descriptor in [false, true] {
+            let mode_table = table.copy_with_options(HashMap::from([(
+                "blob-as-descriptor".to_string(),
+                blob_as_descriptor.to_string(),
+            )]));
+            let read = TableRead::new(
+                &mode_table,
+                mode_table.schema().fields().to_vec(),
+                Vec::new(),
+            );
+            let mut stream = read.to_arrow(std::slice::from_ref(&split)).unwrap();
+            let first = stream.try_next().await;
+            assert!(
+                matches!(
+                    &first,
+                    Err(Error::DataInvalid { message, .. })
+                        if message.contains(
+                            "uncovered ranges are [RowRange { from: 3, to: 3 }]"
+                        )
+                ),
+                "blob_as_descriptor={blob_as_descriptor}: expected uncovered selected BLOB range error, got {first:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_selected_blob_range_is_clipped_to_anchor_before_sequential_read() {
+        use BlobFixtureValue::Value;
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![10, 20])], None);
+
+        let blob_path = bucket_dir.join("blob-straddling.blob");
+        write_blob_file_with_values(
+            &blob_path,
+            &[Value(b"outside-anchor"), Value(b"anchor-row-0")],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "selected_blob_anchor_clip_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    2,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-straddling.blob",
+                    -1,
+                    2,
+                    1,
+                    blob_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ),
+            ])
+            .with_row_ranges(vec![RowRange::new(-1, 0)])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let mut stream = read.to_arrow(&[split]).unwrap();
+        let first_batch = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(
+            collect_int_values(std::slice::from_ref(&first_batch), "id"),
+            vec![10]
+        );
+        assert_eq!(
+            collect_binary_values(&[first_batch], "payload"),
+            vec![Some(b"anchor-row-0".to_vec())]
+        );
+    }
+
+    #[tokio::test]
     async fn test_single_blob_sequence_group_yields_before_opening_next_file() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
@@ -5158,6 +5412,27 @@ mod tests {
             2,
             &[Some(vec![1.0, 1.0]), Some(vec![5.0, 5.0])],
         );
+
+        let uncovered_split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                normal_meta.clone(),
+                first_vector_meta.clone(),
+                last_vector_meta.clone(),
+            ])
+            .with_row_ranges(vec![RowRange::new(2, 2), RowRange::new(4, 4)])
+            .build()
+            .unwrap();
+        let mut stream = read.to_arrow(&[uncovered_split]).unwrap();
+        let error = stream.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { message, .. }
+        if message.contains(
+            "does not cover effective selected row ranges [RowRange { from: 2, to: 2 }]"
+        )));
 
         let full_split = DataSplitBuilder::new()
             .with_snapshot(1)
