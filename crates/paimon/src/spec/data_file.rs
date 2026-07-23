@@ -257,7 +257,12 @@ impl DataFileMeta {
 
     /// Returns the row ID range `[first_row_id, first_row_id + row_count - 1]` if `first_row_id` is set.
     pub fn row_id_range(&self) -> Option<(i64, i64)> {
-        self.first_row_id.map(|fid| (fid, fid + self.row_count - 1))
+        let from = self.first_row_id?;
+        if self.row_count <= 0 {
+            return None;
+        }
+        let to = from.checked_add(self.row_count - 1)?;
+        Some((from, to))
     }
 
     /// Serialize as a `DataFileMeta.SCHEMA` (version 8) BinaryRow, raw data without the
@@ -582,6 +587,19 @@ mod tests {
             let back = DataFileMeta::from_serialized_row_data(&bytes).unwrap();
             assert_eq!(back, meta);
         }
+    }
+
+    #[test]
+    fn row_id_range_rejects_non_positive_count_and_overflow() {
+        let mut file = data_file("data.parquet");
+        assert_eq!(file.row_id_range(), Some((100, 106)));
+
+        file.row_count = 0;
+        assert_eq!(file.row_id_range(), None);
+
+        file.row_count = 2;
+        file.first_row_id = Some(i64::MAX);
+        assert_eq!(file.row_id_range(), None);
     }
 
     #[test]

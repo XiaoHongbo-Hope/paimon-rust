@@ -5592,7 +5592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_and_read_prunes_unselected_rolled_dedicated_sources() {
+    async fn test_scan_and_read_retains_complete_rolled_dedicated_group() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -5677,7 +5677,7 @@ mod tests {
 
         let mut builder = table.new_read_builder();
         builder.with_row_ranges(vec![RowRange::new(0, 0)]);
-        let plan = builder.new_scan().plan().await.unwrap();
+        let (plan, trace) = builder.new_scan().plan_with_trace().await.unwrap();
         let mut planned_files = plan
             .splits()
             .iter()
@@ -5685,14 +5685,18 @@ mod tests {
             .map(|file| file.file_name.clone())
             .collect::<Vec<_>>();
         planned_files.sort();
-        assert_eq!(
-            planned_files,
-            vec![
-                "data.parquet".to_string(),
-                "emb-1.vector.parquet".to_string(),
-                "payload-1.blob".to_string(),
-            ]
-        );
+        let expected_planned_files = vec![
+            "data.parquet".to_string(),
+            "emb-1.vector.parquet".to_string(),
+            "emb-2.vector.parquet".to_string(),
+            "emb-3.vector.parquet".to_string(),
+            "payload-1.blob".to_string(),
+            "payload-2.blob".to_string(),
+            "payload-3.blob".to_string(),
+        ];
+        assert_eq!(planned_files, expected_planned_files);
+        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
+        assert_eq!(trace.final_files, 7);
 
         let batches = builder
             .new_read()
@@ -5708,6 +5712,134 @@ mod tests {
             collect_binary_values(&batches, "payload"),
             vec![Some(b"b1".to_vec())]
         );
+
+        for field in ["embedding", "payload"] {
+            let predicate = PredicateBuilder::new(table.schema().fields())
+                .is_null(field)
+                .unwrap();
+            let mut predicate_builder = table.new_read_builder();
+            predicate_builder.with_projection(&["id"]).unwrap();
+            predicate_builder.with_filter(predicate);
+            predicate_builder.with_row_ranges(vec![RowRange::new(0, 0)]);
+            let predicate_plan = predicate_builder.new_scan().plan().await.unwrap();
+            let predicate_batches = predicate_builder
+                .new_read()
+                .unwrap()
+                .to_arrow(predicate_plan.splits())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(
+                collect_int_values(&predicate_batches, "id").is_empty(),
+                "predicate-only dedicated field '{field}' must not be treated as missing/null"
+            );
+        }
+
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let delta_plan = builder
+            .new_scan()
+            .plan_snapshot_delta(&snapshot)
+            .await
+            .unwrap();
+        let mut delta_files = delta_plan
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .map(|file| file.file_name.clone())
+            .collect::<Vec<_>>();
+        delta_files.sort();
+        assert_eq!(delta_files, expected_planned_files);
+    }
+
+    #[tokio::test]
+    async fn test_scan_and_read_rejects_selected_gap_after_dedicated_pruning() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        fs::create_dir_all(tempdir.path().join("snapshot")).unwrap();
+        fs::create_dir_all(tempdir.path().join("manifest")).unwrap();
+
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3, 4, 5, 6])], None);
+
+        let files = vec![
+            data_file_meta_with_path(
+                "data.parquet",
+                0,
+                6,
+                1,
+                normal_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            ),
+            data_file_meta_with_path(
+                "emb-left.vector.parquet",
+                0,
+                2,
+                1,
+                1,
+                Some(vec!["embedding"]),
+            ),
+            data_file_meta_with_path(
+                "emb-right.vector.parquet",
+                4,
+                2,
+                1,
+                1,
+                Some(vec!["embedding"]),
+            ),
+            data_file_meta_with_path("payload-left.blob", 0, 2, 1, 1, Some(vec!["payload"])),
+            data_file_meta_with_path("payload-right.blob", 4, 2, 1, 1, Some(vec!["payload"])),
+        ];
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "missing_selected_dedicated_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        TableCommit::new(table.clone(), "missing-selected-dedicated-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+
+        for (field, provider_kind) in [("embedding", "Vector"), ("payload", "Blob")] {
+            let mut builder = table.new_read_builder();
+            builder.with_projection(&["id", field]).unwrap();
+            builder.with_row_ranges(vec![RowRange::new(2, 2)]);
+            let plan = builder.new_scan().plan().await.unwrap();
+
+            let mut stream = builder.new_read().unwrap().to_arrow(plan.splits()).unwrap();
+            let error = stream.try_next().await.unwrap_err();
+            assert!(
+                matches!(error, Error::DataInvalid { ref message, .. }
+                if message.contains(provider_kind)
+                    && message.contains("cover effective selected row ranges")),
+                "expected missing {provider_kind} coverage error, got {error:?}"
+            );
+        }
     }
 
     /// (6) Row-range mismatch: normal file row_count=3 but `.vector.parquet` row_count=2

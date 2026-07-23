@@ -167,7 +167,7 @@ async fn read_all_manifest_entries(
 
     if let Some(index) = row_range_index {
         let before = manifest_files.len();
-        manifest_files.retain(|meta| manifest_file_overlaps_row_range_index(meta, index));
+        retain_manifest_row_range_components(&mut manifest_files, index);
         if let Some(trace) = trace.as_deref_mut() {
             trace.manifest_files_pruned_by_row_ranges = before - manifest_files.len();
         }
@@ -240,12 +240,6 @@ async fn read_all_manifest_entries(
                             counters.pruned_by_level += 1;
                             continue;
                         }
-                        if row_range_index.is_some_and(|index| {
-                            !data_file_overlaps_row_range_index(entry.file(), index)
-                        }) {
-                            counters.pruned_by_row_ranges += 1;
-                            continue;
-                        }
                         if !data_predicates.is_empty()
                             && !data_file_matches_predicates(
                                 entry.file(),
@@ -273,6 +267,12 @@ async fn read_all_manifest_entries(
         counters.merge(manifest_counters);
         all_entries.extend(entries);
     }
+    if let Some(index) = row_range_index {
+        let before = all_entries.len();
+        all_entries = retain_manifest_entry_row_range_groups(all_entries, index);
+        counters.pruned_by_row_ranges = before - all_entries.len();
+        counters.after_manifest_filters = all_entries.len();
+    }
     if let Some(trace) = trace {
         trace.manifest_entries_read = counters.entries_read;
         trace.manifest_entries_pruned_by_bucket = counters.pruned_by_bucket;
@@ -286,30 +286,226 @@ async fn read_all_manifest_entries(
     Ok(all_entries)
 }
 
+#[cfg(test)]
 fn manifest_file_overlaps_row_range_index(
     manifest: &crate::spec::ManifestFileMeta,
     row_range_index: &RowRangeIndex,
 ) -> bool {
+    manifest_row_id_range(manifest).is_none_or(|(min, max)| row_range_index.intersects(min, max))
+}
+
+fn manifest_row_id_range(manifest: &crate::spec::ManifestFileMeta) -> Option<(i64, i64)> {
     match (manifest.min_row_id(), manifest.max_row_id()) {
-        (Some(min), Some(max)) if min <= max => row_range_index.intersects(min, max),
-        _ => true,
+        (Some(min), Some(max)) if min <= max => Some((min, max)),
+        _ => None,
     }
 }
 
+fn retain_manifest_row_range_components(
+    manifests: &mut Vec<crate::spec::ManifestFileMeta>,
+    row_range_index: &RowRangeIndex,
+) {
+    let ranges = manifests
+        .iter()
+        .map(manifest_row_id_range)
+        .collect::<Option<Vec<_>>>();
+    let Some(ranges) = ranges else {
+        // An unknown manifest range may contain the anchor that connects otherwise
+        // disjoint dedicated-file ranges. Fail open for the whole list.
+        return;
+    };
+
+    let mut order = (0..manifests.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&idx| ranges[idx]);
+    let mut keep = vec![false; manifests.len()];
+    let mut component = Vec::new();
+    let mut component_from = 0i64;
+    let mut component_to = 0i64;
+
+    for idx in order {
+        let (from, to) = ranges[idx];
+        if component.is_empty() {
+            component_from = from;
+            component_to = to;
+            component.push(idx);
+        } else if from <= component_to {
+            component_to = component_to.max(to);
+            component.push(idx);
+        } else {
+            if row_range_index.intersects(component_from, component_to) {
+                for component_idx in component.drain(..) {
+                    keep[component_idx] = true;
+                }
+            } else {
+                component.clear();
+            }
+            component_from = from;
+            component_to = to;
+            component.push(idx);
+        }
+    }
+    if !component.is_empty() && row_range_index.intersects(component_from, component_to) {
+        for component_idx in component {
+            keep[component_idx] = true;
+        }
+    }
+
+    let mut idx = 0usize;
+    manifests.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+#[cfg(test)]
 fn data_file_overlaps_row_range_index(
     file: &DataFileMeta,
     row_range_index: &RowRangeIndex,
 ) -> bool {
-    let Some(first_row_id) = file.first_row_id else {
-        return true;
-    };
-    if file.row_count <= 0 {
-        return true;
+    file.row_id_range()
+        .is_none_or(|(from, to)| row_range_index.intersects(from, to))
+}
+
+fn retain_manifest_entry_row_range_groups(
+    entries: Vec<ManifestEntry>,
+    row_range_index: &RowRangeIndex,
+) -> Vec<ManifestEntry> {
+    let mut buckets: HashMap<(&[u8], i32), Vec<usize>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        buckets
+            .entry((entry.partition(), entry.bucket()))
+            .or_default()
+            .push(idx);
     }
-    let Some(last_row_id) = first_row_id.checked_add(file.row_count - 1) else {
-        return true;
+
+    let mut keep = vec![false; entries.len()];
+    for indices in buckets.values_mut() {
+        if indices
+            .iter()
+            .any(|&idx| entries[idx].file().row_id_range().is_none())
+        {
+            // Unknown file ranges may bridge otherwise disjoint row groups.
+            // Keep the whole bucket rather than risking a partial group.
+            for &idx in indices.iter() {
+                keep[idx] = true;
+            }
+            continue;
+        }
+
+        indices.sort_unstable_by_key(|&idx| {
+            entries[idx]
+                .file()
+                .row_id_range()
+                .expect("validated row-id range")
+        });
+        let mut component = Vec::new();
+        let mut component_from = 0i64;
+        let mut component_to = 0i64;
+
+        for &idx in indices.iter() {
+            let (from, to) = entries[idx]
+                .file()
+                .row_id_range()
+                .expect("validated row-id range");
+            if component.is_empty() {
+                component_from = from;
+                component_to = to;
+                component.push(idx);
+            } else if from <= component_to {
+                component_to = component_to.max(to);
+                component.push(idx);
+            } else {
+                if row_range_index.intersects(component_from, component_to) {
+                    for component_idx in component.drain(..) {
+                        keep[component_idx] = true;
+                    }
+                } else {
+                    component.clear();
+                }
+                component_from = from;
+                component_to = to;
+                component.push(idx);
+            }
+        }
+        if !component.is_empty() && row_range_index.intersects(component_from, component_to) {
+            for component_idx in component {
+                keep[component_idx] = true;
+            }
+        }
+    }
+    drop(buckets);
+
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| keep[idx].then_some(entry))
+        .collect()
+}
+
+fn data_evolution_row_range_groups(
+    data_files: Vec<DataFileMeta>,
+    row_ranges: Option<&[RowRange]>,
+) -> (Vec<Vec<DataFileMeta>>, usize) {
+    if data_files.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let Some(row_ranges) = row_ranges else {
+        return (group_by_overlapping_row_id(data_files), 0);
     };
-    row_range_index.intersects(first_row_id, last_row_id)
+    let all_ranges_known = data_files.iter().all(|file| file.row_id_range().is_some());
+    if !all_ranges_known {
+        // Avoid unchecked row-range arithmetic in downstream grouping and keep
+        // the whole bucket as one non-raw group. The reader will then fail on
+        // invalid metadata instead of silently losing dedicated providers.
+        return (vec![data_files], 0);
+    }
+    let row_id_groups = group_by_overlapping_row_id(data_files);
+    let groups_before_pruning = row_id_groups.len();
+
+    let retained = row_id_groups
+        .into_iter()
+        .filter(|group| {
+            group
+                .iter()
+                .any(|file| any_range_overlaps_file(row_ranges, file))
+        })
+        .collect::<Vec<_>>();
+    let pruned = groups_before_pruning - retained.len();
+    (retained, pruned)
+}
+
+fn split_row_ranges_for_files(
+    effective_row_ranges: Option<&[RowRange]>,
+    files: &[DataFileMeta],
+) -> crate::Result<Option<Vec<RowRange>>> {
+    let Some(ranges) = effective_row_ranges else {
+        return Ok(None);
+    };
+    if let Some(file) = files.iter().find(|file| file.row_id_range().is_none()) {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Cannot apply selected row ranges to file '{}' with missing or invalid row-id range",
+                file.file_name
+            ),
+            source: None,
+        });
+    }
+
+    let split_ranges = merge_row_ranges(
+        files
+            .iter()
+            .flat_map(|file| intersect_ranges_with_file(ranges, file))
+            .collect(),
+    );
+    if split_ranges.is_empty() {
+        return Err(crate::Error::DataInvalid {
+            message: "Planned data-evolution split does not overlap selected row ranges"
+                .to_string(),
+            source: None,
+        });
+    }
+    Ok(Some(split_ranges))
 }
 
 fn retain_index_manifest_entry(
@@ -1370,7 +1566,7 @@ impl<'a> PaimonTableScan<'a> {
             }
         }
         if let Some(index) = row_range_index {
-            manifest_metas.retain(|meta| manifest_file_overlaps_row_range_index(meta, index));
+            retain_manifest_row_range_components(&mut manifest_metas, index);
         }
 
         let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
@@ -1446,11 +1642,12 @@ impl<'a> PaimonTableScan<'a> {
         let entries = entries
             .into_iter()
             .filter(|entry| *entry.kind() == FileKind::Add)
-            .filter(|entry| {
-                row_range_index
-                    .is_none_or(|index| data_file_overlaps_row_range_index(entry.file(), index))
-            })
-            .collect();
+            .collect::<Vec<_>>();
+        let entries = if let Some(index) = row_range_index {
+            retain_manifest_entry_row_range_groups(entries, index)
+        } else {
+            entries
+        };
         Ok(entries)
     }
 
@@ -1671,35 +1868,11 @@ impl<'a> PaimonTableScan<'a> {
 
             // Data-evolution reads merge overlapping row-id groups column-wise.
             let file_groups: Vec<SplitGroup> = if data_evolution_enabled {
-                // Prune files before grouping and stats, while retaining every sequence
-                // candidate that overlaps a selected row.
-                let (data_files, pruned_groups) = if let Some(ref ranges) = effective_row_ranges {
-                    let pruned_groups = if trace.is_some() {
-                        group_by_overlapping_row_id(data_files.clone())
-                            .iter()
-                            .filter(|group| {
-                                !group
-                                    .iter()
-                                    .any(|file| any_range_overlaps_file(ranges, file))
-                            })
-                            .count()
-                    } else {
-                        0
-                    };
-                    (
-                        data_files
-                            .into_iter()
-                            .filter(|file| any_range_overlaps_file(ranges, file))
-                            .collect(),
-                        pruned_groups,
-                    )
-                } else {
-                    (data_files, 0)
-                };
-                let row_id_groups = group_by_overlapping_row_id(data_files);
+                let (row_id_groups, groups_pruned_by_row_ranges) =
+                    data_evolution_row_range_groups(data_files, effective_row_ranges.as_deref());
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.data_evolution_groups_before_stats += row_id_groups.len();
-                    trace.data_evolution_groups_pruned_by_row_ranges += pruned_groups;
+                    trace.data_evolution_groups_pruned_by_row_ranges += groups_pruned_by_row_ranges;
                 }
 
                 // Filter groups by merged stats before splitting.
@@ -1815,21 +1988,8 @@ impl<'a> PaimonTableScan<'a> {
                         .collect::<Vec<Option<DeletionFile>>>()
                 });
 
-                // Compute row_ranges before moving file_group to avoid clone
-                let split_row_ranges = if let Some(ref ranges) = effective_row_ranges {
-                    let mut split_ranges = Vec::new();
-                    for file in &file_group {
-                        split_ranges.extend(intersect_ranges_with_file(ranges, file));
-                    }
-                    let split_ranges = merge_row_ranges(split_ranges);
-                    if split_ranges.is_empty() {
-                        None
-                    } else {
-                        Some(split_ranges)
-                    }
-                } else {
-                    None
-                };
+                let split_row_ranges =
+                    split_row_ranges_for_files(effective_row_ranges.as_deref(), &file_group)?;
 
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
@@ -1887,9 +2047,11 @@ impl<'a> PaimonTableScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_file_overlaps_row_range_index, manifest_file_overlaps_row_range_index,
-        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        should_skip_level_zero_for_scan, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
+        data_evolution_row_range_groups, data_file_overlaps_row_range_index,
+        manifest_file_overlaps_row_range_index, prune_data_evolution_group_by_read_fields,
+        retain_index_manifest_entry, retain_manifest_entry_row_range_groups,
+        retain_manifest_row_range_components, should_skip_level_zero_for_scan,
+        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
         TableScan,
     };
     use crate::catalog::Identifier;
@@ -1897,8 +2059,9 @@ mod tests {
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
         CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind,
-        IndexFileMeta, IndexManifestEntry, IntType, ManifestFileMeta, Predicate, PredicateBuilder,
-        PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema, VarCharType,
+        IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta, Predicate,
+        PredicateBuilder, PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema,
+        VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -1988,6 +2151,156 @@ mod tests {
             &make_evo_file("overflow", 1, 2, 0, Some(i64::MAX)),
             &index
         ));
+    }
+
+    #[test]
+    fn test_manifest_row_range_pruning_retains_overlapping_component() {
+        let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
+        let stats = BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new());
+        let manifest = |name: &str, min, max| {
+            ManifestFileMeta::new(name.to_string(), 1, 1, 0, stats.clone(), 0)
+                .with_row_id_stats(Some(min), Some(max))
+        };
+        let mut manifests = vec![
+            manifest("anchor", 0, 5),
+            manifest("left-dedicated", 0, 1),
+            manifest("right-dedicated", 4, 5),
+            manifest("other-group", 10, 15),
+        ];
+
+        retain_manifest_row_range_components(&mut manifests, &index);
+
+        assert_eq!(
+            manifests
+                .iter()
+                .map(ManifestFileMeta::file_name)
+                .collect::<Vec<_>>(),
+            vec!["anchor", "left-dedicated", "right-dedicated"]
+        );
+    }
+
+    #[test]
+    fn test_manifest_row_range_component_pruning_fails_open_on_unknown_range() {
+        let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
+        let stats = BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new());
+        let mut manifests = vec![
+            ManifestFileMeta::new("unknown".to_string(), 1, 1, 0, stats.clone(), 0),
+            ManifestFileMeta::new("inverted".to_string(), 1, 1, 0, stats.clone(), 0)
+                .with_row_id_stats(Some(20), Some(10)),
+            ManifestFileMeta::new("one-sided".to_string(), 1, 1, 0, stats.clone(), 0)
+                .with_row_id_stats(Some(0), None),
+            ManifestFileMeta::new("outside".to_string(), 1, 1, 0, stats, 0)
+                .with_row_id_stats(Some(10), Some(15)),
+        ];
+
+        retain_manifest_row_range_components(&mut manifests, &index);
+
+        assert_eq!(manifests.len(), 4);
+    }
+
+    #[test]
+    fn test_manifest_entry_row_range_pruning_retains_overlapping_group() {
+        let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
+        let entry = |name: &str, first_row_id, row_count| {
+            ManifestEntry::new(
+                FileKind::Add,
+                Vec::new(),
+                0,
+                1,
+                make_evo_file(name, 1, row_count, 0, Some(first_row_id)),
+                3,
+            )
+        };
+        let entries = vec![
+            entry("anchor", 0, 6),
+            entry("left-dedicated", 0, 2),
+            entry("right-dedicated", 4, 2),
+            entry("other-group", 10, 2),
+        ];
+
+        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|entry| entry.file().file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["anchor", "left-dedicated", "right-dedicated"]
+        );
+    }
+
+    #[test]
+    fn test_manifest_entry_row_range_pruning_fails_open_per_bucket() {
+        let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
+        let entry = |name: &str, bucket, first_row_id, row_count| {
+            ManifestEntry::new(
+                FileKind::Add,
+                Vec::new(),
+                bucket,
+                2,
+                make_evo_file(name, 1, row_count, 0, first_row_id),
+                3,
+            )
+        };
+        let entries = vec![
+            entry("unknown-anchor", 0, None, 6),
+            entry("zero-count", 0, Some(10), 0),
+            entry("overflow", 0, Some(i64::MAX), 2),
+            entry("bucket-0-outside", 0, Some(10), 2),
+            entry("bucket-1-outside", 1, Some(10), 2),
+        ];
+
+        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+
+        let mut names = retained
+            .into_iter()
+            .map(|entry| entry.file().file_name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "bucket-0-outside",
+                "overflow",
+                "unknown-anchor",
+                "zero-count",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_data_evolution_row_range_group_pruning_fails_open_on_unknown_range() {
+        let files = vec![
+            make_evo_file("unknown-anchor", 1, 6, 0, None),
+            make_evo_file("left.blob", 1, 2, 0, Some(0)),
+            make_evo_file("right.blob", 1, 2, 0, Some(4)),
+        ];
+        let ranges = [RowRange::new(2, 2)];
+
+        let (groups, pruned) = data_evolution_row_range_groups(files, Some(&ranges));
+
+        assert_eq!(pruned, 0);
+        let mut names = groups
+            .into_iter()
+            .flatten()
+            .map(|file| file.file_name)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["left.blob", "right.blob", "unknown-anchor"]);
+    }
+
+    #[test]
+    fn test_split_row_ranges_rejects_unknown_or_non_overlapping_files() {
+        let ranges = [RowRange::new(2, 2)];
+        let unknown = make_evo_file("unknown", 1, 6, 0, None);
+        let error = split_row_ranges_for_files(Some(&ranges), &[unknown]).unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { message, .. }
+            if message.contains("missing or invalid row-id range")));
+
+        let outside = make_evo_file("outside", 1, 2, 0, Some(10));
+        let error = split_row_ranges_for_files(Some(&ranges), &[outside]).unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { message, .. }
+            if message.contains("does not overlap selected row ranges")));
     }
 
     fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
