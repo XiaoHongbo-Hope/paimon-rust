@@ -144,9 +144,14 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cargo-about
+        if: matrix.runner != 'macos-15-intel'
         uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
           tool: cargo-about@0.9.1
+
+      - name: Install cargo-about on Intel macOS
+        if: matrix.runner == 'macos-15-intel'
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
 
       - name: Install zstd on Linux
         if: runner.os == 'Linux'
