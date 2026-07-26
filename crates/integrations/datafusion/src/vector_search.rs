@@ -221,10 +221,22 @@ impl TableProvider for VectorSearchTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.inner.table();
         let projected_schema = project_schema(&self.schema(), projection)?;
+
+        // Honor the outer query limit: we only need the top `limit` most relevant
+        // rows, so bounding the search here also bounds the read and the in-memory
+        // materialization below (e.g. `vector_search(..., 1_000_000) LIMIT 1` only
+        // searches/reads/materializes one row instead of a million).
+        let effective_limit = match limit {
+            Some(outer) => self.limit.min(outer),
+            None => self.limit,
+        };
+        if effective_limit == 0 {
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
 
         // Best-first row-ids from the index (data-evolution / global-index path;
         // PK-vector tables are unsupported here, as before).
@@ -233,7 +245,7 @@ impl TableProvider for VectorSearchTableProvider {
             builder
                 .with_vector_column(&self.column_name)
                 .with_query_vector(self.query_vector.clone())
-                .with_limit(self.limit);
+                .with_limit(effective_limit);
             builder.execute_scored().await.map_err(to_datafusion_error)
         })
         .await?;

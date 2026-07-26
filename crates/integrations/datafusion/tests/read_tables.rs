@@ -2068,6 +2068,16 @@ mod vector_search_tests {
             vec![2, 5, 1],
             "SELECT * must also be relevance-ordered"
         );
+
+        // An outer LIMIT bounds the search: top-2 of the relevance order is [2, 5].
+        let limited = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 6) LIMIT 2")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+        assert_eq!(extract_ids_in_order(&limited), vec![2, 5]);
     }
 
     /// Regression: a result containing a string column must not fail on the provider's
