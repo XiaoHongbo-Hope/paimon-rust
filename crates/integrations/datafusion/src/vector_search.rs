@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{
     Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt32Array,
 };
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
@@ -376,8 +377,17 @@ fn gather_rows_by_rank(
                     field.name()
                 ))
             })?;
-            arrow_select::take::take(combined.column(index).as_ref(), &take_indices, None)
-                .map_err(DataFusionError::from)
+            let taken =
+                arrow_select::take::take(combined.column(index).as_ref(), &take_indices, None)
+                    .map_err(DataFusionError::from)?;
+            // The Paimon read keeps its own arrow types (e.g. `Utf8`), but the provider
+            // schema may differ (e.g. DataFusion's `Utf8View`); cast to match, as the
+            // normal scan path does via `to_datafusion_batch`.
+            if taken.data_type() == field.data_type() {
+                Ok(taken)
+            } else {
+                cast(taken.as_ref(), field.data_type()).map_err(DataFusionError::from)
+            }
         })
         .collect::<DFResult<Vec<_>>>()?;
 
