@@ -28,7 +28,7 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::stats::Precision;
-use datafusion::common::{project_schema, Statistics};
+use datafusion::common::{internal_err, project_schema, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -391,16 +391,24 @@ impl ExecutionPlan for VectorSearchExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!("VectorSearchExec is a leaf and takes no children");
+        }
         Ok(self)
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!(
+                "VectorSearchExec has a single partition, got partition {partition}"
+            );
+        }
         let exec = self.clone();
         let stream = stream::once(async move { exec.compute_batch().await });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
