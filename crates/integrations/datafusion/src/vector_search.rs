@@ -18,22 +18,32 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt32Array,
+};
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::project_schema;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 use paimon::catalog::Catalog;
+use paimon::spec::{
+    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+};
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
-use crate::table::{PaimonScanBuilder, PaimonTableProvider};
+use crate::table::{datafusion_read_fields, PaimonTableProvider};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
@@ -207,51 +217,62 @@ impl TableProvider for VectorSearchTableProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.inner.table();
+        let projected_schema = project_schema(&self.schema(), projection)?;
 
-        let row_ranges = await_with_runtime(async {
+        // Best-first row-ids from the index (data-evolution / global-index path;
+        // PK-vector tables are unsupported here, as before).
+        let search_result = await_with_runtime(async {
             let mut builder = table.new_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
                 .with_query_vector(self.query_vector.clone())
                 .with_limit(self.limit);
-            builder.execute().await.map_err(to_datafusion_error)
+            builder.execute_scored().await.map_err(to_datafusion_error)
         })
         .await?;
 
-        if row_ranges.is_empty() {
-            let schema = project_schema(&self.schema(), projection)?;
-            return Ok(Arc::new(EmptyExec::new(schema)));
+        if search_result.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        let mut read_builder = table.new_read_builder();
-        if let Some(limit) = limit {
-            read_builder.with_limit(limit);
-        }
-        let scan = read_builder.new_scan().with_row_ranges(row_ranges);
-        let plan = await_with_runtime(scan.plan())
-            .await
-            .map_err(to_datafusion_error)?;
+        // Read the projected columns (+ internal `_ROW_ID`); the row-range scan yields
+        // file order, realigned to relevance rank below.
+        let read_fields = projected_read_fields(table, projection)?;
+        let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
+        let batches = await_with_runtime(async {
+            let mut read_builder = table.new_read_builder();
+            read_builder
+                .with_read_type(read_fields)
+                .with_row_ranges(row_ranges);
+            let scan = read_builder.new_scan();
+            let plan = scan.plan().await.map_err(to_datafusion_error)?;
+            let table_read = read_builder.new_read().map_err(to_datafusion_error)?;
+            let mut stream = table_read
+                .to_arrow(plan.splits())
+                .map_err(to_datafusion_error)?;
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
+                batches.push(batch);
+            }
+            Ok::<_, DataFusionError>(batches)
+        })
+        .await?;
 
-        let target = state.config_options().execution.target_partitions;
-        PaimonScanBuilder {
-            table,
-            schema: &self.schema(),
-            plan: &plan,
-            scan_trace: None,
-            projection,
-            pushed_predicate: None,
-            limit,
-            target_partitions: target,
-            filter_exact: false,
-            case_sensitive: true,
-        }
-        .build()
+        // Realign file-order rows to best-first rank and drop `_ROW_ID` — this is what
+        // honors the documented "top-k rows ordered by relevance score" contract.
+        let ordered = gather_rows_by_rank(&batches, &search_result.row_ids, &projected_schema)?;
+
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![ordered]],
+            projected_schema,
+            None,
+        )?)
     }
 
     fn supports_filters_pushdown(
@@ -263,4 +284,105 @@ impl TableProvider for VectorSearchTableProvider {
             filters.len()
         ])
     }
+}
+
+/// Projected user columns (+ internal `_ROW_ID`, needed to realign rows to rank).
+/// Errors if the table has no row tracking, since results then can't be ordered.
+fn projected_read_fields(
+    table: &paimon::table::Table,
+    projection: Option<&Vec<usize>>,
+) -> DFResult<Vec<DataField>> {
+    let base_fields = datafusion_read_fields(table);
+    let mut read_fields: Vec<DataField> = match projection {
+        Some(indices) => indices.iter().map(|&i| base_fields[i].clone()).collect(),
+        None => base_fields,
+    };
+    if !read_fields
+        .iter()
+        .any(|field| field.name() == ROW_ID_FIELD_NAME)
+    {
+        if !CoreOptions::new(table.schema().options()).row_tracking_enabled() {
+            return Err(DataFusionError::Plan(
+                "vector_search: cannot order results by relevance because _ROW_ID is not available"
+                    .to_string(),
+            ));
+        }
+        read_fields.push(DataField::new(
+            ROW_ID_FIELD_ID,
+            ROW_ID_FIELD_NAME.to_string(),
+            DataType::BigInt(BigIntType::with_nullable(true)),
+        ));
+    }
+    Ok(read_fields)
+}
+
+/// Gather the file-order `batches` into `ranked_row_ids` order (rank == slice index),
+/// producing `output_schema` (which excludes `_ROW_ID`). A permutation driven by the
+/// index's existing ranking, not a re-sort.
+fn gather_rows_by_rank(
+    batches: &[RecordBatch],
+    ranked_row_ids: &[u64],
+    output_schema: &ArrowSchemaRef,
+) -> DFResult<RecordBatch> {
+    let input_schema = batches.first().map(|batch| batch.schema()).ok_or_else(|| {
+        DataFusionError::Internal("vector_search: no rows materialized".to_string())
+    })?;
+    let combined = arrow_select::concat::concat_batches(&input_schema, batches)
+        .map_err(DataFusionError::from)?;
+
+    let row_id_index = combined.schema().index_of(ROW_ID_FIELD_NAME).map_err(|_| {
+        DataFusionError::Internal(format!(
+            "vector_search: materialized rows are missing the {ROW_ID_FIELD_NAME} column"
+        ))
+    })?;
+    let row_ids = combined
+        .column(row_id_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!("vector_search: {ROW_ID_FIELD_NAME} must be Int64"))
+        })?;
+
+    // Map global row id -> physical position in the materialized batch.
+    let mut position_of: HashMap<i64, u32> = HashMap::with_capacity(combined.num_rows());
+    for row in 0..combined.num_rows() {
+        if !row_ids.is_null(row) {
+            position_of.insert(row_ids.value(row), row as u32);
+        }
+    }
+
+    // Emit in rank order; extra scanned rows are ignored, but a missing scored id
+    // fails loud rather than silently shrinking the top-k.
+    let mut take_indices: Vec<u32> = Vec::with_capacity(ranked_row_ids.len());
+    for &row_id in ranked_row_ids {
+        let position = position_of.get(&(row_id as i64)).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "vector_search: scored row id {row_id} was not materialized; \
+                 cannot return the requested top-k"
+            ))
+        })?;
+        take_indices.push(*position);
+    }
+    let take_indices = UInt32Array::from(take_indices);
+    let row_count = take_indices.len();
+
+    let columns = output_schema
+        .fields()
+        .iter()
+        .map(|field| -> DFResult<ArrayRef> {
+            let index = combined.schema().index_of(field.name()).map_err(|_| {
+                DataFusionError::Internal(format!(
+                    "vector_search: materialized rows are missing expected column '{}'",
+                    field.name()
+                ))
+            })?;
+            arrow_select::take::take(combined.column(index).as_ref(), &take_indices, None)
+                .map_err(DataFusionError::from)
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    // Preserve the row count for a zero-column projection (e.g. `COUNT(*)`).
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    RecordBatch::try_new_with_options(Arc::clone(output_schema), columns, &options)
+        .map_err(DataFusionError::from)
 }

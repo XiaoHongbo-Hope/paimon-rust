@@ -1877,6 +1877,22 @@ mod vector_search_tests {
         ids
     }
 
+    /// Like [`extract_ids`] but preserves the row order returned by the query (used to
+    /// assert relevance ordering).
+    fn extract_ids_in_order(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for id");
+            for i in 0..batch.num_rows() {
+                ids.push(id_array.value(i));
+            }
+        }
+        ids
+    }
+
     fn extract_query_result_ids(
         batches: &[datafusion::arrow::record_batch::RecordBatch],
     ) -> Vec<(i32, i32)> {
@@ -1959,6 +1975,97 @@ mod vector_search_tests {
         let ids = extract_ids(&batches);
         assert_eq!(ids.len(), 3);
         assert!(ids.contains(&0), "exact match [1,0,0,0] should be in top 3");
+    }
+
+    /// `vector_search` must return rows in relevance order, not file order. Querying
+    /// id 2's vector ranks `[2, 5, 1]` by L2 distance, which differs from the
+    /// ascending-id file order `[1, 2, 5]` the pre-fix scan produced.
+    #[tokio::test]
+    async fn test_vector_search_orders_by_relevance() {
+        let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
+        let identifier = Identifier::new("default", "vindex_order_e2e");
+        catalog
+            .create_table(&identifier, build_vindex_table_schema(), false)
+            .await
+            .expect("Failed to create table");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("Failed to load table");
+
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("Failed to configure write builder");
+        let mut table_write = write_builder
+            .new_write()
+            .expect("Failed to create table write");
+        table_write
+            .write_arrow_batch(&build_vector_batch(
+                vec![0, 1, 2, 3, 4, 5],
+                vec![
+                    vec![1.0, 0.0],
+                    vec![0.9, 0.1],
+                    vec![0.0, 1.0],
+                    vec![-1.0, 0.0],
+                    vec![0.0, -1.0],
+                    vec![0.7, 0.3],
+                ],
+            ))
+            .await
+            .expect("Failed to write vector batch");
+        let messages = table_write
+            .prepare_commit()
+            .await
+            .expect("Failed to prepare commit");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("Failed to commit vector data");
+
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.vindex_order_e2e', \
+             index_column => 'embedding', \
+             index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=2,ivf-flat.nlist=1,ivf-flat.distance.metric=l2')",
+        )
+        .await
+        .expect("vindex index build SQL should parse")
+        .collect()
+        .await
+        .expect("vindex index build SQL should execute");
+
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let ordered = extract_ids_in_order(&batches);
+        assert_eq!(
+            ordered,
+            vec![2, 5, 1],
+            "vector_search must return rows best-first by relevance, not in file order"
+        );
+
+        // The full-projection path (`SELECT *`, i.e. projection = None) must stay
+        // ordered too, and round-trip the other columns.
+        let star_batches = ctx
+            .sql("SELECT * FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+        assert_eq!(
+            extract_ids_in_order(&star_batches),
+            vec![2, 5, 1],
+            "SELECT * must also be relevance-ordered"
+        );
     }
 
     #[tokio::test]
