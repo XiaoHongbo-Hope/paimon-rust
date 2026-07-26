@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt::Debug;
-use std::sync::Arc;
-
 use std::collections::HashMap;
+use std::fmt::{self, Debug};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -28,19 +27,26 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
-use datafusion::common::project_schema;
-use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::common::stats::Precision;
+use datafusion::common::{project_schema, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
+use futures::{stream, TryStreamExt};
 use paimon::catalog::Catalog;
 use paimon::spec::{
     BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
+use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
@@ -223,43 +229,121 @@ impl TableProvider for VectorSearchTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self.inner.table();
         let projected_schema = project_schema(&self.schema(), projection)?;
 
-        // Honor the outer query limit: we only need the top `limit` most relevant
-        // rows, so bounding the search here also bounds the read and the in-memory
-        // materialization below (e.g. `vector_search(..., 1_000_000) LIMIT 1` only
-        // searches/reads/materializes one row instead of a million).
-        let effective_limit = match limit {
-            Some(outer) => self.limit.min(outer),
-            None => self.limit,
-        };
-        if effective_limit == 0 {
+        // An outer `LIMIT 0` needs no rows.
+        if limit == Some(0) {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        // Best-first row-ids from the index (data-evolution / global-index path;
-        // PK-vector tables are unsupported here, as before).
-        let search_result = await_with_runtime(async {
-            let mut builder = table.new_vector_search_builder();
+        // The search runs with the table function's own top-k (`self.limit`) so the ANN
+        // recall/search width is unchanged; the outer DataFusion `limit` only truncates
+        // the already-ranked result before any rows are read (so a large top-k with a
+        // small outer LIMIT doesn't read/materialize everything). All of this — search,
+        // read and rank-order gather — runs at execution time in the exec's stream, so
+        // planning / EXPLAIN stays cheap and the work is driven by the TaskContext.
+        Ok(Arc::new(VectorSearchExec::new(
+            self.inner.table().clone(),
+            self.column_name.clone(),
+            self.query_vector.clone(),
+            self.limit,
+            limit,
+            projection.cloned(),
+            projected_schema,
+        )))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
+    }
+}
+
+/// Execution-time plan for `vector_search`: runs the ANN search, reads the matching
+/// rows, and gathers them into best-first relevance order when its stream is polled,
+/// so planning (and `EXPLAIN`) stays cheap and the work runs under DataFusion's
+/// `TaskContext`.
+#[derive(Debug, Clone)]
+struct VectorSearchExec {
+    table: Table,
+    column_name: String,
+    query_vector: Vec<f32>,
+    /// The table function's own top-k — drives the ANN search width; never reduced.
+    search_limit: usize,
+    /// The outer DataFusion `LIMIT`, applied by truncating the ranked result.
+    output_limit: Option<usize>,
+    projection: Option<Vec<usize>>,
+    output_schema: ArrowSchemaRef,
+    plan_properties: Arc<PlanProperties>,
+}
+
+impl VectorSearchExec {
+    fn new(
+        table: Table,
+        column_name: String,
+        query_vector: Vec<f32>,
+        search_limit: usize,
+        output_limit: Option<usize>,
+        projection: Option<Vec<usize>>,
+        output_schema: ArrowSchemaRef,
+    ) -> Self {
+        let plan_properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            table,
+            column_name,
+            query_vector,
+            search_limit,
+            output_limit,
+            projection,
+            output_schema,
+            plan_properties,
+        }
+    }
+
+    async fn compute_batch(&self) -> DFResult<RecordBatch> {
+        // Best-first row-ids from the index, searched at the full top-k so the ANN
+        // recall is unchanged (data-evolution / global-index path; PK-vector tables are
+        // unsupported here, as before).
+        let mut search_result = await_with_runtime(async {
+            let mut builder = self.table.new_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
                 .with_query_vector(self.query_vector.clone())
-                .with_limit(effective_limit);
+                .with_limit(self.search_limit);
             builder.execute_scored().await.map_err(to_datafusion_error)
         })
         .await?;
 
         if search_result.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+        }
+
+        // Apply the outer LIMIT by truncating the ranked result *before* reading, so a
+        // large top-k with a small outer LIMIT only reads/materializes the rows it can
+        // return (the search itself is unaffected).
+        if let Some(n) = self.output_limit {
+            if search_result.row_ids.len() > n {
+                search_result.row_ids.truncate(n);
+                search_result.scores.truncate(n);
+            }
         }
 
         // Read the projected columns (+ internal `_ROW_ID`); the row-range scan yields
         // file order, realigned to relevance rank below.
-        let read_fields = projected_read_fields(table, projection)?;
+        let read_fields = projected_read_fields(&self.table, self.projection.as_ref())?;
         let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
         let batches = await_with_runtime(async {
-            let mut read_builder = table.new_read_builder();
+            let mut read_builder = self.table.new_read_builder();
             read_builder
                 .with_read_type(read_fields)
                 .with_row_ranges(row_ranges);
@@ -277,25 +361,60 @@ impl TableProvider for VectorSearchTableProvider {
         })
         .await?;
 
-        // Realign file-order rows to best-first rank and drop `_ROW_ID` — this is what
-        // honors the documented "top-k rows ordered by relevance score" contract.
-        let ordered = gather_rows_by_rank(&batches, &search_result.row_ids, &projected_schema)?;
+        // Realign file-order rows to best-first rank and drop `_ROW_ID`.
+        gather_rows_by_rank(&batches, &search_result.row_ids, &self.output_schema)
+    }
+}
 
-        Ok(MemorySourceConfig::try_new_exec(
-            &[vec![ordered]],
-            projected_schema,
-            None,
-        )?)
+impl DisplayAs for VectorSearchExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "VectorSearchExec: column={}, search_limit={}, output_limit={:?}",
+            self.column_name, self.search_limit, self.output_limit
+        )
+    }
+}
+
+impl ExecutionPlan for VectorSearchExec {
+    fn name(&self) -> &str {
+        "VectorSearchExec"
     }
 
-    fn supports_filters_pushdown(
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
         &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let exec = self.clone();
+        let stream = stream::once(async move { exec.compute_batch().await });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            Box::pin(stream),
+        )))
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: Statistics::unknown_column(&self.output_schema),
+        }))
     }
 }
 

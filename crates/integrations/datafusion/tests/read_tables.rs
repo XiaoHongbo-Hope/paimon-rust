@@ -2069,9 +2069,9 @@ mod vector_search_tests {
             "SELECT * must also be relevance-ordered"
         );
 
-        // An outer LIMIT bounds the search: top-2 of the relevance order is [2, 5].
+        // An outer LIMIT truncates the ranked result: top-2 of [2, 5, 1] is [2, 5].
         let limited = ctx
-            .sql("SELECT id FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 6) LIMIT 2")
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 3) LIMIT 2")
             .await
             .expect("SQL should parse")
             .collect()
