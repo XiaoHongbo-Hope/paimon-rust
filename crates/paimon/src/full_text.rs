@@ -126,9 +126,8 @@ impl SearchResult {
 
     /// Return top-k results by score (descending).
     pub fn top_k(&self, k: usize) -> Self {
-        if self.row_ids.len() <= k {
-            return self.clone();
-        }
+        // Always sort best-first, even when no truncation is needed (len <= k):
+        // downstream consumers rely on relevance order, not input/shard order.
         let mut indices: Vec<usize> = (0..self.row_ids.len()).collect();
         indices.sort_by(|&a, &b| {
             self.scores[b]
@@ -258,8 +257,20 @@ mod tests {
             .without_deleted_row_ranges(Some(&deleted))
             .unwrap()
             .top_k(10);
-        assert_eq!(filtered.row_ids, vec![1, 4]);
-        assert_eq!(filtered.scores, vec![0.1, 0.2]);
+        // Rows 2..3 are deleted; the remaining rows come back best-first by score.
+        assert_eq!(filtered.row_ids, vec![4, 1]);
+        assert_eq!(filtered.scores, vec![0.2, 0.1]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_sorts_best_first_without_truncation() {
+        // k >= candidate count: results must still be best-first by score, not in
+        // input/shard order.
+        let result = SearchResult::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
+
+        let top = result.top_k(3);
+        assert_eq!(top.row_ids, vec![1, 2, 3]);
+        assert_eq!(top.scores, vec![0.9, 0.5, 0.1]);
     }
 
     #[test]
