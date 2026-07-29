@@ -268,11 +268,11 @@ async fn read_all_manifest_entries(
         all_entries.extend(entries);
     }
     let mut all_entries = merge_manifest_entries(all_entries);
+    let manifest_entries_after_merge = all_entries.len();
     if let Some(index) = row_range_index {
         let before = all_entries.len();
         all_entries = retain_live_manifest_entry_row_range_groups(all_entries, index);
         counters.pruned_by_row_ranges = before - all_entries.len();
-        counters.after_manifest_filters = all_entries.len();
     }
     if let Some(trace) = trace {
         trace.manifest_entries_read = counters.entries_read;
@@ -283,7 +283,7 @@ async fn read_all_manifest_entries(
         trace.manifest_entries_pruned_by_row_ranges = counters.pruned_by_row_ranges;
         trace.manifest_entries_pruned_by_data_stats = counters.pruned_by_data_stats;
         trace.manifest_entries_after_manifest_filters = counters.after_manifest_filters;
-        trace.manifest_entries_after_merge = all_entries.len();
+        trace.manifest_entries_after_merge = manifest_entries_after_merge;
     }
     Ok(all_entries)
 }
@@ -3032,8 +3032,8 @@ mod tests {
         assert_eq!(planned_files, vec!["a-new", "a-old"]);
         assert_eq!(trace.manifest_entries_read, 4);
         assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 2);
-        assert_eq!(trace.manifest_entries_after_manifest_filters, 2);
-        assert_eq!(trace.manifest_entries_after_merge, 2);
+        assert_eq!(trace.manifest_entries_after_manifest_filters, 4);
+        assert_eq!(trace.manifest_entries_after_merge, 4);
         assert_eq!(trace.data_evolution_groups_before_stats, 1);
         assert_eq!(trace.data_evolution_groups_pruned_by_row_ranges, 0);
 
@@ -3065,12 +3065,13 @@ mod tests {
 
         let deleted = make_evo_file_with_cols("deleted.parquet", 10, 1, 0, &["id"]);
         let retained = make_evo_file_with_cols("retained.parquet", 10, 2, 0, &["id"]);
+        let pruned = make_evo_file_with_cols("pruned.parquet", 10, 3, 100, &["id"]);
         let partition = BinaryRowBuilder::new(0).build_serialized();
         TableCommit::new(table.clone(), "row-range-netting-add".to_string())
             .commit(vec![CommitMessage::new(
                 partition.clone(),
                 0,
-                vec![deleted.clone(), retained],
+                vec![deleted.clone(), retained, pruned],
             )])
             .await
             .unwrap();
@@ -3090,10 +3091,10 @@ mod tests {
             plan.splits()[0].data_files()[0].file_name,
             "retained.parquet"
         );
-        assert_eq!(trace.manifest_entries_read, 3);
-        assert_eq!(trace.manifest_entries_after_manifest_filters, 1);
-        assert_eq!(trace.manifest_entries_after_merge, 1);
-        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
+        assert_eq!(trace.manifest_entries_read, 4);
+        assert_eq!(trace.manifest_entries_after_manifest_filters, 4);
+        assert_eq!(trace.manifest_entries_after_merge, 2);
+        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 1);
     }
 
     #[tokio::test]
