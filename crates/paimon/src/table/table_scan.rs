@@ -267,9 +267,10 @@ async fn read_all_manifest_entries(
         counters.merge(manifest_counters);
         all_entries.extend(entries);
     }
+    let mut all_entries = merge_manifest_entries(all_entries);
     if let Some(index) = row_range_index {
         let before = all_entries.len();
-        all_entries = retain_manifest_entry_row_range_groups(all_entries, index);
+        all_entries = retain_live_manifest_entry_row_range_groups(all_entries, index);
         counters.pruned_by_row_ranges = before - all_entries.len();
         counters.after_manifest_filters = all_entries.len();
     }
@@ -282,6 +283,7 @@ async fn read_all_manifest_entries(
         trace.manifest_entries_pruned_by_row_ranges = counters.pruned_by_row_ranges;
         trace.manifest_entries_pruned_by_data_stats = counters.pruned_by_data_stats;
         trace.manifest_entries_after_manifest_filters = counters.after_manifest_filters;
+        trace.manifest_entries_after_merge = all_entries.len();
     }
     Ok(all_entries)
 }
@@ -367,12 +369,11 @@ fn data_file_overlaps_row_range_index(
         .is_none_or(|(from, to)| row_range_index.intersects(from, to))
 }
 
-fn retain_manifest_entry_row_range_groups(
+fn retain_live_manifest_entry_row_range_groups(
     entries: Vec<ManifestEntry>,
     row_range_index: &RowRangeIndex,
 ) -> Vec<ManifestEntry> {
-    // Net DELETE entries first to avoid resurrecting deleted witnesses.
-    let entries = merge_manifest_entries(entries);
+    debug_assert!(entries.iter().all(|entry| *entry.kind() == FileKind::Add));
     let mut buckets: HashMap<(&[u8], i32), Vec<usize>> = HashMap::new();
     for (idx, entry) in entries.iter().enumerate() {
         buckets
@@ -454,20 +455,26 @@ fn retain_manifest_entry_row_range_groups(
 enum DataEvolutionProviderKey<'a> {
     Normal,
     Blob(Option<&'a [String]>),
-    Vector(String, Option<&'a [String]>),
+    Vector(i64, String, Option<Vec<&'a str>>),
 }
 
 fn data_evolution_provider_key(file: &DataFileMeta) -> DataEvolutionProviderKey<'_> {
     if crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name) {
         DataEvolutionProviderKey::Blob(file.write_cols.as_deref())
     } else if is_vector_store_file_name(&file.file_name) {
+        let write_cols = file.write_cols.as_ref().map(|cols| {
+            let mut cols = cols.iter().map(String::as_str).collect::<Vec<_>>();
+            cols.sort_unstable();
+            cols
+        });
         DataEvolutionProviderKey::Vector(
+            file.schema_id,
             file.file_name
                 .rsplit('.')
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase(),
-            file.write_cols.as_deref(),
+            write_cols,
         )
     } else {
         DataEvolutionProviderKey::Normal
@@ -1272,7 +1279,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: &Snapshot,
         row_range_index: Option<&RowRangeIndex>,
-        mut trace: Option<&mut ScanTrace>,
+        trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
@@ -1346,14 +1353,10 @@ impl<'a> PaimonTableScan<'a> {
             &bucket_key_fields,
             bucket_function_type,
             row_range_index,
-            trace.as_deref_mut(),
+            trace,
         )
         .await?;
-        let merged = merge_manifest_entries(entries);
-        if let Some(trace) = trace {
-            trace.manifest_entries_after_merge = merged.len();
-        }
-        Ok(merged)
+        Ok(entries)
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
@@ -1713,7 +1716,7 @@ impl<'a> PaimonTableScan<'a> {
             .filter(|entry| *entry.kind() == FileKind::Add)
             .collect::<Vec<_>>();
         let entries = if let Some(index) = row_range_index {
-            retain_manifest_entry_row_range_groups(entries, index)
+            retain_live_manifest_entry_row_range_groups(entries, index)
         } else {
             entries
         };
@@ -2123,11 +2126,11 @@ impl<'a> PaimonTableScan<'a> {
 mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
-        manifest_file_overlaps_row_range_index, prune_data_evolution_group_by_read_fields,
-        retain_index_manifest_entry, retain_manifest_entry_row_range_groups,
-        retain_manifest_row_range_components, should_skip_level_zero_for_scan,
-        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
-        TableScan,
+        manifest_file_overlaps_row_range_index, merge_manifest_entries,
+        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
+        retain_live_manifest_entry_row_range_groups, retain_manifest_row_range_components,
+        should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
+        PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -2293,7 +2296,7 @@ mod tests {
             entry("other-group", 10, 2),
         ];
 
-        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
 
         assert_eq!(
             retained
@@ -2320,7 +2323,7 @@ mod tests {
             entry("image-3.blob", 300, 100, 3, &["image"]),
         ];
 
-        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
 
         assert_eq!(
             retained
@@ -2328,6 +2331,61 @@ mod tests {
                 .map(|entry| entry.file().file_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["base.parquet", "image-1.blob"]
+        );
+    }
+
+    #[test]
+    fn test_vector_provider_key_distinguishes_schema_ids() {
+        let index = RowRangeIndex::create(vec![RowRange::new(120, 129)]);
+        let entry = |name: &str, first_row_id, row_count, schema_id, write_cols: &[&str]| {
+            let mut file = make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols);
+            file.schema_id = schema_id;
+            ManifestEntry::new(FileKind::Add, Vec::new(), 0, 1, file, 3)
+        };
+        let entries = vec![
+            entry("base.parquet", 0, 1_000, 3, &["id"]),
+            entry("old.vector.parquet", 0, 100, 1, &["embedding"]),
+            entry("new.vector.parquet", 100, 100, 3, &["embedding"]),
+        ];
+
+        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|entry| entry.file().file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base.parquet", "old.vector.parquet", "new.vector.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_vector_provider_key_normalizes_write_col_order() {
+        let index = RowRangeIndex::create(vec![RowRange::new(120, 129)]);
+        let entry = |name: &str, first_row_id, row_count, write_cols: &[&str]| {
+            ManifestEntry::new(
+                FileKind::Add,
+                Vec::new(),
+                0,
+                1,
+                make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols),
+                3,
+            )
+        };
+        let entries = vec![
+            entry("base.parquet", 0, 1_000, &["id"]),
+            entry("old.vector.parquet", 0, 100, &["velocity", "embedding"]),
+            entry("new.vector.parquet", 100, 100, &["embedding", "velocity"]),
+        ];
+
+        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|entry| entry.file().file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base.parquet", "new.vector.parquet"]
         );
     }
 
@@ -2350,7 +2408,7 @@ mod tests {
             entry("payload-right.blob", 4, 2, &["payload"]),
         ];
 
-        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
 
         assert_eq!(
             retained
@@ -2380,7 +2438,8 @@ mod tests {
             entry(FileKind::Delete, "deleted-payload.blob", 0, 2, &["payload"]),
         ];
 
-        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+        let live_entries = merge_manifest_entries(entries);
+        let retained = retain_live_manifest_entry_row_range_groups(live_entries, &index);
 
         assert_eq!(
             retained
@@ -2412,7 +2471,7 @@ mod tests {
             entry("bucket-1-outside", 1, Some(10), 2),
         ];
 
-        let retained = retain_manifest_entry_row_range_groups(entries, &index);
+        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
 
         let mut names = retained
             .into_iter()
@@ -2998,6 +3057,45 @@ mod tests {
             .map(|file| file.file_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(delta_files, vec!["a-new", "a-old"]);
+    }
+
+    #[tokio::test]
+    async fn test_row_range_trace_excludes_manifest_netting() {
+        let table_path = "memory:/de_row_range_trace_netting";
+        let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "name"));
+        setup_scan_trace_dirs(&table).await;
+
+        let deleted = make_evo_file_with_cols("deleted.parquet", 10, 1, 0, &["id"]);
+        let retained = make_evo_file_with_cols("retained.parquet", 10, 2, 0, &["id"]);
+        let partition = BinaryRowBuilder::new(0).build_serialized();
+        TableCommit::new(table.clone(), "row-range-netting-add".to_string())
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![deleted.clone(), retained],
+            )])
+            .await
+            .unwrap();
+
+        let mut delete = CommitMessage::new(partition, 0, Vec::new());
+        delete.deleted_files = vec![deleted];
+        TableCommit::new(table.clone(), "row-range-netting-delete".to_string())
+            .commit(vec![delete])
+            .await
+            .unwrap();
+
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_row_ranges(vec![RowRange::new(0, 0)]);
+        let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(
+            plan.splits()[0].data_files()[0].file_name,
+            "retained.parquet"
+        );
+        assert_eq!(trace.manifest_entries_read, 3);
+        assert_eq!(trace.manifest_entries_after_manifest_filters, 1);
+        assert_eq!(trace.manifest_entries_after_merge, 1);
+        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
     }
 
     #[tokio::test]
