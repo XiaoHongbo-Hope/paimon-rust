@@ -454,6 +454,7 @@ fn retain_live_manifest_entry_row_range_groups(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DataEvolutionProviderKey<'a> {
     Normal,
+    // Blob bunches span schema versions and resolve to one write column.
     Blob(Option<&'a [String]>),
     Vector(i64, String, Option<Vec<&'a str>>),
 }
@@ -1711,10 +1712,7 @@ impl<'a> PaimonTableScan<'a> {
             )?;
             entries.extend(manifest_entries);
         }
-        let entries = entries
-            .into_iter()
-            .filter(|entry| *entry.kind() == FileKind::Add)
-            .collect::<Vec<_>>();
+        let entries = merge_manifest_entries(entries);
         let entries = if let Some(index) = row_range_index {
             retain_live_manifest_entry_row_range_groups(entries, index)
         } else {
@@ -3096,6 +3094,55 @@ mod tests {
         assert_eq!(trace.manifest_entries_after_manifest_filters, 1);
         assert_eq!(trace.manifest_entries_after_merge, 1);
         assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_delta_row_range_pruning_does_not_resurrect_deleted_witness() {
+        let table_path = "memory:/de_delta_row_range_netting";
+        let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "payload"));
+        setup_scan_trace_dirs(&table).await;
+
+        let deleted = make_evo_file_with_cols("deleted.blob", 100, 1, 0, &["payload"]);
+        let partition = BinaryRowBuilder::new(0).build_serialized();
+        TableCommit::new(table.clone(), "delta-netting-base".to_string())
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![deleted.clone()],
+            )])
+            .await
+            .unwrap();
+
+        let anchor = make_evo_file_with_cols("anchor.parquet", 1_000, 2, 0, &["id"]);
+        let mut replacement = CommitMessage::new(partition, 0, vec![anchor, deleted.clone()]);
+        replacement.deleted_files = vec![deleted];
+        TableCommit::new(table.clone(), "delta-netting-replacement".to_string())
+            .commit(vec![replacement])
+            .await
+            .unwrap();
+
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_row_ranges(vec![RowRange::new(120, 129)]);
+        let plan = read_builder
+            .new_scan()
+            .plan_snapshot_delta(&snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .flat_map(|split| split.data_files())
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["anchor.parquet"]
+        );
     }
 
     #[tokio::test]
