@@ -371,9 +371,7 @@ fn retain_manifest_entry_row_range_groups(
     entries: Vec<ManifestEntry>,
     row_range_index: &RowRangeIndex,
 ) -> Vec<ManifestEntry> {
-    // Net DELETE entries before choosing provider witnesses. Otherwise a
-    // deleted disjoint provider could be kept without its DELETE record and be
-    // accidentally resurrected when the caller merges the retained entries.
+    // Net DELETE entries first to avoid resurrecting deleted witnesses.
     let entries = merge_manifest_entries(entries);
     let mut buckets: HashMap<(&[u8], i32), Vec<usize>> = HashMap::new();
     for (idx, entry) in entries.iter().enumerate() {
@@ -488,9 +486,7 @@ fn retain_selected_row_range_component(
         return;
     }
 
-    // Only files intersecting the selected rows can contribute values to those
-    // rows. A wide normal-file anchor can otherwise connect every rolled BLOB
-    // or vector segment into one enormous transitive component.
+    // Keep files that can contribute to the selected rows.
     let mut selected_providers = HashSet::new();
     for &idx in component {
         let file = entries[idx].file();
@@ -501,10 +497,7 @@ fn retain_selected_row_range_component(
         }
     }
 
-    // Preserve one disjoint witness for a provider that has no selected file.
-    // The DE reader uses it to distinguish a corrupt coverage gap from a
-    // nullable/missing column. Keeping one witness retains that validation
-    // without carrying every disjoint rolled segment into the split.
+    // Keep one missing-provider witness for gap validation.
     for &idx in component {
         if keep[idx] {
             continue;
