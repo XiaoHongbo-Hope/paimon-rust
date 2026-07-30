@@ -30,6 +30,7 @@ use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 struct NormalizedFilter {
@@ -464,11 +465,14 @@ impl<'a> PaimonReadBuilder<'a> {
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
         // Pushdown/stats skip compound nodes; the residual pass enforces the full
         // predicate exactly. Pruning here would drop compound predicates.
-        Ok(TableRead::new(
-            self.table,
-            read_type,
-            self.filter.data_predicates.clone(),
-        ))
+        let parquet_read_budget = Arc::new(crate::arrow::ParquetReadBudget::new(
+            core_options.parquet_row_group_parallelism()?,
+            core_options.parquet_row_group_max_inflight_bytes()?,
+        )?);
+        Ok(
+            TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
+                .with_parquet_read_budget(parquet_read_budget),
+        )
     }
 
     /// Resolve the effective read type, deferring projection name resolution to

@@ -23,6 +23,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::ParquetReadBudget;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
     ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -132,6 +133,17 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Override the Parquet resource budget shared by this read.
+    #[doc(hidden)]
+    pub fn with_parquet_read_budget(self, budget: Arc<ParquetReadBudget>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => {
+                Self(TableReadKind::Paimon(read.with_parquet_read_budget(budget)))
+            }
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
+    }
+
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         match &self.0 {
@@ -189,6 +201,7 @@ struct PaimonTableRead<'a> {
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -203,6 +216,7 @@ impl<'a> PaimonTableRead<'a> {
             read_type,
             data_predicates,
             row_filter_factory: None,
+            parquet_read_budget: None,
         }
     }
 
@@ -241,6 +255,11 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
+    fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
+        self.parquet_read_budget = Some(budget);
+        self
+    }
+
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
     pub fn to_incremental_arrow(
         &self,
@@ -276,15 +295,19 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let parquet_read_budget = self.parquet_read_budget.clone();
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
+                let parquet_read_budget = parquet_read_budget.clone();
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
-                    let pair_read =
-                        PaimonTableRead::new(&table, read_type, data_predicates);
+                    let mut pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
+                    if let Some(budget) = parquet_read_budget {
+                        pair_read = pair_read.with_parquet_read_budget(budget);
+                    }
                     let mut pair_stream = pair_read.to_diff_after_image_stream(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
                         yield batch?;
@@ -356,7 +379,8 @@ impl<'a> PaimonTableRead<'a> {
             read_type,
             self.data_predicates.clone(),
         )
-        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
+        .with_parquet_read_budget(self.parquet_read_budget.clone());
         let raw_stream = reader.read(&data_splits)?;
 
         Ok(Box::pin(async_stream::try_stream! {
@@ -637,6 +661,7 @@ impl<'a> PaimonTableRead<'a> {
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
                 max_merge_file_streams: Some(256),
+                parquet_read_budget: self.parquet_read_budget.clone(),
             },
         );
         reader.read(splits)
@@ -773,6 +798,7 @@ impl<'a> PaimonTableRead<'a> {
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: false,
                 max_merge_file_streams: None,
+                parquet_read_budget: self.parquet_read_budget.clone(),
             },
         );
         reader.read(splits)
@@ -797,7 +823,8 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
         )?
-        .with_batch_size(Some(core_options.read_batch_size()?));
+        .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_parquet_read_budget(self.parquet_read_budget.clone());
         reader.read(data_splits)
     }
 
@@ -815,7 +842,8 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
-        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
+        .with_parquet_read_budget(self.parquet_read_budget.clone());
         // The engine decoder filter is safe only on the plain append/raw path.
         // This constructor is also used by raw-convertible primary-key splits,
         // where positional merge semantics must remain untouched.

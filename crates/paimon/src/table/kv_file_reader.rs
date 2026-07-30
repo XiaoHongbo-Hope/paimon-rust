@@ -30,7 +30,7 @@ use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, PartialUpdateMergeFunction,
     SortMergeReaderBuilder,
 };
-use crate::arrow::build_target_arrow_schema;
+use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::io::FileIO;
 use crate::spec::{
     BigIntType, DataField, DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate,
@@ -45,6 +45,7 @@ use arrow_array::{RecordBatch, RecordBatchOptions};
 use async_stream::try_stream;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Reads primary-key table data files using sort-merge deduplication.
 pub(crate) struct KeyValueFileReader {
@@ -77,6 +78,8 @@ pub(crate) struct KeyValueReadConfig {
     pub merge_splits: bool,
     /// Optional cap on file streams opened by a single sort-merge group.
     pub max_merge_file_streams: Option<usize>,
+    /// Scan-shared Parquet concurrency and projected-byte budget.
+    pub parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -408,6 +411,7 @@ impl KeyValueFileReader {
         let sequence_fields = self.config.sequence_fields;
         let read_batch_size = self.config.read_batch_size;
         let max_merge_file_streams = self.config.max_merge_file_streams;
+        let parquet_read_budget = self.config.parquet_read_budget;
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
@@ -458,7 +462,8 @@ impl KeyValueFileReader {
                         internal_read_type.clone(),
                         pushdown_predicates.clone(),
                     )
-                    .with_batch_size(Some(read_batch_size));
+                    .with_batch_size(Some(read_batch_size))
+                    .with_parquet_read_budget(parquet_read_budget.clone());
 
                     let stream = reader.read_single_file_stream(
                         split,
@@ -863,6 +868,7 @@ mod tests {
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: true,
                 max_merge_file_streams: Some(256),
+                parquet_read_budget: None,
             },
         );
 
@@ -926,6 +932,7 @@ mod tests {
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: false,
                 max_merge_file_streams: None,
+                parquet_read_budget: None,
             },
         )
         .with_input_batch_sizes(input_batch_sizes.clone());

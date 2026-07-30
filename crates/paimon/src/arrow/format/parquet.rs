@@ -18,9 +18,10 @@
 use super::shredding::PhysicalFormatWriterFactory;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
+use crate::arrow::parquet_read_budget::ParquetReadPermit;
 use crate::arrow::shredding::map::MapShreddingReadPlan;
 use crate::arrow::shredding::ShreddingReadPlan;
-use crate::arrow::{RowFilter, RowFilterContext};
+use crate::arrow::{ParquetReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -51,14 +52,26 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
-pub(crate) struct ParquetFormatReader;
+#[derive(Default)]
+pub(crate) struct ParquetFormatReader {
+    read_budget: Option<Arc<ParquetReadBudget>>,
+}
 
-/// Maximum number of Parquet row groups decoded concurrently for an
-/// unfiltered full-file read.
-const PARQUET_ROW_GROUP_READ_CONCURRENCY: usize = 8;
-/// Bound projected uncompressed data buffered by concurrent row-group reads.
-const PARQUET_ROW_GROUP_IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+impl ParquetFormatReader {
+    pub(crate) fn with_read_budget(read_budget: Arc<ParquetReadBudget>) -> Self {
+        Self {
+            read_budget: Some(read_budget),
+        }
+    }
+}
+
+enum ParquetRowGroupMessage {
+    Batch(RecordBatch),
+    Error(Error),
+    Done,
+}
 
 struct ParquetRowFilterPredicate {
     inner: Box<dyn RowFilter>,
@@ -471,51 +484,93 @@ impl FormatFileReader for ParquetFormatReader {
         // For remote object stores, a full scan of a compacted file can
         // therefore serialize dozens of independent range requests behind one
         // DataFusion partition. Build one stream per row group on the
-        // predicate-free path and collect a bounded number concurrently.
+        // predicate-free path and run a bounded number concurrently.
         //
-        // `buffered` preserves the input order, so positional `_ROW_ID`,
-        // sort-order, and downstream merge assumptions remain unchanged. Reads
+        // Row-group receivers are consumed in order and buffer one batch each,
+        // preserving positional `_ROW_ID`, sort order, and batch backpressure. Reads
         // with predicates or an explicit row selection retain the original
         // single-stream path until their selections are split per row group.
-        let row_group_parallelism =
-            if preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none() {
-                parquet_row_group_read_parallelism(batch_stream_builder.metadata(), &mask)
-            } else {
-                1
-            };
+        let row_group_parallelism = self
+            .read_budget
+            .as_ref()
+            .filter(|_| preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none())
+            .map(|budget| {
+                budget
+                    .parallelism()
+                    .min(batch_stream_builder.metadata().num_row_groups())
+            })
+            .unwrap_or(1);
         if row_group_parallelism > 1 {
             let row_group_count = batch_stream_builder.metadata().num_row_groups();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
                 ArrowReaderOptions::new(),
             )?;
-            let mut row_groups =
-                futures::stream::iter((0..row_group_count).map(move |row_group_index| {
-                    let shared_reader = Arc::clone(&shared_reader);
-                    let reader_metadata = reader_metadata.clone();
-                    let mask = mask.clone();
-                    async move {
-                        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                            ArrowFileReader::new(file_size, shared_reader),
-                            reader_metadata,
-                        )
-                        .with_projection(mask)
-                        .with_row_groups(vec![row_group_index]);
-                        if let Some(size) = batch_size {
-                            builder = builder.with_batch_size(size);
+            let projected_bytes = batch_stream_builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|row_group| projected_row_group_bytes(row_group, &mask))
+                .collect::<Vec<_>>();
+            let read_budget = Arc::clone(self.read_budget.as_ref().expect("checked above"));
+            let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
+            tokio::spawn(async move {
+                for (row_group_index, projected_bytes) in projected_bytes.into_iter().enumerate() {
+                    let permit = match read_budget.acquire(projected_bytes).await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let _ = row_group_tx.send(Err(error)).await;
+                            return;
                         }
-                        let stream = builder.build().map_err(Error::from)?;
-                        stream.try_collect::<Vec<_>>().await.map_err(Error::from)
+                    };
+                    let (batch_tx, batch_rx) = mpsc::channel(1);
+                    let row_group_reader = Arc::clone(&shared_reader);
+                    let row_group_metadata = reader_metadata.clone();
+                    let row_group_mask = mask.clone();
+                    tokio::spawn(read_row_group(
+                        row_group_reader,
+                        file_size,
+                        row_group_metadata,
+                        row_group_mask,
+                        row_group_index,
+                        batch_size,
+                        permit,
+                        batch_tx,
+                    ));
+                    if row_group_tx.send(Ok(batch_rx)).await.is_err() {
+                        return;
                     }
-                }))
-                .buffered(row_group_parallelism);
+                }
+            });
             let stream = async_stream::try_stream! {
-                while let Some(batches) = row_groups.next().await {
-                    for batch in batches? {
-                        yield match &map_read_plan {
-                            Some(plan) => plan.assemble_batch(&batch)?,
-                            None => batch,
-                        };
+                for _ in 0..row_group_count {
+                    let mut batches = row_group_rx.recv().await.ok_or_else(|| {
+                        Error::UnexpectedError {
+                            message: "Parquet row-group coordinator stopped early".to_string(),
+                            source: None,
+                        }
+                    })??;
+                    let mut completed = false;
+                    while let Some(message) = batches.recv().await {
+                        match message {
+                            ParquetRowGroupMessage::Batch(batch) => {
+                                yield match &map_read_plan {
+                                    Some(plan) => plan.assemble_batch(&batch)?,
+                                    None => batch,
+                                };
+                            }
+                            ParquetRowGroupMessage::Error(error) => Err(error)?,
+                            ParquetRowGroupMessage::Done => {
+                                completed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !completed {
+                        Err(Error::UnexpectedError {
+                            message: "Parquet row-group reader stopped early".to_string(),
+                            source: None,
+                        })?;
                     }
                 }
             };
@@ -566,38 +621,72 @@ impl FormatFileReader for ParquetFormatReader {
     }
 }
 
-fn parquet_row_group_read_parallelism(
-    metadata: &ParquetMetaData,
-    projection: &ProjectionMask,
-) -> usize {
-    let row_group_count = metadata.num_row_groups();
-    if row_group_count <= 1 {
-        return 1;
-    }
-
-    let max_projected_bytes = metadata
-        .row_groups()
+fn projected_row_group_bytes(row_group: &RowGroupMetaData, projection: &ProjectionMask) -> u64 {
+    row_group
+        .columns()
         .iter()
-        .map(|row_group| {
-            row_group
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(leaf_index, _)| projection.leaf_included(*leaf_index))
-                .filter_map(|(_, column)| u64::try_from(column.uncompressed_size()).ok())
-                .fold(0u64, u64::saturating_add)
-        })
-        .max()
-        .unwrap_or(0);
-    let memory_parallelism = PARQUET_ROW_GROUP_IN_FLIGHT_BYTES
-        .checked_div(max_projected_bytes)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(PARQUET_ROW_GROUP_READ_CONCURRENCY)
-        .max(1);
+        .enumerate()
+        .filter(|(leaf_index, _)| projection.leaf_included(*leaf_index))
+        .filter_map(|(_, column)| u64::try_from(column.uncompressed_size()).ok())
+        .fold(0u64, u64::saturating_add)
+}
 
-    row_group_count
-        .min(PARQUET_ROW_GROUP_READ_CONCURRENCY)
-        .min(memory_parallelism)
+#[allow(clippy::too_many_arguments)]
+async fn read_row_group(
+    reader: Arc<dyn FileRead>,
+    file_size: u64,
+    reader_metadata: ArrowReaderMetadata,
+    projection: ProjectionMask,
+    row_group_index: usize,
+    batch_size: Option<usize>,
+    _permit: ParquetReadPermit,
+    sender: mpsc::Sender<ParquetRowGroupMessage>,
+) {
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+        ArrowFileReader::new(file_size, reader),
+        reader_metadata,
+    )
+    .with_projection(projection)
+    .with_row_groups(vec![row_group_index]);
+    if let Some(size) = batch_size {
+        builder = builder.with_batch_size(size);
+    }
+    let mut stream = match builder.build() {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = sender
+                .send(ParquetRowGroupMessage::Error(error.into()))
+                .await;
+            return;
+        }
+    };
+
+    forward_row_group_batches(&mut stream, sender).await;
+}
+
+async fn forward_row_group_batches<S, E>(
+    mut stream: S,
+    sender: mpsc::Sender<ParquetRowGroupMessage>,
+) where
+    S: futures::Stream<Item = std::result::Result<RecordBatch, E>> + Unpin,
+    E: Into<Error>,
+{
+    loop {
+        let Ok(slot) = sender.reserve().await else {
+            return;
+        };
+        match stream.next().await {
+            Some(Ok(batch)) => slot.send(ParquetRowGroupMessage::Batch(batch)),
+            Some(Err(error)) => {
+                slot.send(ParquetRowGroupMessage::Error(error.into()));
+                return;
+            }
+            None => {
+                slot.send(ParquetRowGroupMessage::Done);
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2071,14 +2160,17 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::{
+        forward_row_group_batches, FilePredicates, ParquetFormatReader, ParquetFormatWriter,
+        ParquetRowGroupMessage,
+    };
+    use super::{
         AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
         PredicateOperator, RowSelection,
     };
-    use super::{FilePredicates, ParquetFormatReader, ParquetFormatWriter};
     use crate::arrow::format::{
         create_format_reader, create_format_writer, FormatFileReader, FormatFileWriter,
     };
-    use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
+    use crate::arrow::{build_target_arrow_schema, variant_arrow_type, ParquetReadBudget};
     use crate::io::FileIOBuilder;
     use crate::spec::{
         ArrayType, BigIntType, DataField, DataType, Datum, IntType, MapType, PredicateBuilder,
@@ -2086,17 +2178,19 @@ mod tests {
     };
     use crate::table::RowRange;
     use crate::variant::GenericVariant;
+    use crate::Error;
     use arrow_array::{
         Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     fn test_fields() -> Vec<DataField> {
         vec![
@@ -2584,20 +2678,22 @@ mod tests {
             "id".to_string(),
             DataType::Int(IntType::new()),
         )];
-        let batches = ParquetFormatReader
-            .read_batch_stream(
-                Box::new(file_reader),
-                file_size,
-                &fields,
-                None,
-                Some(32),
-                None,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batches = ParquetFormatReader::with_read_budget(Arc::new(
+            ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap(),
+        ))
+        .read_batch_stream(
+            Box::new(file_reader),
+            file_size,
+            &fields,
+            None,
+            Some(32),
+            None,
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
         let actual = batches
             .iter()
             .flat_map(|batch| {
@@ -2618,6 +2714,129 @@ mod tests {
             max_in_flight.load(AtomicOrdering::SeqCst) > 1,
             "row-group reads should overlap"
         );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_read_budget_is_shared_across_readers() {
+        const ROWS: i32 = 256;
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(32))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut data = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut data, schema.clone(), Some(props)).unwrap();
+        let ids = (0..ROWS).collect::<Vec<_>>();
+        writer
+            .write(&writer_test_batch(
+                &schema,
+                ids.clone(),
+                ids.iter().map(|id| id * 10).collect(),
+            ))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let data = Bytes::from(data);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let new_file_reader = || ConcurrentTrackingFileRead {
+            data: data.clone(),
+            in_flight: Arc::clone(&in_flight),
+            max_in_flight: Arc::clone(&max_in_flight),
+        };
+        let file_size = data.len() as u64;
+        let fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let budget = Arc::new(ParquetReadBudget::new(2, 256 * 1024 * 1024).unwrap());
+        let first = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+            .read_batch_stream(
+                Box::new(new_file_reader()),
+                file_size,
+                &fields,
+                None,
+                Some(32),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = ParquetFormatReader::with_read_budget(budget)
+            .read_batch_stream(
+                Box::new(new_file_reader()),
+                file_size,
+                &fields,
+                None,
+                Some(32),
+                None,
+            )
+            .await
+            .unwrap();
+
+        max_in_flight.store(0, AtomicOrdering::SeqCst);
+        let (first, second) = tokio::join!(
+            first.try_collect::<Vec<_>>(),
+            second.try_collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            ROWS as usize
+        );
+        assert_eq!(
+            second
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            ROWS as usize
+        );
+        let observed = max_in_flight.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            observed, 2,
+            "two readers must share the same row-group budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_group_batch_forwarding_applies_backpressure() {
+        let schema = Arc::new(ArrowSchema::empty());
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            Vec::new(),
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let tracked_polls = Arc::clone(&polls);
+        let stream =
+            futures::stream::iter(vec![Ok::<_, Error>(batch.clone()), Ok::<_, Error>(batch)])
+                .inspect(move |_| {
+                    tracked_polls.fetch_add(1, AtomicOrdering::SeqCst);
+                });
+        let (tx, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(forward_row_group_batches(stream, tx));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            polls.load(AtomicOrdering::SeqCst),
+            1,
+            "a full output channel must stop polling and decoding the source stream"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(ParquetRowGroupMessage::Batch(_))
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 2);
+        drop(rx);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -3102,7 +3321,7 @@ mod tests {
             "items".to_string(),
             DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
         )];
-        let stream = ParquetFormatReader
+        let stream = ParquetFormatReader::default()
             .read_batch_stream(
                 Box::new(file_read),
                 file_size,
@@ -3491,7 +3710,7 @@ mod tests {
             file_fields: fields.clone(),
         };
 
-        let batches = ParquetFormatReader
+        let batches = ParquetFormatReader::default()
             .read_batch_stream(
                 Box::new(input.reader().await.unwrap()),
                 file_size,
@@ -3619,7 +3838,7 @@ mod tests {
             file_fields: fields.clone(),
         };
 
-        ParquetFormatReader
+        ParquetFormatReader::default()
             .read_batch_stream(
                 Box::new(input.reader().await.unwrap()),
                 file_size,
@@ -3664,7 +3883,7 @@ mod tests {
             file_fields: id_name_age_file_fields(),
         };
 
-        let reader = ParquetFormatReader;
+        let reader = ParquetFormatReader::default();
         let mut stream = reader
             .read_batch_stream(
                 Box::new(reader_input),
@@ -3858,7 +4077,7 @@ mod tests {
             row_filter_factory: None,
             file_fields,
         };
-        let reader = ParquetFormatReader;
+        let reader = ParquetFormatReader::default();
         let mut stream = reader
             .read_batch_stream(
                 Box::new(reader_input),
