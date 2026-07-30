@@ -35,8 +35,8 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter as ParquetRowFilter,
-    RowSelection, RowSelector,
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
+    RowFilter as ParquetRowFilter, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -53,6 +53,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) struct ParquetFormatReader;
+
+/// Maximum number of Parquet row groups decoded concurrently for an
+/// unfiltered full-file read.
+const PARQUET_ROW_GROUP_READ_CONCURRENCY: usize = 8;
+/// Bound projected uncompressed data buffered by concurrent row-group reads.
+const PARQUET_ROW_GROUP_IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
 struct ParquetRowFilterPredicate {
     inner: Box<dyn RowFilter>,
@@ -301,7 +307,8 @@ impl FormatFileReader for ParquetFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let arrow_file_reader = ArrowFileReader::new(file_size, reader);
+        let shared_reader: Arc<dyn FileRead> = reader.into();
+        let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader));
 
         let empty_predicates = Vec::new();
         let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
@@ -361,7 +368,7 @@ impl FormatFileReader for ParquetFormatReader {
             .collect();
 
         let mask = ProjectionMask::roots(&parquet_schema, root_indices);
-        batch_stream_builder = batch_stream_builder.with_projection(mask);
+        batch_stream_builder = batch_stream_builder.with_projection(mask.clone());
 
         let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
             .map(ParquetRowFilter::into_predicates)
@@ -460,6 +467,61 @@ impl FormatFileReader for ParquetFormatReader {
             MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
                 .map(Arc::new);
 
+        // A normal Parquet stream fetches and decodes row groups one by one.
+        // For remote object stores, a full scan of a compacted file can
+        // therefore serialize dozens of independent range requests behind one
+        // DataFusion partition. Build one stream per row group on the
+        // predicate-free path and collect a bounded number concurrently.
+        //
+        // `buffered` preserves the input order, so positional `_ROW_ID`,
+        // sort-order, and downstream merge assumptions remain unchanged. Reads
+        // with predicates or an explicit row selection retain the original
+        // single-stream path until their selections are split per row group.
+        let row_group_parallelism =
+            if preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none() {
+                parquet_row_group_read_parallelism(batch_stream_builder.metadata(), &mask)
+            } else {
+                1
+            };
+        if row_group_parallelism > 1 {
+            let row_group_count = batch_stream_builder.metadata().num_row_groups();
+            let reader_metadata = ArrowReaderMetadata::try_new(
+                batch_stream_builder.metadata().clone(),
+                ArrowReaderOptions::new(),
+            )?;
+            let mut row_groups =
+                futures::stream::iter((0..row_group_count).map(move |row_group_index| {
+                    let shared_reader = Arc::clone(&shared_reader);
+                    let reader_metadata = reader_metadata.clone();
+                    let mask = mask.clone();
+                    async move {
+                        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+                            ArrowFileReader::new(file_size, shared_reader),
+                            reader_metadata,
+                        )
+                        .with_projection(mask)
+                        .with_row_groups(vec![row_group_index]);
+                        if let Some(size) = batch_size {
+                            builder = builder.with_batch_size(size);
+                        }
+                        let stream = builder.build().map_err(Error::from)?;
+                        stream.try_collect::<Vec<_>>().await.map_err(Error::from)
+                    }
+                }))
+                .buffered(row_group_parallelism);
+            let stream = async_stream::try_stream! {
+                while let Some(batches) = row_groups.next().await {
+                    for batch in batches? {
+                        yield match &map_read_plan {
+                            Some(plan) => plan.assemble_batch(&batch)?,
+                            None => batch,
+                        };
+                    }
+                }
+            };
+            return Ok(stream.boxed());
+        }
+
         let batch_stream = batch_stream_builder.build()?;
 
         if all_enforced {
@@ -502,6 +564,40 @@ impl FormatFileReader for ParquetFormatReader {
         });
         Ok(stream.boxed())
     }
+}
+
+fn parquet_row_group_read_parallelism(
+    metadata: &ParquetMetaData,
+    projection: &ProjectionMask,
+) -> usize {
+    let row_group_count = metadata.num_row_groups();
+    if row_group_count <= 1 {
+        return 1;
+    }
+
+    let max_projected_bytes = metadata
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            row_group
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(leaf_index, _)| projection.leaf_included(*leaf_index))
+                .filter_map(|(_, column)| u64::try_from(column.uncompressed_size()).ok())
+                .fold(0u64, u64::saturating_add)
+        })
+        .max()
+        .unwrap_or(0);
+    let memory_parallelism = PARQUET_ROW_GROUP_IN_FLIGHT_BYTES
+        .checked_div(max_projected_bytes)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(PARQUET_ROW_GROUP_READ_CONCURRENCY)
+        .max(1);
+
+    row_group_count
+        .min(PARQUET_ROW_GROUP_READ_CONCURRENCY)
+        .min(memory_parallelism)
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,7 +1789,7 @@ fn build_row_ranges_selection(
 /// - `preload_offset_index`: Load the Offset Index as part of [`Self::get_metadata`].
 struct ArrowFileReader {
     file_size: u64,
-    r: Box<dyn FileRead>,
+    r: Arc<dyn FileRead>,
 }
 
 /// coalesce threshold: 1 MiB.
@@ -1709,7 +1805,7 @@ const METADATA_SIZE_HINT: usize = 512 * 1024;
 const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
 impl ArrowFileReader {
-    fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
+    fn new(file_size: u64, r: Arc<dyn FileRead>) -> Self {
         Self { file_size, r }
     }
 
@@ -1998,7 +2094,9 @@ mod tests {
     use futures::TryStreamExt;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_fields() -> Vec<DataField> {
         vec![
@@ -2431,6 +2529,95 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentTrackingFileRead {
+        data: Bytes,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileRead for ConcurrentTrackingFileRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            let current = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_in_flight
+                .fetch_max(current, AtomicOrdering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_reader_reads_row_groups_concurrently_in_order() {
+        const ROWS: i32 = 512;
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(64))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut data = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut data, schema.clone(), Some(props)).unwrap();
+        let ids = (0..ROWS).collect::<Vec<_>>();
+        writer
+            .write(&writer_test_batch(
+                &schema,
+                ids.clone(),
+                ids.iter().map(|id| id * 10).collect(),
+            ))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let file_reader = ConcurrentTrackingFileRead {
+            data: Bytes::from(data),
+            in_flight,
+            max_in_flight: Arc::clone(&max_in_flight),
+        };
+        let file_size = file_reader.data.len() as u64;
+        let fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let batches = ParquetFormatReader
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size,
+                &fields,
+                None,
+                Some(32),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, ids);
+        assert!(
+            max_in_flight.load(AtomicOrdering::SeqCst) > 1,
+            "row-group reads should overlap"
+        );
     }
 
     #[tokio::test]
