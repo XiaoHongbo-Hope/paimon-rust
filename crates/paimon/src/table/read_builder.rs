@@ -24,7 +24,7 @@ use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_
 use super::format_read_builder::FormatReadBuilder;
 use super::incremental_scan::{IncrementalScan, IncrementalScanMode};
 use super::partition_filter::PartitionFilter;
-use super::table_read::TableRead;
+use super::table_read::{configured_parquet_read_budget, TableRead};
 use super::{Table, TableScan};
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
@@ -236,6 +236,23 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Inject a Parquet budget shared with sibling scan partitions.
+    #[doc(hidden)]
+    pub fn with_parquet_read_budget(
+        &mut self,
+        budget: Arc<crate::arrow::ParquetReadBudget>,
+    ) -> &mut Self {
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_parquet_read_budget(budget);
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_parquet_read_budget(budget);
+            }
+        }
+        self
+    }
+
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
         match &self.0 {
@@ -292,6 +309,7 @@ struct PaimonReadBuilder<'a> {
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
+    parquet_read_budget: Option<Arc<crate::arrow::ParquetReadBudget>>,
 }
 
 impl<'a> PaimonReadBuilder<'a> {
@@ -304,6 +322,7 @@ impl<'a> PaimonReadBuilder<'a> {
             limit: None,
             row_ranges: None,
             case_sensitive: true,
+            parquet_read_budget: None,
         }
     }
 
@@ -421,6 +440,14 @@ impl<'a> PaimonReadBuilder<'a> {
         self
     }
 
+    fn with_parquet_read_budget(
+        &mut self,
+        budget: Arc<crate::arrow::ParquetReadBudget>,
+    ) -> &mut Self {
+        self.parquet_read_budget = Some(budget);
+        self
+    }
+
     /// Create a table scan. Call [TableScan::plan] to get splits.
     ///
     /// Projection names are resolved here on a best-effort basis: the resolved
@@ -465,10 +492,10 @@ impl<'a> PaimonReadBuilder<'a> {
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
         // Pushdown/stats skip compound nodes; the residual pass enforces the full
         // predicate exactly. Pruning here would drop compound predicates.
-        let parquet_read_budget = Arc::new(crate::arrow::ParquetReadBudget::new(
-            core_options.parquet_row_group_parallelism()?,
-            core_options.parquet_row_group_max_inflight_bytes()?,
-        )?);
+        let parquet_read_budget = match &self.parquet_read_budget {
+            Some(budget) => Arc::clone(budget),
+            None => configured_parquet_read_budget(self.table)?,
+        };
         Ok(
             TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
                 .with_parquet_read_budget(parquet_read_budget),

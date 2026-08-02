@@ -516,10 +516,16 @@ impl FormatFileReader for ParquetFormatReader {
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
             tokio::spawn(async move {
                 for (row_group_index, projected_bytes) in projected_bytes.into_iter().enumerate() {
-                    let permit = match read_budget.acquire(projected_bytes).await {
+                    let Ok(slot) = row_group_tx.reserve().await else {
+                        return;
+                    };
+                    let permit = match tokio::select! {
+                        _ = row_group_tx.closed() => return,
+                        permit = read_budget.acquire(projected_bytes) => permit,
+                    } {
                         Ok(permit) => permit,
                         Err(error) => {
-                            let _ = row_group_tx.send(Err(error)).await;
+                            slot.send(Err(error));
                             return;
                         }
                     };
@@ -537,9 +543,7 @@ impl FormatFileReader for ParquetFormatReader {
                         permit,
                         batch_tx,
                     ));
-                    if row_group_tx.send(Ok(batch_rx)).await.is_err() {
-                        return;
-                    }
+                    slot.send(Ok(batch_rx));
                 }
             });
             let stream = async_stream::try_stream! {
@@ -675,7 +679,11 @@ async fn forward_row_group_batches<S, E>(
         let Ok(slot) = sender.reserve().await else {
             return;
         };
-        match stream.next().await {
+        let next = tokio::select! {
+            _ = sender.closed() => return,
+            next = stream.next() => next,
+        };
+        match next {
             Some(Ok(batch)) => slot.send(ParquetRowGroupMessage::Batch(batch)),
             Some(Err(error)) => {
                 slot.send(ParquetRowGroupMessage::Error(error.into()));
@@ -2837,6 +2845,27 @@ mod tests {
         assert_eq!(polls.load(AtomicOrdering::SeqCst), 2);
         drop(rx);
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_row_group_batch_forwarding_stops_during_pending_io() {
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let mut polled_tx = Some(polled_tx);
+        let stream = futures::stream::poll_fn(move |_| {
+            if let Some(tx) = polled_tx.take() {
+                let _ = tx.send(());
+            }
+            std::task::Poll::Pending::<Option<Result<RecordBatch, Error>>>
+        });
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(forward_row_group_batches(stream, tx));
+
+        polled_rx.await.unwrap();
+        drop(rx);
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("dropping the receiver must cancel a pending row-group read")
+            .unwrap();
     }
 
     #[tokio::test]

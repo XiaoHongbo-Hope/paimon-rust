@@ -1088,11 +1088,9 @@ impl ExecutionPlan for PaimonTableScan {
             if !paimon_predicates.is_empty() {
                 read_builder.with_filter(Predicate::and(paimon_predicates));
             }
+            read_builder.with_parquet_read_budget(parquet_read_budget);
 
-            let mut read = read_builder
-                .new_read()
-                .map_err(to_datafusion_error)?
-                .with_parquet_read_budget(parquet_read_budget);
+            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
             if !runtime_filter_plan.datafusion_filters.is_empty() {
                 let predicate = conjunction(runtime_filter_plan.datafusion_filters);
                 read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(

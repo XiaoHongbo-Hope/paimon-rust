@@ -442,6 +442,17 @@ impl KeyValueFileReader {
                     continue;
                 }
                 ensure_merge_fan_in_limit(file_count, max_merge_file_streams)?;
+                // Sort-merge must first obtain one batch from every input stream.
+                // A concurrent Parquet reader keeps its row-group permits until
+                // the complete row group has been consumed, so enabling it on
+                // several lockstep inputs can let the first file occupy the
+                // entire scan budget while the merge waits for the second file.
+                // Keep multi-file merge inputs on the sequential Parquet path.
+                let group_parquet_read_budget = if file_count == 1 {
+                    parquet_read_budget.clone()
+                } else {
+                    None
+                };
                 // Create one stream per data file.
                 let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
@@ -463,7 +474,7 @@ impl KeyValueFileReader {
                         pushdown_predicates.clone(),
                     )
                     .with_batch_size(Some(read_batch_size))
-                    .with_parquet_read_budget(parquet_read_budget.clone());
+                    .with_parquet_read_budget(group_parquet_read_budget.clone());
 
                     let stream = reader.read_single_file_stream(
                         split,
@@ -583,9 +594,12 @@ mod tests {
     use crate::table::source::DataSplitBuilder;
     use crate::table::table_commit::TableCommit;
     use crate::table::{Table, TableWrite};
-    use arrow_array::{Array, Int32Array, StringArray};
+    use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use parquet::arrow::AsyncArrowWriter;
+    use parquet::file::metadata::ParquetMetaDataReader;
+    use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
 
     fn test_file_io() -> FileIO {
@@ -752,6 +766,69 @@ mod tests {
             first_row_id: None,
             write_cols: None,
         }
+    }
+
+    async fn write_multi_row_group_kv_file(
+        file_io: &FileIO,
+        table_path: &str,
+        file_name: &str,
+        sequence: i64,
+        value: i32,
+    ) -> DataFileMeta {
+        let schema = crate::arrow::build_target_arrow_schema(&[
+            DataField::new(
+                SEQUENCE_NUMBER_FIELD_ID,
+                SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                DataType::BigInt(BigIntType::new()),
+            ),
+            DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            ),
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ])
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_value(sequence, 128)),
+                Arc::new(Int8Array::from_value(0, 128)),
+                Arc::new(Int32Array::from_iter_values(0..128)),
+                Arc::new(Int32Array::from_value(value, 128)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(64))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = AsyncArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+        let parquet_bytes = bytes::Bytes::from(bytes);
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+        assert_eq!(metadata.num_row_groups(), 2);
+
+        let bucket_path = format!("{table_path}/bucket-0");
+        file_io.mkdirs(&format!("{bucket_path}/")).await.unwrap();
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(parquet_bytes.clone())
+            .await
+            .unwrap();
+
+        let mut file = dummy_data_file(file_name.to_string());
+        file.file_size = parquet_bytes.len() as i64;
+        file.row_count = 128;
+        file
     }
 
     #[test]
@@ -949,6 +1026,66 @@ mod tests {
         assert_eq!(batches.len(), 1, "merge output batching stays independent");
         assert_eq!(batches[0].num_rows(), 5);
         assert_eq!(int_column(&batches, "value"), vec![11, 21, 31, 41, 51]);
+    }
+
+    #[tokio::test]
+    async fn kv_merge_with_shared_budget_does_not_deadlock_between_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_shared_parquet_budget";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("read.batch-size", "1"),
+                ("read.parquet.row-group.parallelism", "2"),
+            ],
+        );
+        let first =
+            write_multi_row_group_kv_file(&file_io, table_path, "first.parquet", 0, 10).await;
+        let second =
+            write_multi_row_group_kv_file(&file_io, table_path, "second.parquet", 1, 11).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![first, second])
+            .build()
+            .unwrap();
+        let core_options = table.schema().core_options();
+        let reader = KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: false,
+                max_merge_file_streams: None,
+                parquet_read_budget: Some(Arc::new(ParquetReadBudget::new(2, 256 << 20).unwrap())),
+            },
+        );
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read(&[split]).unwrap().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("multi-file sort-merge must not wait forever for a shared Parquet permit")
+        .unwrap();
+
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            128
+        );
     }
 
     /// Non-PK equality filter on a dedup PK table read through the sort-merge

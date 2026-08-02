@@ -53,6 +53,16 @@ enum TableReadKind<'a> {
     Format(FormatTableRead<'a>),
 }
 
+pub(super) fn configured_parquet_read_budget(
+    table: &Table,
+) -> crate::Result<Arc<ParquetReadBudget>> {
+    let options = table.schema().core_options();
+    Ok(Arc::new(ParquetReadBudget::new(
+        options.parquet_row_group_parallelism()?,
+        options.parquet_row_group_max_inflight_bytes()?,
+    )?))
+}
+
 impl<'a> TableRead<'a> {
     /// Create a new TableRead with a specific read type (projected fields).
     pub fn new(
@@ -140,7 +150,9 @@ impl<'a> TableRead<'a> {
             TableReadKind::Paimon(read) => {
                 Self(TableReadKind::Paimon(read.with_parquet_read_budget(budget)))
             }
-            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+            TableReadKind::Format(read) => {
+                Self(TableReadKind::Format(read.with_parquet_read_budget(budget)))
+            }
         }
     }
 
@@ -260,6 +272,13 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
+    fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
+        match &self.parquet_read_budget {
+            Some(budget) => Ok(Arc::clone(budget)),
+            None => configured_parquet_read_budget(self.table),
+        }
+    }
+
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
     pub fn to_incremental_arrow(
         &self,
@@ -295,19 +314,17 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
-        let parquet_read_budget = self.parquet_read_budget.clone();
+        let parquet_read_budget = self.parquet_read_budget()?;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
-                let parquet_read_budget = parquet_read_budget.clone();
+                let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
-                    let mut pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
-                    if let Some(budget) = parquet_read_budget {
-                        pair_read = pair_read.with_parquet_read_budget(budget);
-                    }
+                    let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
+                        .with_parquet_read_budget(parquet_read_budget);
                     let mut pair_stream = pair_read.to_diff_after_image_stream(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
                         yield batch?;
@@ -380,7 +397,7 @@ impl<'a> PaimonTableRead<'a> {
             self.data_predicates.clone(),
         )
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
-        .with_parquet_read_budget(self.parquet_read_budget.clone());
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         let raw_stream = reader.read(&data_splits)?;
 
         Ok(Box::pin(async_stream::try_stream! {
@@ -438,14 +455,17 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let parquet_read_budget = self.parquet_read_budget()?;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
+                let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
-                    let pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
+                    let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
+                        .with_parquet_read_budget(parquet_read_budget);
                     let mut pair_stream =
                         pair_read.to_audit_log_arrow_for_diff(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
@@ -490,10 +510,12 @@ impl<'a> PaimonTableRead<'a> {
         let table = self.table.clone();
         let read_type_for_output = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
+        let parquet_read_budget = self.parquet_read_budget()?;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
-            let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates);
+            let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
+                .with_parquet_read_budget(parquet_read_budget);
             let before_stream =
                 pair_read.read_pk_sorted_for_diff_with_type(&before, &core_options, &diff_read_type)?;
             let after_stream =
@@ -574,10 +596,12 @@ impl<'a> PaimonTableRead<'a> {
         let data_predicates = self.data_predicates.clone();
         let before = before.to_vec();
         let after = after.to_vec();
+        let parquet_read_budget = self.parquet_read_budget()?;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
-            let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates);
+            let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
+                .with_parquet_read_budget(parquet_read_budget);
             let before_stream = pair_read.read_pk_sorted_for_diff_with_type(
                 &before,
                 &core_options,
@@ -661,7 +685,10 @@ impl<'a> PaimonTableRead<'a> {
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
                 max_merge_file_streams: Some(256),
-                parquet_read_budget: self.parquet_read_budget.clone(),
+                // Diff primes the before and after streams in sequence. Keeping
+                // a row-group permit across yielded batches can otherwise let
+                // the first side block the second side indefinitely.
+                parquet_read_budget: None,
             },
         );
         reader.read(splits)
@@ -798,7 +825,7 @@ impl<'a> PaimonTableRead<'a> {
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: false,
                 max_merge_file_streams: None,
-                parquet_read_budget: self.parquet_read_budget.clone(),
+                parquet_read_budget: Some(self.parquet_read_budget()?),
             },
         );
         reader.read(splits)
@@ -824,7 +851,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().cloned(),
         )?
         .with_batch_size(Some(core_options.read_batch_size()?))
-        .with_parquet_read_budget(self.parquet_read_budget.clone());
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         reader.read(data_splits)
     }
 
@@ -843,7 +870,7 @@ impl<'a> PaimonTableRead<'a> {
             self.data_predicates.clone(),
         )
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
-        .with_parquet_read_budget(self.parquet_read_budget.clone());
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         // The engine decoder filter is safe only on the plain append/raw path.
         // This constructor is also used by raw-convertible primary-key splits,
         // where positional merge semantics must remain untouched.
@@ -1429,8 +1456,10 @@ fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRow, DataFileMeta};
+    use crate::spec::{BinaryRow, DataFileMeta, DataType, IntType, Schema, TableSchema};
     use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
 
@@ -1470,6 +1499,22 @@ mod tests {
             .with_raw_convertible(raw_convertible)
             .build()
             .unwrap()
+    }
+
+    fn table_with_invalid_parquet_budget(format_table: bool) -> Table {
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("read.parquet.row-group.parallelism", "0");
+        if format_table {
+            schema = schema.option("type", "format-table");
+        }
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "budget_t"),
+            "memory:/budget_t".to_string(),
+            TableSchema::new(0, &schema.build().unwrap()),
+            None,
+        )
     }
 
     #[test]
@@ -1526,6 +1571,23 @@ mod tests {
             ),
             "directly-constructed read of a query-auth.enabled table must fail closed"
         );
+    }
+
+    #[test]
+    fn test_direct_table_read_validates_and_can_override_parquet_budget() {
+        for format_table in [false, true] {
+            let table = table_with_invalid_parquet_budget(format_table);
+            let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+            assert!(matches!(
+                read.to_arrow(&[]),
+                Err(crate::Error::DataInvalid { ref message, .. })
+                    if message.contains("row-group.parallelism")
+            ));
+
+            let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
+                .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
+            assert!(read.to_arrow(&[]).is_ok());
+        }
     }
 
     #[test]

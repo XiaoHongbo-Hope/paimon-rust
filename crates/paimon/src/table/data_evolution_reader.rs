@@ -642,6 +642,17 @@ impl DataEvolutionReader {
                 return;
             }
 
+            // Column evolution advances every active source in lockstep. If
+            // several sources shared the row-group budget, the first source
+            // could occupy every permit while this loop waits for the next
+            // source's initial batch. Use the sequential Parquet path for
+            // multi-source merges; single-source evolution can still prefetch
+            // row groups concurrently.
+            let source_parquet_read_budget = if active_source_indices.len() == 1 {
+                parquet_read_budget.clone()
+            } else {
+                None
+            };
             let mut source_streams: Vec<Option<ArrowRecordBatchStream>> = source_plan
                 .sources
                 .iter()
@@ -659,7 +670,7 @@ impl DataEvolutionReader {
                             table_fields.clone(),
                             batch_size,
                             blob_as_descriptor,
-                            parquet_read_budget.clone(),
+                            source_parquet_read_budget.clone(),
                             anchor_deletion_vector.as_ref(),
                         )
                         .map(Some)
