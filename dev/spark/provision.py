@@ -965,8 +965,9 @@ def main():
     )
 
     # ===== Postpone bucket PK table (bucket = -2) =====
-    # New data lands in bucket-postpone and is NOT visible to readers until compacted.
-    # Without running compaction, the table should appear empty to batch readers.
+    # Spark data lands in bucket-postpone and is NOT visible until compacted.
+    # Keep deletion vectors disabled so the Go fixed-bucket write regression can
+    # verify that its new level-0 file becomes visible immediately.
     spark.sql(
         """
         CREATE TABLE IF NOT EXISTS postpone_bucket_pk_table (
@@ -975,8 +976,7 @@ def main():
         ) USING paimon
         TBLPROPERTIES (
             'primary-key' = 'id',
-            'bucket' = '-2',
-            'deletion-vectors.enabled' = 'true'
+            'bucket' = '-2'
         )
         """
     )
