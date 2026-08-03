@@ -22,12 +22,15 @@ package paimon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/cdata"
+	"github.com/apache/arrow-go/v18/arrow/memory/mallocator"
 	"github.com/jupiterrider/ffi"
 )
 
@@ -141,22 +144,51 @@ func (tw *TableWrite) WriteArrowBatch(record arrow.Record) error {
 	if record == nil {
 		return errors.New("paimon: record batch must not be nil")
 	}
+	owned, err := cloneRecordToCMemory(record)
+	if err != nil {
+		return err
+	}
+	defer owned.Release()
 
 	var array cdata.CArrowArray
 	var schema cdata.CArrowSchema
-	cdata.ExportArrowRecordBatch(record, &array, &schema)
+	cdata.ExportArrowRecordBatch(owned, &array, &schema)
 	// The C binding moves both structs on import. These releases are no-ops
 	// after a successful move and cover any early return before import.
 	defer cdata.ReleaseCArrowArray(&array)
 	defer cdata.ReleaseCArrowSchema(&schema)
 
-	err := ffiTableWriteWriteArrowBatch.symbol(tw.ctx)(
+	err = ffiTableWriteWriteArrowBatch.symbol(tw.ctx)(
 		tw.inner,
 		unsafe.Pointer(&array),
 		unsafe.Pointer(&schema),
 	)
-	runtime.KeepAlive(record)
+	runtime.KeepAlive(owned)
 	return err
+}
+
+// cloneRecordToCMemory makes the Arrow buffers safe for the native writer to
+// retain after the FFI call returns. Arrow's default Go allocator may move or
+// reclaim its buffers once a cgo call ends, while postpone writes deliberately
+// hold record batches until PrepareCommit.
+func cloneRecordToCMemory(record arrow.Record) (arrow.Record, error) {
+	allocator := mallocator.NewMallocator()
+	columns := make([]arrow.Array, record.NumCols())
+	for index := range columns {
+		column, err := array.Concatenate([]arrow.Array{record.Column(index)}, allocator)
+		if err != nil {
+			for _, allocated := range columns[:index] {
+				allocated.Release()
+			}
+			return nil, fmt.Errorf("paimon: failed to copy Arrow column %d to C memory: %w", index, err)
+		}
+		columns[index] = column
+	}
+	owned := array.NewRecord(record.Schema(), columns, record.NumRows())
+	for _, column := range columns {
+		column.Release()
+	}
+	return owned, nil
 }
 
 // PrepareCommit closes the current file writers and returns opaque commit
