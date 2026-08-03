@@ -71,6 +71,10 @@ struct PostponeFixedBucketState {
     buffered_batches: HashMap<Vec<u8>, Vec<RecordBatch>>,
     /// Bucket counts used by the current prepare-commit round.
     bucket_counts: HashMap<Vec<u8>, i32>,
+    /// Fixed-bucket planning covers one complete batch. Reusing the writer
+    /// before its prepared messages are committed could re-plan new partitions
+    /// against a stale snapshot, so this mode is deliberately one-shot.
+    prepare_started: bool,
 }
 
 impl FileWriter {
@@ -346,6 +350,7 @@ impl TableWrite {
                 postpone_row_counts: HashMap::new(),
                 buffered_batches: HashMap::new(),
                 bucket_counts: HashMap::new(),
+                prepare_started: false,
             })
         } else {
             None
@@ -494,6 +499,13 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self
+            .postpone_fixed_bucket
+            .as_ref()
+            .is_some_and(|state| state.prepare_started)
+        {
+            return Err(Self::postpone_fixed_bucket_one_shot_error());
+        }
         self.validate_write_batch_schema(batch)?;
 
         if batch.num_rows() == 0 {
@@ -1091,8 +1103,18 @@ impl TableWrite {
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
-    /// Writers are cleared after this call, allowing the TableWrite to be reused.
+    /// Writers are cleared after this call, allowing the TableWrite to be reused,
+    /// except for fixed-bucket postpone batch writes, which are one-shot.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        if let Some(state) = self.postpone_fixed_bucket.as_mut() {
+            if state.prepare_started {
+                return Err(Self::postpone_fixed_bucket_one_shot_error());
+            }
+            // Mark the one-shot operation before flushing. A failed prepare may
+            // already have consumed buffered batches or closed file writers and
+            // therefore cannot be retried safely on the same writer.
+            state.prepare_started = true;
+        }
         self.flush_postpone_fixed_batches().await?;
 
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
@@ -1150,6 +1172,13 @@ impl TableWrite {
             state.bucket_counts.clear();
         }
         Ok(messages)
+    }
+
+    fn postpone_fixed_bucket_one_shot_error() -> crate::Error {
+        crate::Error::DataInvalid {
+            message: "Fixed-bucket postpone TableWrite only supports one prepare_commit call; create a new writer for the next batch".to_string(),
+            source: None,
+        }
     }
 
     async fn create_writer(&mut self, partition_bytes: Vec<u8>, bucket: i32) -> Result<()> {
@@ -4133,6 +4162,41 @@ mod tests {
         assert_eq!(
             read_id_value_rows(&table).await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_postpone_fixed_bucket_batch_write_is_one_shot() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_fixed_bucket_one_shot";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_fixed_postpone_pk_table(&file_io, table_path);
+        let mut write = TableWrite::new(&table, "fixed-one-shot".to_string()).unwrap();
+
+        write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(1)));
+
+        let write_error = write
+            .write_arrow_batch(&make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(write_error, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("only supports one prepare_commit call")
+                    && message.contains("create a new writer"))
+        );
+
+        let prepare_error = write.prepare_commit().await.unwrap_err();
+        assert!(
+            matches!(prepare_error, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("only supports one prepare_commit call")
+                    && message.contains("create a new writer"))
         );
     }
 

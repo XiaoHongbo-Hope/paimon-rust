@@ -358,8 +358,9 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
 /// Close file writers and produce CommitMessages.
 ///
 /// Consumes the open file writers (they are flushed and closed). After this
-/// call, the TableWrite can be reused — `write_arrow_batch` may be called
-/// again to start a new round of writes.
+/// call, the TableWrite can normally be reused — `write_arrow_batch` may be
+/// called again to start a new round of writes. Fixed-bucket postpone batch
+/// writers are one-shot; create a new TableWrite for the next batch.
 ///
 /// The returned `paimon_commit_messages` must be passed to a
 /// `paimon_table_commit_*` function and then freed with
