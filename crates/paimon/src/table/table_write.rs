@@ -38,6 +38,7 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
+use crate::table::postpone_bucket::binary_row_batch_size;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
@@ -153,6 +154,21 @@ pub struct TableWrite {
 
 impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
+        Self::new_inner(table, commit_user, false)
+    }
+
+    pub(crate) fn new_postpone_fixed_bucket(
+        table: &Table,
+        commit_user: String,
+    ) -> crate::Result<Self> {
+        Self::new_inner(table, commit_user, true)
+    }
+
+    fn new_inner(
+        table: &Table,
+        commit_user: String,
+        use_postpone_fixed_bucket: bool,
+    ) -> crate::Result<Self> {
         let is_overwrite = false;
         let schema = table.schema();
         let write_schema = build_target_arrow_schema(schema.fields())?;
@@ -318,14 +334,19 @@ impl TableWrite {
         let target_bucket_row_number = core_options.dynamic_bucket_target_row_num();
         let bucket_function_type = core_options.bucket_function_type()?;
 
-        let postpone_fixed_bucket = if total_buckets == POSTPONE_BUCKET
-            && has_primary_keys
-            && core_options.postpone_batch_write_fixed_bucket()
-        {
+        let postpone_fixed_bucket = if use_postpone_fixed_bucket {
+            if total_buckets != POSTPONE_BUCKET || !has_primary_keys {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Postpone fixed-bucket writes require a primary-key table with bucket=-2, but table '{}' has bucket={total_buckets}",
+                        table.identifier().full_name()
+                    ),
+                });
+            }
             if core_options.deletion_vectors_enabled() {
                 return Err(crate::Error::Unsupported {
                     message: format!(
-                        "Table '{}' cannot use postpone.batch-write-fixed-bucket=true with deletion-vectors.enabled=true because deletion-vector scans skip the level-0 files produced by batch writers; disable fixed-bucket batch writes or deletion vectors",
+                        "Table '{}' cannot use postpone fixed-bucket writes with deletion-vectors.enabled=true because deletion-vector scans skip the level-0 files produced by batch writers; use the normal postpone writer or disable deletion vectors",
                         table.identifier().full_name()
                     ),
                 });
@@ -1008,11 +1029,13 @@ impl TableWrite {
             let input_rows = batches.iter().fold(0_i64, |rows, batch| {
                 rows.saturating_add(batch.num_rows() as i64)
             });
-            let input_size = batches.iter().fold(0_i64, |size, batch| {
-                size.saturating_add(
-                    i64::try_from(batch.get_array_memory_size()).unwrap_or(i64::MAX),
-                )
-            });
+            let input_size =
+                batches.iter().try_fold(0_i64, |size, batch| {
+                    Ok::<_, crate::Error>(size.saturating_add(binary_row_batch_size(
+                        batch,
+                        self.table.schema().fields(),
+                    )?))
+                })?;
             let postpone_rows = if self.is_overwrite {
                 0
             } else {
@@ -4004,7 +4027,6 @@ mod tests {
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
             .option("bucket", "-2")
-            .option("postpone.batch-write-fixed-bucket", "false")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -4047,7 +4069,6 @@ mod tests {
             .primary_key(["pt", "id"])
             .partition_keys(["pt"])
             .option("bucket", "-2")
-            .option("postpone.batch-write-fixed-bucket", "false")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -4115,7 +4136,8 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let table = test_fixed_postpone_pk_table(&file_io, table_path);
 
-        let mut write = TableWrite::new(&table, "fixed-user-1".to_string()).unwrap();
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-user-1".to_string()).unwrap();
         write
             .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
             .await
@@ -4140,7 +4162,8 @@ mod tests {
 
         // A later small append reuses the partition's existing bucket count
         // instead of inferring a new count from its own input size.
-        let mut write = TableWrite::new(&table, "fixed-user-2".to_string()).unwrap();
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-user-2".to_string()).unwrap();
         write
             .write_arrow_batch(&make_batch(vec![5], vec![50]))
             .await
@@ -4166,12 +4189,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_postpone_bucket_count_uses_java_binary_row_size() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_java_binary_row_size";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("left", DataType::VarChar(VarCharType::string_type()))
+            .column("right", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "-2")
+            .option("postpone.target-size-per-bucket", "20 kb")
+            .option("postpone.batch-write-fixed-bucket.max-parallelism", "8")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_postpone_java_binary_row_size"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let row_count = 1_000;
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("left", ArrowDataType::Utf8, false),
+                ArrowField::new("right", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..row_count)),
+                Arc::new(StringArray::from(vec!["a"; row_count as usize])),
+                Arc::new(StringArray::from(vec!["b"; row_count as usize])),
+            ],
+        )
+        .unwrap();
+
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-size-user".to_string()).unwrap();
+        write.write_arrow_batch(&batch).await.unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+
+        // Java BinaryRows are 32,000 bytes, so a 20 KiB target plans two
+        // buckets. Arrow buffer sizing would incorrectly plan one.
+        assert!(!messages.is_empty());
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(2)));
+    }
+
+    #[tokio::test]
     async fn test_postpone_fixed_bucket_batch_write_is_one_shot() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_fixed_bucket_one_shot";
         setup_dirs(&file_io, table_path).await;
         let table = test_fixed_postpone_pk_table(&file_io, table_path);
-        let mut write = TableWrite::new(&table, "fixed-one-shot".to_string()).unwrap();
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-one-shot".to_string()).unwrap();
 
         write
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
@@ -4219,11 +4293,11 @@ mod tests {
             None,
         );
 
-        let error = TableWrite::new(&table, "test-user".to_string())
+        let error = TableWrite::new_postpone_fixed_bucket(&table, "test-user".to_string())
             .err()
             .expect("fixed-bucket postpone writes must reject deletion vectors");
         assert!(matches!(error, crate::Error::Unsupported { ref message }
-                if message.contains("postpone.batch-write-fixed-bucket=true")
+                if message.contains("postpone fixed-bucket writes")
                     && message.contains("deletion-vectors.enabled=true")));
     }
 
@@ -4236,7 +4310,8 @@ mod tests {
 
         // Both writers plan against the empty table. Their differently sized
         // inputs produce different bucket counts for the same partition.
-        let mut first = TableWrite::new(&table, "fixed-conflict-1".to_string()).unwrap();
+        let mut first =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-conflict-1".to_string()).unwrap();
         first
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await
@@ -4246,7 +4321,8 @@ mod tests {
             .iter()
             .all(|message| message.total_buckets == Some(1)));
 
-        let mut second = TableWrite::new(&table, "fixed-conflict-2".to_string()).unwrap();
+        let mut second =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-conflict-2".to_string()).unwrap();
         second
             .write_arrow_batch(&make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]))
             .await

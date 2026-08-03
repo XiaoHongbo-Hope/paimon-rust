@@ -2588,6 +2588,10 @@ impl TableCommit {
             stats.file_size_in_bytes += sign * file.file_size;
             stats.file_count += sign;
             stats.last_file_creation_time = stats.last_file_creation_time.max(file_creation_time);
+            // Overwrite entries are ordered DELETE-old then ADD-new. Match
+            // Java PartitionEntry.merge by retaining the replacement entry's
+            // bucket count instead of the first value seen for the partition.
+            stats.total_buckets = entry.total_buckets();
         }
 
         Ok(stats_map.into_values().collect())
@@ -2934,7 +2938,7 @@ mod tests {
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
         BinaryRowBuilder, DataFileMeta, DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta,
-        ManifestList, TableSchema,
+        ManifestList, TableSchema, POSTPONE_BUCKET,
     };
     use chrono::{DateTime, Utc};
 
@@ -4164,6 +4168,45 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 300 - 100 (delete a) + 50 (add a2) = 250
         assert_eq!(snapshot.total_record_count(), Some(250));
+    }
+
+    #[test]
+    fn test_partition_statistics_keep_replacement_bucket_count() {
+        let file_io = test_file_io();
+        let commit = setup_partitioned_commit(
+            &file_io,
+            "memory:/test_partition_statistics_replacement_bucket_count",
+        );
+        let partition = partition_bytes("a");
+
+        for (old_buckets, new_buckets) in [(-2, 4), (4, 8)] {
+            let entries = vec![
+                ManifestEntry::new(
+                    FileKind::Delete,
+                    partition.clone(),
+                    if old_buckets == POSTPONE_BUCKET {
+                        POSTPONE_BUCKET
+                    } else {
+                        0
+                    },
+                    old_buckets,
+                    test_data_file("old.parquet", 100),
+                    2,
+                ),
+                ManifestEntry::new(
+                    FileKind::Add,
+                    partition.clone(),
+                    0,
+                    new_buckets,
+                    test_data_file("new.parquet", 50),
+                    2,
+                ),
+            ];
+
+            let statistics = commit.generate_partition_statistics(&entries).unwrap();
+            assert_eq!(statistics.len(), 1);
+            assert_eq!(statistics[0].total_buckets, new_buckets);
+        }
     }
 
     #[tokio::test]

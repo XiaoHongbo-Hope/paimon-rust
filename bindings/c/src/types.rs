@@ -210,6 +210,7 @@ pub(crate) struct WriteBuilderState {
     pub table: Table,
     pub commit_user: String,
     pub overwrite: bool,
+    pub postpone_fixed_bucket: bool,
 }
 
 pub(crate) struct TableWriteState {

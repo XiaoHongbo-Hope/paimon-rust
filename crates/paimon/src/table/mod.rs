@@ -72,6 +72,7 @@ mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
 mod pk_vector_position_read;
 mod pk_vector_scan;
+mod postpone_bucket;
 mod postpone_file_writer;
 mod prepared_files;
 mod read_builder;
@@ -357,6 +358,14 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_write_builder(&self) -> WriteBuilder<'_> {
         WriteBuilder::new(self)
+    }
+
+    /// Create an explicit one-shot fixed-bucket writer for a postpone table.
+    ///
+    /// Normal write builders retain postpone-bucket semantics. Callers which
+    /// want immediately visible real buckets must opt in through this builder.
+    pub fn new_postpone_fixed_bucket_write_builder(&self) -> Result<WriteBuilder<'_>> {
+        WriteBuilder::new_postpone_fixed_bucket(self)
     }
 
     /// Create a copy of this table with extra options merged into the schema.

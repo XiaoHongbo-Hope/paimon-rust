@@ -1941,9 +1941,9 @@ async fn test_pk_first_row_insert_overwrite() {
 
 // ======================= Postpone Bucket (bucket = -2) =======================
 
-/// Batch writes to postpone tables use visible fixed buckets by default.
+/// Postpone bucket files are invisible to normal SELECT but visible via scan_all_files.
 #[tokio::test]
-async fn test_postpone_batch_write_uses_visible_fixed_bucket() {
+async fn test_postpone_write_invisible_to_select() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
     sql_context
@@ -1970,7 +1970,7 @@ async fn test_postpone_batch_write_uses_visible_fixed_bucket() {
         .await
         .unwrap();
 
-    // scan_all_files should find the fixed-bucket file.
+    // scan_all_files should find the postpone file
     let table = catalog
         .get_table(&Identifier::new("test_db", "t_postpone"))
         .await
@@ -1983,11 +1983,11 @@ async fn test_postpone_batch_write_uses_visible_fixed_bucket() {
         .await
         .unwrap();
     let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
-    assert_eq!(file_count, 1, "scan_all_files should find 1 data file");
+    assert_eq!(file_count, 1, "scan_all_files should find 1 postpone file");
 
-    // Fixed-bucket files are immediately visible to normal readers.
+    // Normal SELECT should return 0 rows (postpone files are invisible)
     let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t_postpone").await;
-    assert_eq!(count, 3, "SELECT should return the fixed-bucket rows");
+    assert_eq!(count, 0, "SELECT should return 0 rows for postpone table");
 }
 
 /// INSERT OVERWRITE on a postpone table should replace old files with new ones.

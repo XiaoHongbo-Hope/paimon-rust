@@ -1155,8 +1155,9 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
     }
 
-    /// Whether batch writes to a postpone-bucket table are routed directly to
-    /// real buckets so they are immediately visible to normal readers.
+    /// Whether high-level batch integrations should select the explicit
+    /// postpone fixed-bucket writer. Direct `new_write_builder` calls retain
+    /// normal postpone semantics regardless of this option.
     pub fn postpone_batch_write_fixed_bucket(&self) -> bool {
         self.options
             .get(POSTPONE_BATCH_WRITE_FIXED_BUCKET_OPTION)

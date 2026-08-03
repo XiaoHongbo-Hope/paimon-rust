@@ -43,6 +43,23 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
+    /// Create a builder for one-shot fixed-bucket writes to a postpone table.
+    ///
+    /// Unlike [`WriteBuilder::new`], writers created by this builder plan real
+    /// buckets for `bucket = -2` tables. Keeping this mode explicit prevents a
+    /// normal batch writer from silently changing postpone-write semantics.
+    pub fn new_postpone_fixed_bucket(table: &'a Table) -> crate::Result<Self> {
+        if table.is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: "Postpone fixed-bucket writes are only supported for Paimon tables"
+                    .to_string(),
+            });
+        }
+        Ok(Self(WriteBuilderKind::Paimon(
+            PaimonWriteBuilder::new(table).with_postpone_fixed_bucket(),
+        )))
+    }
+
     /// Get the commit user shared by writers and committers created by this builder.
     pub fn commit_user(&self) -> &str {
         match &self.0 {
@@ -120,6 +137,7 @@ struct PaimonWriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
     overwrite: bool,
+    postpone_fixed_bucket: bool,
 }
 
 impl<'a> PaimonWriteBuilder<'a> {
@@ -128,7 +146,13 @@ impl<'a> PaimonWriteBuilder<'a> {
             table,
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
+            postpone_fixed_bucket: false,
         }
+    }
+
+    fn with_postpone_fixed_bucket(mut self) -> Self {
+        self.postpone_fixed_bucket = true;
+        self
     }
 
     /// Get the commit user shared by writers and committers created by this builder.
@@ -198,7 +222,11 @@ impl<'a> PaimonWriteBuilder<'a> {
                         .to_string(),
             });
         }
-        let write = TableWrite::new(self.table, self.commit_user.clone())?;
+        let write = if self.postpone_fixed_bucket {
+            TableWrite::new_postpone_fixed_bucket(self.table, self.commit_user.clone())?
+        } else {
+            TableWrite::new(self.table, self.commit_user.clone())?
+        };
         Ok(if self.overwrite {
             write.with_overwrite()
         } else {
@@ -289,7 +317,6 @@ mod tests {
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
             .option("bucket", "-2")
-            .option("postpone.batch-write-fixed-bucket", "false")
             .build()
             .unwrap();
         Table::new(
@@ -429,6 +456,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.commit_user(), "my-commit-user");
+    }
+
+    #[tokio::test]
+    async fn test_postpone_fixed_bucket_builder_is_explicit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_explicit_postpone_fixed_bucket_builder";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+
+        let mut normal = table.new_write_builder().new_write().unwrap();
+        normal
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let normal_messages = normal.prepare_commit().await.unwrap();
+        assert_eq!(normal_messages.len(), 1);
+        assert_eq!(normal_messages[0].bucket, POSTPONE_BUCKET);
+        assert_eq!(normal_messages[0].total_buckets, None);
+
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("explicit-fixed-user")
+            .unwrap();
+        let mut fixed = builder.new_write().unwrap();
+        fixed
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .await
+            .unwrap();
+        let fixed_messages = fixed.prepare_commit().await.unwrap();
+        assert_eq!(fixed_messages.len(), 1);
+        assert_eq!(fixed_messages[0].bucket, 0);
+        assert_eq!(fixed_messages[0].total_buckets, Some(1));
     }
 
     #[tokio::test]
