@@ -72,6 +72,59 @@ catalog, err := paimon.NewCatalog(map[string]string{
 })
 ```
 
+## Writing a Table
+
+The Go binding accepts `arrow.Record` batches whose field count, order, names,
+and data types match the Paimon table schema. Create the writer and committer
+from the same `WriteBuilder`; they share the commit identity used for duplicate
+commit detection.
+
+```go
+builder, err := table.NewWriteBuilder()
+if err != nil {
+    log.Fatal(err)
+}
+defer builder.Close()
+
+write, err := builder.NewWrite()
+if err != nil {
+    log.Fatal(err)
+}
+defer write.Close()
+
+// record is an arrow.Record owned by the caller. It remains valid after write.
+if err := write.WriteArrowBatch(record); err != nil {
+    log.Fatal(err)
+}
+
+messages, err := write.PrepareCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer messages.Close()
+
+commit, err := builder.NewCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer commit.Close()
+if err := commit.Commit(messages); err != nil {
+    log.Fatal(err)
+}
+```
+
+`TableWrite` accepts multiple record batches before `PrepareCommit`. For
+distributed writers, create each builder with
+`NewWriteBuilderWithCommitUser`, merge their `CommitMessages`, and use
+`CommitWithIdentifier` plus `FilterAndCommitWithIdentifier` for idempotent
+retries. The API also exposes overwrite, truncate, and abort operations.
+
+For a primary-key table configured with `bucket = -2`, Go batch writes route to
+visible fixed buckets by default. Existing partitions reuse their current bucket
+count; new partitions infer it from the input size. Set
+`postpone.batch-write-fixed-bucket = false` to retain the legacy
+`bucket-postpone` behavior.
+
 ## Reading a Table
 
 Paimon Go uses a **scan-then-read** pattern: first scan the table to produce splits, then read data from those splits as Arrow RecordBatches.
@@ -284,7 +337,10 @@ pred, _ := pb.Eq("ts", paimon.Timestamp{Millis: 1700000000000, Nanos: 0})
 
 ## Resource Management
 
-All Paimon objects (`Catalog`, `Table`, `ReadBuilder`, `TableScan`, `Plan`, `TableRead`, `RecordBatchReader`) hold native resources and must be closed when no longer needed. Use `defer` to ensure cleanup:
+All Paimon objects (`Catalog`, `Table`, `ReadBuilder`, `TableScan`, `Plan`,
+`TableRead`, `RecordBatchReader`, `WriteBuilder`, `TableWrite`, `TableCommit`,
+`CommitMessages`) hold native resources and must be closed when no longer
+needed. Use `defer` to ensure cleanup:
 
 ```go
 catalog, err := paimon.NewCatalog(opts)

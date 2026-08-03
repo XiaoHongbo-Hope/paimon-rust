@@ -289,6 +289,7 @@ mod tests {
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
             .option("bucket", "-2")
+            .option("postpone.batch-write-fixed-bucket", "false")
             .build()
             .unwrap();
         Table::new(

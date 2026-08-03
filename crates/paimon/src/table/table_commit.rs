@@ -1240,7 +1240,11 @@ impl TableCommit {
                 } else {
                     CommitKind::APPEND
                 };
-                let detect_conflicts = has_delete || check_from_snapshot.is_some();
+                let has_partition_bucket_counts = entries
+                    .iter()
+                    .any(|entry| entry.total_buckets() != self.total_buckets);
+                let detect_conflicts =
+                    has_delete || check_from_snapshot.is_some() || has_partition_bucket_counts;
                 let base_data_files = if detect_conflicts {
                     self.check_deletion_vector_index_only_conflict(
                         latest_snapshot.as_ref(),
@@ -1853,6 +1857,7 @@ impl TableCommit {
         check_from_snapshot: Option<i64>,
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
+        self.check_total_bucket_conflicts(base_entries, delta_entries)?;
 
         if !self.data_evolution_enabled {
             return Ok(());
@@ -1867,6 +1872,32 @@ impl TableCommit {
         self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
         self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
             .await
+    }
+
+    fn check_total_bucket_conflicts(
+        &self,
+        base_entries: &[ManifestEntry],
+        delta_entries: &[ManifestEntry],
+    ) -> Result<()> {
+        let mut bucket_counts: HashMap<Vec<u8>, i32> = HashMap::new();
+        for entry in base_entries.iter().chain(delta_entries) {
+            if entry.bucket() < 0 || entry.total_buckets() <= 0 {
+                continue;
+            }
+            let partition = entry.partition().to_vec();
+            if let Some(previous) = bucket_counts.insert(partition, entry.total_buckets()) {
+                if previous != entry.total_buckets() {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone fixed-bucket conflict: one partition uses different total bucket counts {previous} and {}",
+                            entry.total_buckets()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn check_deletion_vector_index_only_conflict(
@@ -2602,7 +2633,7 @@ impl TableCommit {
                         FileKind::Add,
                         msg.partition.clone(),
                         msg.bucket,
-                        self.total_buckets,
+                        msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
                         2,
                     )
@@ -2612,7 +2643,7 @@ impl TableCommit {
                         FileKind::Delete,
                         msg.partition.clone(),
                         msg.bucket,
-                        self.total_buckets,
+                        msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
                         2,
                     )
@@ -2632,7 +2663,7 @@ impl TableCommit {
                         FileKind::Add,
                         msg.partition.clone(),
                         msg.bucket,
-                        self.total_buckets,
+                        msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
                         0,
                     )

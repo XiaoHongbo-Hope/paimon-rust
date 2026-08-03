@@ -121,6 +121,13 @@ const DEFAULT_PARQUET_ROW_GROUP_PARALLELISM: usize = 8;
 const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
+const POSTPONE_BATCH_WRITE_FIXED_BUCKET_OPTION: &str = "postpone.batch-write-fixed-bucket";
+const POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM_OPTION: &str =
+    "postpone.batch-write-fixed-bucket.max-parallelism";
+const POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION: &str = "postpone.target-row-num-per-bucket";
+const POSTPONE_TARGET_SIZE_PER_BUCKET_OPTION: &str = "postpone.target-size-per-bucket";
+const DEFAULT_POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM: i32 = 2048;
+const DEFAULT_POSTPONE_TARGET_SIZE_PER_BUCKET: i64 = 1024 * 1024 * 1024;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
@@ -1146,6 +1153,74 @@ impl<'a> CoreOptions<'a> {
             .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
+    }
+
+    /// Whether batch writes to a postpone-bucket table are routed directly to
+    /// real buckets so they are immediately visible to normal readers.
+    pub fn postpone_batch_write_fixed_bucket(&self) -> bool {
+        self.options
+            .get(POSTPONE_BATCH_WRITE_FIXED_BUCKET_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
+    pub fn postpone_batch_write_fixed_bucket_max_parallelism(&self) -> crate::Result<i32> {
+        let value = self
+            .options
+            .get(POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM_OPTION)
+            .map(|value| value.parse::<i32>())
+            .transpose()
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM_OPTION}' must be a positive integer"
+                ),
+                source: Some(Box::new(error)),
+            })?
+            .unwrap_or(DEFAULT_POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM);
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM_OPTION}' must be positive, got: {value}"
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn postpone_target_row_num_per_bucket(&self) -> crate::Result<Option<i64>> {
+        let value = self.parse_i64_option(POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION)?;
+        if value.is_some_and(|value| value <= 0) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION}' must be positive, got: {}",
+                    value.unwrap()
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn postpone_target_size_per_bucket(&self) -> crate::Result<i64> {
+        let value = match self.options.get(POSTPONE_TARGET_SIZE_PER_BUCKET_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{POSTPONE_TARGET_SIZE_PER_BUCKET_OPTION}' must be a valid positive memory size, got: {raw}"
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_POSTPONE_TARGET_SIZE_PER_BUCKET,
+        };
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{POSTPONE_TARGET_SIZE_PER_BUCKET_OPTION}' must be positive, got: {value}"
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
     }
 
     /// When true, blob field reads return serialized BlobDescriptor bytes
