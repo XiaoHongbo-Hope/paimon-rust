@@ -833,7 +833,7 @@ impl TableWrite {
     }
 
     async fn load_postpone_bucket_metadata(
-        &self,
+        &mut self,
     ) -> Result<(HashMap<Vec<u8>, i32>, HashMap<Vec<u8>, i64>)> {
         let mut known_bucket_counts = HashMap::new();
         let mut postpone_row_counts = HashMap::new();
