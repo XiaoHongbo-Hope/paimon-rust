@@ -125,6 +125,11 @@ count; new partitions infer it from the input size. Set
 `postpone.batch-write-fixed-bucket = false` to retain the legacy
 `bucket-postpone` behavior.
 
+Inputs for new partitions are buffered until `PrepareCommit` so their bucket
+count can be inferred from the complete batch. Existing-bucket partitions are
+written incrementally. For workloads that continuously create large new
+partitions, call `PrepareCommit` at a bounded interval to limit memory usage.
+
 ## Reading a Table
 
 Paimon Go uses a **scan-then-read** pattern: first scan the table to produce splits, then read data from those splits as Arrow RecordBatches.

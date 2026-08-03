@@ -55,9 +55,9 @@ enum FileWriter {
     Postpone(PostponeFileWriter),
 }
 
-/// Buffered planning state for batch writes to postpone-bucket tables. Bucket
-/// counts are resolved per partition when preparing the commit, after all input
-/// batches and their uncompressed Arrow sizes are known.
+/// Planning state for batch writes to postpone-bucket tables. Partitions with
+/// an existing real-bucket count are written incrementally, while only new
+/// partitions are buffered until their bucket count can be inferred.
 struct PostponeFixedBucketState {
     partition_field_indices: Vec<usize>,
     bucket_key_indices: Vec<usize>,
@@ -65,7 +65,11 @@ struct PostponeFixedBucketState {
     max_parallelism: i32,
     target_rows_per_bucket: Option<i64>,
     target_size_per_bucket: i64,
+    metadata_loaded: bool,
+    known_bucket_counts: HashMap<Vec<u8>, i32>,
+    postpone_row_counts: HashMap<Vec<u8>, i64>,
     buffered_batches: HashMap<Vec<u8>, Vec<RecordBatch>>,
+    /// Bucket counts used by the current prepare-commit round.
     bucket_counts: HashMap<Vec<u8>, i32>,
 }
 
@@ -329,6 +333,9 @@ impl TableWrite {
                     .postpone_batch_write_fixed_bucket_max_parallelism()?,
                 target_rows_per_bucket: core_options.postpone_target_row_num_per_bucket()?,
                 target_size_per_bucket: core_options.postpone_target_size_per_bucket()?,
+                metadata_loaded: false,
+                known_bucket_counts: HashMap::new(),
+                postpone_row_counts: HashMap::new(),
                 buffered_batches: HashMap::new(),
                 bucket_counts: HashMap::new(),
             })
@@ -491,7 +498,7 @@ impl TableWrite {
         }
 
         if self.postpone_fixed_bucket.is_some() {
-            self.buffer_postpone_fixed_batch(&batch)?;
+            self.write_postpone_fixed_batch(&batch).await?;
             return Ok(());
         }
 
@@ -805,14 +812,41 @@ impl TableWrite {
         })
     }
 
-    fn buffer_postpone_fixed_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    async fn ensure_postpone_bucket_metadata(&mut self) -> Result<()> {
+        let should_load = self
+            .postpone_fixed_bucket
+            .as_ref()
+            .is_some_and(|state| !state.metadata_loaded);
+        if !should_load {
+            return Ok(());
+        }
+
+        let (known_bucket_counts, postpone_row_counts) =
+            self.load_postpone_bucket_metadata().await?;
         let state = self.postpone_fixed_bucket.as_mut().unwrap();
-        let partitions = if state.partition_field_indices.is_empty() {
+        state.known_bucket_counts = known_bucket_counts;
+        state.postpone_row_counts = postpone_row_counts;
+        state.metadata_loaded = true;
+        Ok(())
+    }
+
+    async fn write_postpone_fixed_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.ensure_postpone_bucket_metadata().await?;
+
+        let (partition_field_indices, bucket_key_indices, bucket_function_type) = {
+            let state = self.postpone_fixed_bucket.as_ref().unwrap();
+            (
+                state.partition_field_indices.clone(),
+                state.bucket_key_indices.clone(),
+                state.bucket_function_type,
+            )
+        };
+        let partitions = if partition_field_indices.is_empty() {
             vec![EMPTY_SERIALIZED_ROW.clone(); batch.num_rows()]
         } else {
             batch_to_serialized_bytes(
                 batch,
-                &state.partition_field_indices,
+                &partition_field_indices,
                 self.table.schema().fields(),
             )?
         };
@@ -823,11 +857,36 @@ impl TableWrite {
         }
         for (partition, rows) in groups {
             let sub_batch = Self::take_rows(batch, &rows)?;
-            state
-                .buffered_batches
-                .entry(partition)
-                .or_default()
-                .push(sub_batch);
+            let known_bucket_count = self
+                .postpone_fixed_bucket
+                .as_ref()
+                .unwrap()
+                .known_bucket_counts
+                .get(&partition)
+                .copied();
+            if let Some(total_buckets) = known_bucket_count {
+                self.postpone_fixed_bucket
+                    .as_mut()
+                    .unwrap()
+                    .bucket_counts
+                    .insert(partition.clone(), total_buckets);
+                self.route_postpone_fixed_batch(
+                    partition,
+                    sub_batch,
+                    total_buckets,
+                    &bucket_key_indices,
+                    bucket_function_type,
+                )
+                .await?;
+            } else {
+                self.postpone_fixed_bucket
+                    .as_mut()
+                    .unwrap()
+                    .buffered_batches
+                    .entry(partition)
+                    .or_default()
+                    .push(sub_batch);
+            }
         }
         Ok(())
     }
@@ -904,71 +963,98 @@ impl TableWrite {
             return Ok(());
         }
 
-        let (mut known_bucket_counts, postpone_row_counts) =
-            self.load_postpone_bucket_metadata().await?;
-        let state = self.postpone_fixed_bucket.as_mut().unwrap();
-        let buffered_batches = std::mem::take(&mut state.buffered_batches);
-        let bucket_key_indices = state.bucket_key_indices.clone();
-        let bucket_function_type = state.bucket_function_type;
-        let target_rows_per_bucket = state.target_rows_per_bucket;
-        let target_size_per_bucket = state.target_size_per_bucket;
-        let max_parallelism = state.max_parallelism;
+        let (
+            buffered_batches,
+            bucket_key_indices,
+            bucket_function_type,
+            target_rows_per_bucket,
+            target_size_per_bucket,
+            max_parallelism,
+            postpone_row_counts,
+        ) = {
+            let state = self.postpone_fixed_bucket.as_mut().unwrap();
+            (
+                std::mem::take(&mut state.buffered_batches),
+                state.bucket_key_indices.clone(),
+                state.bucket_function_type,
+                state.target_rows_per_bucket,
+                state.target_size_per_bucket,
+                state.max_parallelism,
+                state.postpone_row_counts.clone(),
+            )
+        };
 
         for (partition, batches) in buffered_batches {
-            let total_buckets = if let Some(count) = known_bucket_counts.get(&partition) {
-                *count
-            } else {
-                let input_rows = batches.iter().fold(0_i64, |rows, batch| {
-                    rows.saturating_add(batch.num_rows() as i64)
-                });
-                let input_size = batches.iter().fold(0_i64, |size, batch| {
-                    size.saturating_add(
-                        i64::try_from(batch.get_array_memory_size()).unwrap_or(i64::MAX),
-                    )
-                });
-                let postpone_rows = if self.is_overwrite {
-                    0
-                } else {
-                    postpone_row_counts.get(&partition).copied().unwrap_or(0)
-                };
-                Self::infer_postpone_bucket_count(
-                    input_rows,
-                    input_size,
-                    postpone_rows,
-                    target_rows_per_bucket,
-                    target_size_per_bucket,
-                    max_parallelism,
+            let input_rows = batches.iter().fold(0_i64, |rows, batch| {
+                rows.saturating_add(batch.num_rows() as i64)
+            });
+            let input_size = batches.iter().fold(0_i64, |size, batch| {
+                size.saturating_add(
+                    i64::try_from(batch.get_array_memory_size()).unwrap_or(i64::MAX),
                 )
+            });
+            let postpone_rows = if self.is_overwrite {
+                0
+            } else {
+                postpone_row_counts.get(&partition).copied().unwrap_or(0)
             };
-            known_bucket_counts.insert(partition.clone(), total_buckets);
-            self.postpone_fixed_bucket
-                .as_mut()
-                .unwrap()
-                .bucket_counts
-                .insert(partition.clone(), total_buckets);
+            let total_buckets = Self::infer_postpone_bucket_count(
+                input_rows,
+                input_size,
+                postpone_rows,
+                target_rows_per_bucket,
+                target_size_per_bucket,
+                max_parallelism,
+            );
+            {
+                let state = self.postpone_fixed_bucket.as_mut().unwrap();
+                state
+                    .known_bucket_counts
+                    .insert(partition.clone(), total_buckets);
+                state.bucket_counts.insert(partition.clone(), total_buckets);
+            }
 
             for batch in batches {
-                let buckets = if total_buckets <= 1 || bucket_key_indices.is_empty() {
-                    vec![0; batch.num_rows()]
-                } else {
-                    batch_bucket_ids(
-                        &batch,
-                        &bucket_key_indices,
-                        self.table.schema().fields(),
-                        bucket_function_type,
-                        total_buckets,
-                    )?
-                };
-                let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
-                for (row, bucket) in buckets.into_iter().enumerate() {
-                    groups.entry(bucket).or_default().push(row);
-                }
-                for (bucket, rows) in groups {
-                    let sub_batch = Self::take_rows(&batch, &rows)?;
-                    self.write_bucket(partition.clone(), bucket, sub_batch)
-                        .await?;
-                }
+                self.route_postpone_fixed_batch(
+                    partition.clone(),
+                    batch,
+                    total_buckets,
+                    &bucket_key_indices,
+                    bucket_function_type,
+                )
+                .await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn route_postpone_fixed_batch(
+        &mut self,
+        partition: Vec<u8>,
+        batch: RecordBatch,
+        total_buckets: i32,
+        bucket_key_indices: &[usize],
+        bucket_function_type: BucketFunctionType,
+    ) -> Result<()> {
+        let buckets = if total_buckets <= 1 || bucket_key_indices.is_empty() {
+            vec![0; batch.num_rows()]
+        } else {
+            batch_bucket_ids(
+                &batch,
+                bucket_key_indices,
+                self.table.schema().fields(),
+                bucket_function_type,
+                total_buckets,
+            )?
+        };
+        let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
+        for (row, bucket) in buckets.into_iter().enumerate() {
+            groups.entry(bucket).or_default().push(row);
+        }
+        for (bucket, rows) in groups {
+            let sub_batch = Self::take_rows(&batch, &rows)?;
+            self.write_bucket(partition.clone(), bucket, sub_batch)
+                .await?;
         }
         Ok(())
     }
@@ -1048,6 +1134,12 @@ impl TableWrite {
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }
+        }
+        if let Some(state) = self.postpone_fixed_bucket.as_mut() {
+            state.metadata_loaded = false;
+            state.known_bucket_counts.clear();
+            state.postpone_row_counts.clear();
+            state.bucket_counts.clear();
         }
         Ok(messages)
     }
@@ -3991,6 +4083,9 @@ mod tests {
             .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
             .await
             .unwrap();
+        let state = write.postpone_fixed_bucket.as_ref().unwrap();
+        assert_eq!(state.buffered_batches.len(), 1);
+        assert!(write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert!(!messages.is_empty());
         assert!(messages.iter().all(|message| message.bucket >= 0));
@@ -4013,6 +4108,12 @@ mod tests {
             .write_arrow_batch(&make_batch(vec![5], vec![50]))
             .await
             .unwrap();
+        // The real-bucket count is loaded on the first write, so existing
+        // partitions stream into file writers instead of retaining Arrow
+        // batches until prepare_commit.
+        let state = write.postpone_fixed_bucket.as_ref().unwrap();
+        assert!(state.buffered_batches.is_empty());
+        assert!(!write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert!(messages
             .iter()
