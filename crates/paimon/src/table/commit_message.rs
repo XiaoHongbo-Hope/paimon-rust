@@ -27,6 +27,9 @@ pub struct CommitMessage {
     pub partition: Vec<u8>,
     /// Bucket id.
     pub bucket: i32,
+    /// Per-partition bucket count. Set by fixed-bucket postpone batch writes;
+    /// ordinary writes use the table-level bucket option.
+    pub total_buckets: Option<i32>,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
     /// Snapshot id from which row-id/column conflicts should be checked.
@@ -46,6 +49,7 @@ impl CommitMessage {
         Self {
             partition,
             bucket,
+            total_buckets: None,
             new_files,
             check_from_snapshot: None,
             new_changelog_files: Vec::new(),
