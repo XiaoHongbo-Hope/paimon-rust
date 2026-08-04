@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, Table};
+use paimon::table::{DataSplit, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -69,6 +69,7 @@ fn apply_read_config(
     projection: &Option<Vec<String>>,
     limit: Option<usize>,
     filter: &Option<Predicate>,
+    row_ranges: &Option<Vec<RowRange>>,
     case_sensitive: bool,
 ) -> PyResult<()> {
     builder.with_case_sensitive(case_sensitive);
@@ -81,6 +82,9 @@ fn apply_read_config(
     }
     if let Some(filter) = filter {
         builder.with_filter(filter.clone());
+    }
+    if let Some(row_ranges) = row_ranges {
+        builder.with_row_ranges(row_ranges.clone());
     }
     Ok(())
 }
@@ -110,6 +114,7 @@ pub struct PyReadBuilder {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
 }
 
@@ -120,6 +125,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            row_ranges: None,
             case_sensitive: true,
         }
     }
@@ -162,6 +168,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            row_ranges: None,
             case_sensitive: true,
         })
     }
@@ -203,12 +210,31 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
+    /// Set inclusive row ID ranges for Data Evolution scans.
+    fn with_row_ranges(
+        mut slf: PyRefMut<'_, Self>,
+        ranges: Vec<(i64, i64)>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let mut row_ranges = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            if from > to {
+                return Err(PyValueError::new_err(format!(
+                    "row range start {from} exceeds end {to}"
+                )));
+            }
+            row_ranges.push(RowRange::new(from, to));
+        }
+        slf.row_ranges = Some(row_ranges);
+        Ok(slf)
+    }
+
     fn new_scan(&self) -> PyTableScan {
         PyTableScan {
             table: Arc::clone(&self.table),
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
         }
     }
@@ -219,6 +245,7 @@ impl PyReadBuilder {
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
         }
     }
@@ -230,6 +257,7 @@ pub struct PyTableScan {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
 }
 
@@ -245,6 +273,7 @@ impl PyTableScan {
                     &self.projection,
                     self.limit,
                     &self.filter,
+                    &self.row_ranges,
                     self.case_sensitive,
                 )?;
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
@@ -261,6 +290,7 @@ pub struct PyTableRead {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
 }
 
@@ -278,6 +308,7 @@ impl PyTableRead {
                     &self.projection,
                     self.limit,
                     &self.filter,
+                    &self.row_ranges,
                     self.case_sensitive,
                 )?;
                 // Validate config (e.g. projection) before the empty-splits fast
