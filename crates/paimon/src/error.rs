@@ -84,6 +84,12 @@ pub enum Error {
 
     #[snafu(
         visibility(pub(crate)),
+        display("Global-index query memory limit exceeded: {}", message)
+    )]
+    GlobalIndexMemoryLimitExceeded { message: String },
+
+    #[snafu(
+        visibility(pub(crate)),
         display("Paimon hitting unexpected parquet error: {}", message)
     )]
     ParquetDataUnexpected {

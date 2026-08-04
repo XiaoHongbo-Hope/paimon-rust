@@ -27,7 +27,9 @@ use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::footer::{BTreeFileFooter, BTREE_FOOTER_ENCODED_LENGTH};
 use crate::btree::key_serde::prefix_successor;
 use crate::btree::meta::BTreeIndexMeta;
-use crate::btree::sst_file::{read_block_from_bytes, SstFileReader};
+use crate::btree::sst_file::{
+    read_block_from_bytes, read_block_from_bytes_with_memory_limit, SstFileReader,
+};
 use crate::btree::var_len::{decode_var_int, decode_var_long};
 use crate::io::FileRead;
 use roaring::RoaringTreemap;
@@ -54,6 +56,16 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         meta: &BTreeIndexMeta,
         key_comparator: F,
     ) -> io::Result<Self> {
+        Self::open_with_memory_limit(reader, file_size, meta, key_comparator, None).await
+    }
+
+    pub(crate) async fn open_with_memory_limit(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        meta: &BTreeIndexMeta,
+        key_comparator: F,
+        max_memory: Option<usize>,
+    ) -> io::Result<Self> {
         if file_size < BTREE_FOOTER_ENCODED_LENGTH as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -71,17 +83,23 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
         // 2. Read index block
         let idx = &footer.index_block_handle;
+        ensure_block_within_memory_limit(idx.full_block_size() as usize, max_memory)?;
         let idx_end = idx.offset + idx.full_block_size() as u64;
         let index_bytes = reader
             .read(idx.offset..idx_end)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let index_block = read_block_from_bytes(&index_bytes, idx.size)?;
+        let index_block = match max_memory {
+            Some(max_memory) => {
+                read_block_from_bytes_with_memory_limit(&index_bytes, idx.size, max_memory)?
+            }
+            None => read_block_from_bytes(&index_bytes, idx.size)?,
+        };
         let sst_reader = SstFileReader::from_index_block(index_block);
 
         // 3. Read null bitmap
         let null_bitmap = match &footer.null_bitmap_handle {
-            Some(h) => read_null_bitmap(reader.as_ref(), h).await?,
+            Some(h) => read_null_bitmap(reader.as_ref(), h, max_memory).await?,
             None => RoaringTreemap::new(),
         };
 
@@ -119,7 +137,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         &self,
         predicate: impl Fn(&[u8]) -> bool + Send + Sync,
     ) -> io::Result<RoaringTreemap> {
-        self.scan_entries_limited(predicate, None).await
+        self.scan_entries_limited(predicate, None, None).await
     }
 
     /// Scan non-null entries until `limit` matching row ids have been collected.
@@ -128,6 +146,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         &self,
         predicate: impl Fn(&[u8]) -> bool + Send + Sync,
         limit: Option<usize>,
+        max_memory: Option<usize>,
     ) -> io::Result<RoaringTreemap> {
         let Some(min_key) = self.min_key.as_deref() else {
             return Ok(RoaringTreemap::new());
@@ -140,7 +159,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
         while let Some((_key, handle_bytes)) = index_iter.next() {
             let handle = BlockHandle::decode(handle_bytes)?;
-            let block = self.read_data_block(&handle).await?;
+            let block = self.read_data_block(&handle, max_memory).await?;
             let mut offset = 0;
             while offset < block.data.len() {
                 let (key, value, next_offset) = block.read_entry_at(offset);
@@ -166,7 +185,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         from_inclusive: bool,
         to_inclusive: bool,
     ) -> io::Result<RoaringTreemap> {
-        self.range_query_limited(from, to, from_inclusive, to_inclusive, None)
+        self.range_query_limited(from, to, from_inclusive, to_inclusive, None, None)
             .await
     }
 
@@ -177,6 +196,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         from_inclusive: bool,
         to_inclusive: bool,
         limit: Option<usize>,
+        max_memory: Option<usize>,
     ) -> io::Result<RoaringTreemap> {
         if limit == Some(0) {
             return Ok(RoaringTreemap::new());
@@ -192,7 +212,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         let first_block = match index_iter.next() {
             Some((_key, handle_bytes)) => {
                 let handle = BlockHandle::decode(handle_bytes)?;
-                self.read_data_block(&handle).await?
+                self.read_data_block(&handle, max_memory).await?
             }
             None => return Ok(result),
         };
@@ -217,7 +237,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         // Continue with subsequent data blocks
         while let Some((_key, handle_bytes)) = index_iter.next() {
             let handle = BlockHandle::decode(handle_bytes)?;
-            let block = self.read_data_block(&handle).await?;
+            let block = self.read_data_block(&handle, max_memory).await?;
             let mut block_offset = 0;
             if self.scan_block(
                 &block,
@@ -273,14 +293,24 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
     }
 
     /// Read a data block from the file on demand.
-    async fn read_data_block(&self, handle: &BlockHandle) -> io::Result<BlockReader> {
+    async fn read_data_block(
+        &self,
+        handle: &BlockHandle,
+        max_memory: Option<usize>,
+    ) -> io::Result<BlockReader> {
+        ensure_block_within_memory_limit(handle.full_block_size() as usize, max_memory)?;
         let end = handle.offset + handle.full_block_size() as u64;
         let bytes = self
             .reader
             .read(handle.offset..end)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        read_block_from_bytes(&bytes, handle.size)
+        match max_memory {
+            Some(max_memory) => {
+                read_block_from_bytes_with_memory_limit(&bytes, handle.size, max_memory)
+            }
+            None => read_block_from_bytes(&bytes, handle.size),
+        }
     }
 
     /// Equal query: returns row ids for the given key.
@@ -327,28 +357,30 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         }
     }
 
-    pub(crate) async fn query_equal_limited(
+    pub(crate) async fn query_equal_limited_with_memory_limit(
         &self,
         key: &[u8],
         limit: usize,
+        max_memory: usize,
     ) -> io::Result<RoaringTreemap> {
-        self.range_query_limited(key, key, true, true, Some(limit))
+        self.range_query_limited(key, key, true, true, Some(limit), Some(max_memory))
             .await
     }
 
-    pub(crate) async fn query_prefix_limited(
+    pub(crate) async fn query_prefix_limited_with_memory_limit(
         &self,
         prefix: &[u8],
         limit: usize,
+        max_memory: usize,
     ) -> io::Result<RoaringTreemap> {
         match prefix_successor(prefix) {
             Some(upper) => {
-                self.range_query_limited(prefix, &upper, true, false, Some(limit))
+                self.range_query_limited(prefix, &upper, true, false, Some(limit), Some(max_memory))
                     .await
             }
             None => match &self.max_key {
                 Some(max) => {
-                    self.range_query_limited(prefix, max, true, true, Some(limit))
+                    self.range_query_limited(prefix, max, true, true, Some(limit), Some(max_memory))
                         .await
                 }
                 None => Ok(RoaringTreemap::new()),
@@ -385,7 +417,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         let first_block = match index_iter.next() {
             Some((_key, handle_bytes)) => {
                 let handle = BlockHandle::decode(handle_bytes)?;
-                self.read_data_block(&handle).await?
+                self.read_data_block(&handle, None).await?
             }
             None => return Ok(result),
         };
@@ -405,7 +437,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
         while let Some((_key, handle_bytes)) = index_iter.next() {
             let handle = BlockHandle::decode(handle_bytes)?;
-            let block = self.read_data_block(&handle).await?;
+            let block = self.read_data_block(&handle, None).await?;
             let mut block_offset = 0;
             if self.scan_block_in(
                 &block,
@@ -471,9 +503,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 async fn read_null_bitmap(
     reader: &dyn FileRead,
     handle: &BlockHandle,
+    max_memory: Option<usize>,
 ) -> io::Result<RoaringTreemap> {
     let offset = handle.offset;
     let size = handle.size as u64;
+    ensure_block_within_memory_limit(size as usize + 4, max_memory)?;
     // Read bitmap bytes + CRC (4 bytes)
     let bytes = reader
         .read(offset..offset + size + 4)
@@ -486,6 +520,19 @@ async fn read_null_bitmap(
 
     RoaringTreemap::deserialize_from(bitmap_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn ensure_block_within_memory_limit(size: usize, max_memory: Option<usize>) -> io::Result<()> {
+    if max_memory.is_some_and(|max_memory| size > max_memory) {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "BTree index block requires {size} bytes, exceeding the {}-byte limit",
+                max_memory.unwrap()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<()> {

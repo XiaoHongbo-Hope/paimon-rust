@@ -53,10 +53,6 @@ fn is_exact_filter_pushdown_for_schema(
     partition_keys: &[String],
     filter: &Predicate,
 ) -> bool {
-    if partition_keys.is_empty() {
-        return false;
-    }
-
     let (_, data_predicates) =
         split_partition_and_data_predicates(filter.clone(), fields, partition_keys);
     data_predicates.is_empty()
@@ -1237,6 +1233,32 @@ mod tests {
     #[test]
     fn test_exact_filter_pushdown_is_true_for_equality_data_filter() {
         let table = simple_table();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", crate::spec::Datum::Int(1))
+            .unwrap();
+
+        assert!(table
+            .new_read_builder()
+            .is_exact_filter_pushdown(&predicate));
+    }
+
+    #[test]
+    fn test_exact_filter_pushdown_is_true_for_unpartitioned_equality() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(crate::spec::IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-read-builder-unpartitioned-equality".to_string(),
+            table_schema,
+            None,
+        );
         let predicate = PredicateBuilder::new(table.schema().fields())
             .equal("id", crate::spec::Datum::Int(1))
             .unwrap();

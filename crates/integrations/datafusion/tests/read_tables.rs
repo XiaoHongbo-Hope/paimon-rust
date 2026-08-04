@@ -764,6 +764,65 @@ async fn test_equality_pushes_limit_into_paimon_planning() {
 }
 
 #[tokio::test]
+async fn test_unpartitioned_equality_pushes_limit_into_paimon_planning() {
+    let tmp = tempfile::tempdir().expect("Failed to create temp warehouse");
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file://{}", tmp.path().display()),
+    );
+    let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog)
+        .await
+        .expect("Failed to register catalog");
+    sql_context
+        .sql("CREATE TABLE paimon.default.unpartitioned_limit (id INT, name STRING)")
+        .await
+        .expect("CREATE TABLE should plan")
+        .collect()
+        .await
+        .expect("CREATE TABLE should execute");
+    sql_context
+        .sql("INSERT INTO paimon.default.unpartitioned_limit VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .expect("INSERT should plan")
+        .collect()
+        .await
+        .expect("INSERT should execute");
+
+    let sql = "SELECT id, name FROM paimon.default.unpartitioned_limit \
+               WHERE name = 'alice' LIMIT 1";
+    let plan = sql_context
+        .sql(sql)
+        .await
+        .expect("SELECT should plan")
+        .create_physical_plan()
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        scan_lines.iter().any(|line| line.contains("limit=1")),
+        "An exact equality on an unpartitioned table should carry LIMIT into Paimon planning, plan:\n{plan_text}"
+    );
+
+    let batches = sql_context
+        .sql(sql)
+        .await
+        .expect("SELECT should plan")
+        .collect()
+        .await
+        .expect("Unpartitioned equality + LIMIT query should succeed");
+    assert_eq!(
+        extract_id_name_rows(&batches),
+        vec![(1, "alice".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
     let sql = "SELECT id, name FROM paimon.default.simple_log_table WHERE id + 1 > 3 LIMIT 1";
     let plan = create_physical_plan(sql)

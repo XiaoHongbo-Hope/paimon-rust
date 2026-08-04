@@ -195,7 +195,16 @@ impl SstFileWriter {
 /// Read and decode a block from raw bytes where offset 0 is the start of the block.
 /// The bytes must contain exactly: block_data (handle.size) + trailer (5 bytes).
 pub fn read_block_from_bytes(bytes: &[u8], size: u32) -> io::Result<BlockReader> {
+    read_block_from_bytes_with_memory_limit(bytes, size, usize::MAX)
+}
+
+pub(crate) fn read_block_from_bytes_with_memory_limit(
+    bytes: &[u8],
+    size: u32,
+    max_memory: usize,
+) -> io::Result<BlockReader> {
     let size = size as usize;
+    ensure_within_memory_limit(size, max_memory, "encoded BTree block")?;
     let trailer = BlockTrailer::read_from(&bytes[size..size + BLOCK_TRAILER_LENGTH])?;
     let block_data = &bytes[..size];
 
@@ -210,16 +219,24 @@ pub fn read_block_from_bytes(bytes: &[u8], size: u32) -> io::Result<BlockReader>
         ));
     }
 
-    let decompressed = decompress_block(block_data, &trailer)?;
+    let decompressed = decompress_block(block_data, &trailer, max_memory)?;
     BlockReader::create_from_vec(decompressed)
 }
 
-fn decompress_block(data: &[u8], trailer: &BlockTrailer) -> io::Result<Vec<u8>> {
+fn decompress_block(data: &[u8], trailer: &BlockTrailer, max_memory: usize) -> io::Result<Vec<u8>> {
     match trailer.compression_type {
         BlockCompressionType::None => Ok(data.to_vec()),
         BlockCompressionType::Zstd => {
             let mut cursor = Cursor::new(data);
-            let uncompressed_size = crate::btree::var_len::decode_var_int(&mut cursor)? as usize;
+            let uncompressed_size = crate::btree::var_len::decode_var_int(&mut cursor)?;
+            if uncompressed_size < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid BTree uncompressed block size: {uncompressed_size}"),
+                ));
+            }
+            let uncompressed_size = uncompressed_size as usize;
+            ensure_within_memory_limit(uncompressed_size, max_memory, "decoded BTree block")?;
             let compressed_start = cursor.position() as usize;
             let compressed_data = &data[compressed_start..];
             let mut decompressed = vec![0u8; uncompressed_size];
@@ -243,6 +260,16 @@ fn decompress_block(data: &[u8], trailer: &BlockTrailer) -> io::Result<Vec<u8>> 
             ),
         )),
     }
+}
+
+fn ensure_within_memory_limit(size: usize, max_memory: usize, what: &str) -> io::Result<()> {
+    if size > max_memory {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{what} requires {size} bytes, exceeding the {max_memory}-byte limit"),
+        ));
+    }
+    Ok(())
 }
 
 /// SstFileReader reads an SST file index block for async on-demand data block loading.
@@ -327,5 +354,36 @@ mod tests {
             assert_eq!(k.as_slice(), entries[i].0);
             assert_eq!(v.as_slice(), entries[i].1);
         }
+    }
+
+    #[test]
+    fn test_compressed_block_checks_decoded_size_before_allocation() {
+        let mut block_writer = BlockWriter::new(4096);
+        block_writer.add(b"hot", &vec![0; 4096]);
+        let raw = block_writer.finish();
+
+        let output = VecFileWrite::new();
+        let writer = SstFileWriter::new(Box::new(output), 4096, BlockCompressionType::Zstd);
+        let (compressed, compression_type) = writer.maybe_compress(&raw);
+        assert_eq!(compression_type, BlockCompressionType::Zstd);
+        assert!(compressed.len() < raw.len());
+
+        let crc = compute_crc32(&compressed, compression_type);
+        let trailer = BlockTrailer {
+            compression_type,
+            crc32c: crc,
+        };
+        let mut encoded = compressed.into_owned();
+        let encoded_size = encoded.len() as u32;
+        encoded.extend_from_slice(&trailer.to_bytes());
+
+        let max_memory = encoded.len();
+        assert!(raw.len() > max_memory);
+        let error =
+            match read_block_from_bytes_with_memory_limit(&encoded, encoded_size, max_memory) {
+                Ok(_) => panic!("decoded block larger than the budget must not be allocated"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     }
 }

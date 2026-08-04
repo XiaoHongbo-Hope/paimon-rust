@@ -1278,6 +1278,7 @@ impl<'a> PaimonTableScan<'a> {
                 schema_fields: self.table.schema().fields(),
                 search_mode: settings.search_mode,
                 global_index_thread_num: settings.thread_num,
+                query_max_memory: core_options.global_index_query_max_memory()?,
                 btree_fallback_scan_max_size: core_options.btree_index_fallback_scan_max_size()?,
                 bitmap_fallback_scan_max_size: core_options
                     .bitmap_index_fallback_scan_max_size()?,

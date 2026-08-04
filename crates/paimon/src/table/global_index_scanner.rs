@@ -129,6 +129,7 @@ pub(crate) struct GlobalIndexScanner {
     global_index_thread_num: usize,
     /// Scan-scoped shard I/O budget shared by all indexed fields.
     query_semaphore: Arc<Semaphore>,
+    query_max_memory: usize,
     btree_fallback_scan_max_size: i64,
     bitmap_fallback_scan_max_size: i64,
     /// Global index entries grouped by field_id.
@@ -222,6 +223,11 @@ struct EntryQueryPlan {
     matching_predicates: Vec<usize>,
 }
 
+enum EntryQueryResult {
+    Complete(Option<RoaringTreemap>),
+    MemoryLimitExceeded,
+}
+
 impl FallbackScanPlan {
     fn allowed(self, kind: GlobalIndexFileKind) -> bool {
         match kind {
@@ -238,14 +244,23 @@ impl OpenedGlobalIndexReader {
         literals: &[Datum],
         data_type: &DataType,
         limit: Option<usize>,
+        max_memory: usize,
     ) -> std::io::Result<RoaringTreemap> {
         match self {
             Self::BTree(reader) => match limit {
-                Some(limit) => reader.query_limited(op, literals, data_type, limit).await,
+                Some(limit) => {
+                    reader
+                        .query_limited_with_memory_limit(op, literals, data_type, limit, max_memory)
+                        .await
+                }
                 None => reader.query(op, literals, data_type).await,
             },
             Self::Bitmap(reader) => match limit {
-                Some(limit) => reader.query_limited(op, literals, data_type, limit).await,
+                Some(limit) => {
+                    reader
+                        .query_limited_with_memory_limit(op, literals, data_type, limit, max_memory)
+                        .await
+                }
                 None => reader.query(op, literals, data_type).await,
             },
         }
@@ -254,11 +269,23 @@ impl OpenedGlobalIndexReader {
     async fn query_preferred_like(
         &self,
         pattern: &str,
+        data_type: &DataType,
         limit: usize,
+        max_memory: usize,
     ) -> std::io::Result<Option<RoaringTreemap>> {
         match self {
-            Self::BTree(reader) => reader.query_preferred_like_limited(pattern, limit).await,
-            Self::Bitmap(_) => Ok(None),
+            Self::BTree(reader) => {
+                reader
+                    .query_preferred_like_limited_with_memory_limit(pattern, limit, max_memory)
+                    .await
+            }
+            Self::Bitmap(reader) => {
+                reader
+                    .query_preferred_like_limited_with_memory_limit(
+                        pattern, data_type, limit, max_memory,
+                    )
+                    .await
+            }
         }
     }
 
@@ -288,10 +315,12 @@ impl OpenedGlobalIndexReader {
 impl GlobalIndexScanner {
     /// Create a scanner from index manifest entries.
     /// Returns `Ok(None)` if there are no global index entries.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         file_io: &FileIO,
         table_path: &str,
         global_index_thread_num: usize,
+        query_max_memory: usize,
         btree_fallback_scan_max_size: i64,
         bitmap_fallback_scan_max_size: i64,
         index_entries: &[IndexManifestEntry],
@@ -300,6 +329,12 @@ impl GlobalIndexScanner {
         if global_index_thread_num == 0 {
             return Err(Error::DataInvalid {
                 message: "Global index thread count must be greater than 0".to_string(),
+                source: None,
+            });
+        }
+        if query_max_memory == 0 {
+            return Err(Error::DataInvalid {
+                message: "Global index query memory limit must be greater than 0".to_string(),
                 source: None,
             });
         }
@@ -398,6 +433,7 @@ impl GlobalIndexScanner {
             table_path: table_path.trim_end_matches('/').to_string(),
             global_index_thread_num,
             query_semaphore: Arc::new(Semaphore::new(global_index_thread_num)),
+            query_max_memory,
             btree_fallback_scan_max_size,
             bitmap_fallback_scan_max_size,
             entries_by_field: entries_by_field.into_iter().collect(),
@@ -757,6 +793,22 @@ impl GlobalIndexScanner {
             .unwrap_or(predicates[0].2);
         let between = between.as_ref();
         let all_row_ids = if let Some(limit) = limit {
+            let bitmap_floating_equality = effective_predicates.len() == 1
+                && effective_predicates[0].0 == PredicateOperator::Eq
+                && matches!(
+                    effective_predicates[0].2,
+                    DataType::Float(_) | DataType::Double(_)
+                )
+                && query_plans
+                    .iter()
+                    .any(|plan| entries[plan.entry_idx].index_type == GlobalIndexFileKind::Bitmap);
+            if bitmap_floating_equality {
+                // Java-compatible bitmap keys canonicalize all NaN payloads,
+                // while the exact row-level residual distinguishes them. A
+                // limited bitmap lookup could stop on the wrong payload and
+                // hide a later exact match, so let the normal scan evaluate it.
+                return Ok(None);
+            }
             let per_shard_limit_safe = !query_plan_ranges_overlap(entries, &query_plans);
             // An unordered LIMIT may return any matching rows. Prefer the newest
             // row-id ranges so recent point-like patterns do not scan historical
@@ -767,29 +819,53 @@ impl GlobalIndexScanner {
                 std::cmp::Reverse(entries[plan.entry_idx].row_range_start)
             });
             let mut all_row_ids = RoaringTreemap::new();
-            if limit_fallback_scan && per_shard_limit_safe {
+            if limit_fallback_scan {
+                // Preferred probes are speculative exact subsets. They may
+                // use reader-local limits even when shard coverage overlaps:
+                // results are committed only after global de-duplication has
+                // reached LIMIT; otherwise they are discarded before the full
+                // safe path below.
                 let pattern = match effective_predicates[0].1.first() {
                     Some(Datum::String(pattern)) => pattern,
                     _ => unreachable!("LIKE predicate has a validated string literal"),
                 };
                 if let Some((candidate, prefix_match)) = preferred_like_candidate(pattern) {
-                    let candidate =
-                        serialize_datum(&Datum::String(candidate), effective_predicates[0].2);
-                    let probe_op = if prefix_match {
-                        PredicateOperator::StartsWith
-                    } else {
-                        PredicateOperator::Eq
-                    };
-                    let cmp = make_key_comparator(effective_predicates[0].2);
                     for plan in &query_plans {
                         let entry = &entries[plan.entry_idx];
-                        if entry.index_type != GlobalIndexFileKind::BTree
-                            || !entry.meta.may_match(
-                                probe_op,
-                                std::slice::from_ref(&candidate),
-                                cmp.as_ref(),
-                            )
-                        {
+                        let may_match = match entry.index_type {
+                            GlobalIndexFileKind::BTree => {
+                                let serialized = serialize_datum(
+                                    &Datum::String(candidate.clone()),
+                                    effective_predicates[0].2,
+                                );
+                                let probe_op = if prefix_match {
+                                    PredicateOperator::StartsWith
+                                } else {
+                                    PredicateOperator::Eq
+                                };
+                                let cmp = make_key_comparator(effective_predicates[0].2);
+                                entry.meta.may_match(
+                                    probe_op,
+                                    std::slice::from_ref(&serialized),
+                                    cmp.as_ref(),
+                                )
+                            }
+                            GlobalIndexFileKind::Bitmap => {
+                                let serialized = serialize_bitmap_datum(
+                                    &Datum::String(candidate.clone()),
+                                    effective_predicates[0].2,
+                                );
+                                let cmp = make_bitmap_key_comparator(effective_predicates[0].2);
+                                bitmap_meta_may_match(
+                                    &entry.meta,
+                                    PredicateOperator::Eq,
+                                    effective_predicates[0].2,
+                                    std::slice::from_ref(&serialized),
+                                    cmp.as_ref(),
+                                )
+                            }
+                        };
+                        if !may_match {
                             continue;
                         }
                         let _permit = self.query_semaphore.acquire().await.map_err(|error| {
@@ -863,6 +939,9 @@ impl GlobalIndexScanner {
                         shard_limit,
                     )
                     .await?;
+                let EntryQueryResult::Complete(result) = result else {
+                    return Ok(None);
+                };
                 if let Some(bitmap) = result {
                     extend_offset_row_ids_until_limit(
                         &mut all_row_ids,
@@ -893,7 +972,12 @@ impl GlobalIndexScanner {
                 let result = self
                     .query_entry(entry, data_type, between, &plan, effective_predicates, None)
                     .await?;
-                Ok((entry.row_range_start, result))
+                match result {
+                    EntryQueryResult::Complete(result) => Ok((entry.row_range_start, result)),
+                    EntryQueryResult::MemoryLimitExceeded => {
+                        unreachable!("unlimited global-index queries have no memory limit")
+                    }
+                }
             });
             try_fold_bounded(
                 futures,
@@ -932,13 +1016,22 @@ impl GlobalIndexScanner {
             Some(Datum::String(pattern)) => pattern,
             _ => unreachable!("LIKE predicate has a validated string literal"),
         };
-        let reader = self
-            .open_reader_for_entry(entry, &entry.meta, data_type)
-            .await?;
-        let result = reader
-            .query_preferred_like(pattern, limit)
+        let reader = match self
+            .open_reader_for_entry(entry, &entry.meta, data_type, Some(self.query_max_memory))
             .await
-            .map_err(|error| Self::query_error(entry, error))?;
+        {
+            Ok(reader) => reader,
+            Err(Error::GlobalIndexMemoryLimitExceeded { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let result = match reader
+            .query_preferred_like(pattern, data_type, limit, self.query_max_memory)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => return Ok(None),
+            Err(error) => return Err(Self::query_error(entry, error)),
+        };
         if let OpenedGlobalIndexReader::BTree(reader) = reader {
             self.return_reader(entry.file_name.clone(), reader);
         }
@@ -953,13 +1046,26 @@ impl GlobalIndexScanner {
         plan: &EntryQueryPlan,
         effective_predicates: &[(PredicateOperator, &[Datum], &DataType)],
         limit: Option<usize>,
-    ) -> Result<Option<RoaringTreemap>> {
+    ) -> Result<EntryQueryResult> {
         let mut reader = if (plan.between_matches && plan.between_evaluated)
             || !plan.matching_predicates.is_empty()
         {
             Some(
-                self.open_reader_for_entry(entry, &entry.meta, data_type)
-                    .await?,
+                match self
+                    .open_reader_for_entry(
+                        entry,
+                        &entry.meta,
+                        data_type,
+                        limit.map(|_| self.query_max_memory),
+                    )
+                    .await
+                {
+                    Ok(reader) => reader,
+                    Err(Error::GlobalIndexMemoryLimitExceeded { .. }) => {
+                        return Ok(EntryQueryResult::MemoryLimitExceeded);
+                    }
+                    Err(error) => return Err(error),
+                },
             )
         } else {
             None
@@ -991,12 +1097,18 @@ impl GlobalIndexScanner {
 
         for &idx in &plan.matching_predicates {
             let (op, literals, data_type) = &effective_predicates[idx];
-            let bitmap = reader
+            let bitmap = match reader
                 .as_ref()
                 .expect("reader is opened when predicates match")
-                .query(*op, literals, data_type, limit)
+                .query(*op, literals, data_type, limit, self.query_max_memory)
                 .await
-                .map_err(|error| Self::query_error(entry, error))?;
+            {
+                Ok(bitmap) => bitmap,
+                Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                    return Ok(EntryQueryResult::MemoryLimitExceeded);
+                }
+                Err(error) => return Err(Self::query_error(entry, error)),
+            };
             file_result = Some(match file_result {
                 None => bitmap,
                 Some(mut existing) => {
@@ -1011,10 +1123,19 @@ impl GlobalIndexScanner {
         if let Some(OpenedGlobalIndexReader::BTree(reader)) = reader.take() {
             self.return_reader(entry.file_name.clone(), reader);
         }
-        Ok(file_result)
+        Ok(EntryQueryResult::Complete(file_result))
     }
 
     fn query_error(entry: &GlobalIndexEntry, error: std::io::Error) -> Error {
+        if error.kind() == std::io::ErrorKind::OutOfMemory {
+            return Error::GlobalIndexMemoryLimitExceeded {
+                message: format!(
+                    "{} file '{}': {error}",
+                    entry.index_type.name(),
+                    entry.file_name
+                ),
+            };
+        }
         Error::DataInvalid {
             message: format!(
                 "Global index query failed for {} file '{}'",
@@ -1031,6 +1152,7 @@ impl GlobalIndexScanner {
         file_name: &str,
         meta: &BTreeIndexMeta,
         data_type: &DataType,
+        max_memory: Option<usize>,
     ) -> Result<OpenedGlobalIndexReader> {
         // Try to take from cache
         {
@@ -1047,13 +1169,27 @@ impl GlobalIndexScanner {
         let file_reader = input.reader().await?;
 
         let cmp = make_key_comparator(data_type);
-        BTreeIndexReader::open(Box::new(file_reader), file_size, meta, cmp)
-            .await
-            .map(OpenedGlobalIndexReader::BTree)
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to open BTree index file: {file_name}"),
-                source: Some(Box::new(e)),
-            })
+        BTreeIndexReader::open_with_memory_limit(
+            Box::new(file_reader),
+            file_size,
+            meta,
+            cmp,
+            max_memory,
+        )
+        .await
+        .map(OpenedGlobalIndexReader::BTree)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::OutOfMemory {
+                Error::GlobalIndexMemoryLimitExceeded {
+                    message: format!("BTree file '{file_name}': {error}"),
+                }
+            } else {
+                crate::Error::DataInvalid {
+                    message: format!("Failed to open BTree index file: {file_name}"),
+                    source: Some(Box::new(error)),
+                }
+            }
+        })
     }
 
     async fn open_reader_for_entry(
@@ -1061,22 +1197,31 @@ impl GlobalIndexScanner {
         entry: &GlobalIndexEntry,
         meta: &BTreeIndexMeta,
         data_type: &DataType,
+        max_memory: Option<usize>,
     ) -> Result<OpenedGlobalIndexReader> {
         match entry.index_type {
             GlobalIndexFileKind::BTree => {
-                self.get_or_open_reader(&entry.file_name, meta, data_type)
+                self.get_or_open_reader(&entry.file_name, meta, data_type, max_memory)
                     .await
             }
             GlobalIndexFileKind::Bitmap => self
-                .open_bitmap_reader(&entry.file_name)
+                .open_bitmap_reader(&entry.file_name, max_memory)
                 .await
                 .map(OpenedGlobalIndexReader::Bitmap)
-                .map_err(|e| crate::Error::DataInvalid {
-                    message: format!(
-                        "Failed to open bitmap global index file: {}",
-                        entry.file_name
-                    ),
-                    source: Some(Box::new(e)),
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::OutOfMemory {
+                        Error::GlobalIndexMemoryLimitExceeded {
+                            message: format!("bitmap file '{}': {error}", entry.file_name),
+                        }
+                    } else {
+                        crate::Error::DataInvalid {
+                            message: format!(
+                                "Failed to open bitmap global index file: {}",
+                                entry.file_name
+                            ),
+                            source: Some(Box::new(error)),
+                        }
+                    }
                 }),
         }
     }
@@ -1084,6 +1229,7 @@ impl GlobalIndexScanner {
     async fn open_bitmap_reader(
         &self,
         file_name: &str,
+        max_memory: Option<usize>,
     ) -> std::io::Result<BitmapGlobalIndexReader> {
         let path = format!("{}/{INDEX_DIR}/{}", self.table_path, file_name);
         let input = self
@@ -1099,14 +1245,19 @@ impl GlobalIndexScanner {
             .reader()
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        BitmapGlobalIndexReader::open(Box::new(file_reader), file_size).await
+        BitmapGlobalIndexReader::open_with_memory_limit(
+            Box::new(file_reader),
+            file_size,
+            max_memory,
+        )
+        .await
     }
 
     fn fallback_scan_plan(
         &self,
         entries: &[GlobalIndexEntry],
         selected: &[bool],
-        allow_large_btree: bool,
+        allow_large_preferred_probe: bool,
     ) -> FallbackScanPlan {
         let mut plan = FallbackScanPlan::default();
         let mut btree_total = 0i64;
@@ -1132,13 +1283,14 @@ impl GlobalIndexScanner {
 
         plan.allow_btree = plan.selected_btree > 0
             && btree_valid
-            && (allow_large_btree
+            && (allow_large_preferred_probe
                 || (self.btree_fallback_scan_max_size > 0
                     && btree_total <= self.btree_fallback_scan_max_size));
         plan.allow_bitmap = plan.selected_bitmap > 0
             && bitmap_valid
-            && self.bitmap_fallback_scan_max_size > 0
-            && bitmap_total <= self.bitmap_fallback_scan_max_size;
+            && (allow_large_preferred_probe
+                || (self.bitmap_fallback_scan_max_size > 0
+                    && bitmap_total <= self.bitmap_fallback_scan_max_size));
         plan
     }
 
@@ -1657,6 +1809,7 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
     pub(crate) schema_fields: &'a [DataField],
     pub(crate) search_mode: GlobalIndexSearchMode,
     pub(crate) global_index_thread_num: usize,
+    pub(crate) query_max_memory: usize,
     pub(crate) btree_fallback_scan_max_size: i64,
     pub(crate) bitmap_fallback_scan_max_size: i64,
     pub(crate) next_row_id: Option<i64>,
@@ -1672,6 +1825,7 @@ pub(crate) async fn evaluate_global_index(
         evaluation.file_io,
         evaluation.table_path,
         evaluation.global_index_thread_num,
+        evaluation.query_max_memory,
         evaluation.btree_fallback_scan_max_size,
         evaluation.bitmap_fallback_scan_max_size,
         evaluation.index_entries,
@@ -2192,6 +2346,7 @@ mod tests {
             schema_fields: fields,
             search_mode: GlobalIndexSearchMode::Fast,
             global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size,
             bitmap_fallback_scan_max_size,
             next_row_id: None,
@@ -2236,6 +2391,7 @@ mod tests {
             &file_io,
             "memory:/t",
             32,
+            usize::MAX,
             i64::MAX,
             i64::MAX,
             &entries,
@@ -2265,6 +2421,7 @@ mod tests {
             &file_io,
             "memory:/t",
             32,
+            usize::MAX,
             i64::MAX,
             i64::MAX,
             &entries,
@@ -2294,6 +2451,7 @@ mod tests {
             &file_io,
             "memory:/t",
             32,
+            usize::MAX,
             i64::MAX,
             i64::MAX,
             &entries,
@@ -2330,6 +2488,7 @@ mod tests {
             &file_io,
             "memory:/t",
             32,
+            usize::MAX,
             i64::MAX,
             i64::MAX,
             &entries,
@@ -2355,6 +2514,7 @@ mod tests {
             &file_io,
             "memory:/t",
             32,
+            usize::MAX,
             i64::MAX,
             i64::MAX,
             &entries,
@@ -2386,6 +2546,7 @@ mod tests {
             &file_io,
             "memory:/t",
             32,
+            usize::MAX,
             i64::MAX,
             i64::MAX,
             &[entry],
@@ -2751,6 +2912,35 @@ mod tests {
             .unwrap();
             assert_eq!(result, vec![RowRange::new(100, 102)], "{data_type:?}: {op}");
         }
+
+        let nan_equality = vec![Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: data_type.clone(),
+            op: PredicateOperator::Eq,
+            literals: vec![nan_literals[0].clone()],
+        }];
+        let limited = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &nan_equality,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Fast,
+            global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: 0,
+            next_row_id: None,
+            data_ranges: &[],
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+        assert!(
+            limited.is_none(),
+            "{data_type:?} NaN equality must not early-stop a canonicalized bitmap"
+        );
     }
 
     #[tokio::test]
@@ -3203,6 +3393,7 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Full,
             global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(10_000),
@@ -3214,6 +3405,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(row_ranges, vec![RowRange::new(0, 2)]);
+
+        let fallback = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 32,
+            query_max_memory: 64,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: Some(10_000),
+            data_ranges: &[],
+            limit: Some(3),
+        })
+        .await
+        .unwrap();
+        assert!(
+            fallback.is_none(),
+            "a limited query must fall back instead of materializing an oversized hot-key block"
+        );
     }
 
     #[tokio::test]
@@ -3290,6 +3503,7 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Full,
             global_index_thread_num: 1,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(5),
@@ -3338,6 +3552,7 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Full,
             global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: 1,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(300),
@@ -3398,9 +3613,76 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Full,
             global_index_thread_num: 1,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: 1,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(200),
+            data_ranges: &[],
+            limit: Some(3),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(row_ranges, vec![RowRange::new(0, 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_like_limit_probes_exact_candidate_before_full_fallback() {
+        let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            32,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+        let key = serialize_bitmap_datum(&Datum::String("a_ice".to_string()), &data_type);
+        for row_id in 0..5 {
+            writer.write(Some(&key), row_id).unwrap();
+        }
+        let write_result = writer.finish().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let file_name = "bitmap-candidate.index";
+        std::fs::write(index_dir.join(file_name), captured.to_vec()).unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+
+        let mut entry = make_global_index_entry_with_type(
+            BITMAP_GLOBAL_INDEX_TYPE,
+            file_name,
+            1,
+            0,
+            4,
+            &write_result.meta,
+        );
+        entry.index_file.file_size = 2;
+        let overlapping_entry = entry.clone();
+        let fields = string_schema_fields();
+        let predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type,
+            op: PredicateOperator::Like,
+            literals: vec![Datum::String("a_ice%".to_string())],
+        }];
+
+        let row_ranges = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &[entry, overlapping_entry],
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 1,
+            query_max_memory: usize::MAX,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: 1,
+            next_row_id: Some(5),
             data_ranges: &[],
             limit: Some(3),
         })
@@ -3527,6 +3809,7 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Full,
             global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(150),
@@ -3581,6 +3864,7 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Full,
             global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(100),
@@ -3616,6 +3900,7 @@ mod tests {
             schema_fields: &fields,
             search_mode: GlobalIndexSearchMode::Detail,
             global_index_thread_num: 32,
+            query_max_memory: usize::MAX,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(150),
@@ -3921,6 +4206,7 @@ mod tests {
                 &file_io,
                 &table_path,
                 thread_num,
+                usize::MAX,
                 i64::MAX,
                 i64::MAX,
                 &entries,
