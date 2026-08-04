@@ -931,6 +931,21 @@ struct PaimonTableScan<'a> {
     projected_read_field_ids: Option<HashSet<i32>>,
 }
 
+fn safe_global_index_limit(
+    limit: Option<usize>,
+    has_primary_keys: bool,
+    deletion_vectors_enabled: bool,
+    has_partition_filter: bool,
+    has_bucket_predicate: bool,
+) -> Option<usize> {
+    if has_primary_keys || deletion_vectors_enabled || has_partition_filter || has_bucket_predicate
+    {
+        None
+    } else {
+        limit
+    }
+}
+
 impl<'a> PaimonTableScan<'a> {
     pub(crate) fn new(
         table: &'a Table,
@@ -1225,6 +1240,16 @@ impl<'a> PaimonTableScan<'a> {
         data_ranges: &[RowRange],
     ) -> crate::Result<Option<Vec<RowRange>>> {
         let core_options = CoreOptions::new(self.table.schema().options());
+        // Global-index entries currently do not retain partition or bucket
+        // identity. Stopping after LIMIT before manifest pruning could therefore
+        // satisfy the limit entirely with rows that are discarded later.
+        let limit = safe_global_index_limit(
+            self.limit,
+            !self.table.schema().primary_keys().is_empty(),
+            core_options.deletion_vectors_enabled(),
+            self.partition_filter.is_some(),
+            self.bucket_predicate.is_some(),
+        );
         super::global_index_scanner::evaluate_global_index(
             super::global_index_scanner::GlobalIndexEvaluation {
                 file_io: self.table.file_io(),
@@ -1239,6 +1264,7 @@ impl<'a> PaimonTableScan<'a> {
                     .bitmap_index_fallback_scan_max_size()?,
                 next_row_id: snapshot.next_row_id(),
                 data_ranges,
+                limit,
             },
         )
         .await
@@ -2541,6 +2567,32 @@ mod tests {
         let pruned = scan.apply_limit_pushdown(splits);
 
         assert!(pruned.is_empty());
+    }
+
+    #[test]
+    fn test_global_index_limit_is_disabled_before_partition_or_bucket_pruning() {
+        assert_eq!(
+            super::safe_global_index_limit(Some(1), false, false, false, false),
+            Some(1)
+        );
+        assert_eq!(
+            super::safe_global_index_limit(Some(1), false, false, true, false),
+            None,
+            "a partition filter may discard every row used by index early-stop"
+        );
+        assert_eq!(
+            super::safe_global_index_limit(Some(1), false, false, false, true),
+            None,
+            "a bucket predicate may discard every row used by index early-stop"
+        );
+        assert_eq!(
+            super::safe_global_index_limit(Some(1), true, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::safe_global_index_limit(Some(1), false, true, false, false),
+            None
+        );
     }
 
     /// Java semantics: unknown-count splits are skipped — they cannot prove

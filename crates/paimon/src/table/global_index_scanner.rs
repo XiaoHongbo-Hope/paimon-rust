@@ -27,7 +27,7 @@ use super::bitmap_global_index_reader::{
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
 };
-use crate::btree::query::{extract_between, BetweenInfo, IndexQuery};
+use crate::btree::query::{extract_between, preferred_like_candidate, BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
@@ -236,10 +236,25 @@ impl OpenedGlobalIndexReader {
         op: PredicateOperator,
         literals: &[Datum],
         data_type: &DataType,
+        limit: Option<usize>,
     ) -> std::io::Result<RoaringTreemap> {
         match self {
-            Self::BTree(reader) => reader.query(op, literals, data_type).await,
+            Self::BTree(reader) => match limit {
+                Some(limit) => reader.query_limited(op, literals, data_type, limit).await,
+                None => reader.query(op, literals, data_type).await,
+            },
             Self::Bitmap(reader) => reader.query(op, literals, data_type).await,
+        }
+    }
+
+    async fn query_preferred_like(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> std::io::Result<Option<RoaringTreemap>> {
+        match self {
+            Self::BTree(reader) => reader.query_preferred_like_limited(pattern, limit).await,
+            Self::Bitmap(_) => Ok(None),
         }
     }
 
@@ -391,7 +406,11 @@ impl GlobalIndexScanner {
 
     /// Evaluate a predicate against the global indexes and return matching row ranges.
     /// Returns `None` if the predicate cannot be evaluated by the global index.
-    fn evaluate<'a>(&'a self, predicate: &'a Predicate) -> EvaluateFuture<'a> {
+    fn evaluate<'a>(
+        &'a self,
+        predicate: &'a Predicate,
+        limit: Option<usize>,
+    ) -> EvaluateFuture<'a> {
         Box::pin(async move {
             match predicate {
                 Predicate::Leaf {
@@ -413,7 +432,7 @@ impl GlobalIndexScanner {
                         Some(e) => e,
                         None => return Ok(None),
                     };
-                    self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)])
+                    self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)], limit)
                         .await
                         .map(|ranges| {
                             ranges.map(|row_ranges| GlobalIndexScanResult {
@@ -456,12 +475,17 @@ impl GlobalIndexScanner {
                     // Evaluate independent fields concurrently while keeping predicates for the
                     // same field together so each index file is opened only once.
                     let mut leaf_futures = Vec::with_capacity(leaf_groups.len());
+                    let sole_leaf_group = leaf_groups.len() == 1 && non_leaf_children.is_empty();
                     for (field_id, predicates) in &leaf_groups {
                         if let Some(entries) = self.entries_for_field(*field_id) {
                             let field_id = *field_id;
                             let predicates = predicates.as_slice();
+                            let leaf_limit = (sole_leaf_group && predicates.len() == 1)
+                                .then_some(limit)
+                                .flatten();
                             leaf_futures.push(async move {
-                                let ranges = self.evaluate_leaf(entries, predicates).await?;
+                                let ranges =
+                                    self.evaluate_leaf(entries, predicates, leaf_limit).await?;
                                 Ok((field_id, ranges))
                             });
                         }
@@ -485,7 +509,7 @@ impl GlobalIndexScanner {
 
                     // Evaluate non-leaf children recursively
                     for child in non_leaf_children {
-                        if let Some(child_result) = self.evaluate(child).await? {
+                        if let Some(child_result) = self.evaluate(child, None).await? {
                             row_ranges = Some(match row_ranges {
                                 None => child_result.row_ranges,
                                 Some(existing) => {
@@ -505,7 +529,7 @@ impl GlobalIndexScanner {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
                     let mut evaluated_field_ids = HashSet::new();
                     for child in children {
-                        match self.evaluate(child).await? {
+                        match self.evaluate(child, None).await? {
                             Some(child_result) => {
                                 all_ranges.extend(child_result.row_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
@@ -535,7 +559,11 @@ impl GlobalIndexScanner {
         &self,
         entries: &[GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
+        limit: Option<usize>,
     ) -> Result<Option<Vec<RowRange>>> {
+        if limit == Some(0) {
+            return Ok(Some(Vec::new()));
+        }
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
 
@@ -592,12 +620,16 @@ impl GlobalIndexScanner {
                 },
             )
             .collect();
+        let limit_fallback_scan = limit.is_some()
+            && effective_predicates.len() == 1
+            && effective_predicates[0].0 == PredicateOperator::Like;
         let predicate_fallback_plans: Vec<Option<FallbackScanPlan>> = effective_predicates
             .iter()
             .enumerate()
             .map(|(i, (op, _, _))| {
-                requires_fallback_scan(*op)
-                    .then(|| self.fallback_scan_plan(entries, &predicate_matches[i]))
+                requires_fallback_scan(*op).then(|| {
+                    self.fallback_scan_plan(entries, &predicate_matches[i], limit_fallback_scan)
+                })
             })
             .collect();
 
@@ -631,7 +663,7 @@ impl GlobalIndexScanner {
         };
         let between_fallback_plan = between
             .as_ref()
-            .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry));
+            .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry, false));
 
         let mut query_plans = Vec::with_capacity(entries.len());
         for (entry_idx, entry) in entries.iter().enumerate() {
@@ -708,8 +740,112 @@ impl GlobalIndexScanner {
             .or_else(|| effective_predicates.first().map(|p| p.2))
             .unwrap_or(predicates[0].2);
         let between = between.as_ref();
-        let futures =
-            query_plans.into_iter().map(|plan| async move {
+        let all_row_ids = if let Some(limit) = limit {
+            // An unordered LIMIT may return any matching rows. Prefer the newest
+            // row-id ranges so recent point-like patterns do not scan historical
+            // index shards before reaching the limit. Keep this path sequential:
+            // concurrent shard futures can over-read after another shard already
+            // satisfies the limit and retain several decoded bitmaps at once.
+            query_plans.sort_unstable_by_key(|plan| {
+                std::cmp::Reverse(entries[plan.entry_idx].row_range_start)
+            });
+            let mut all_row_ids = RoaringTreemap::new();
+            if limit_fallback_scan {
+                let pattern = match effective_predicates[0].1.first() {
+                    Some(Datum::String(pattern)) => pattern,
+                    _ => unreachable!("LIKE predicate has a validated string literal"),
+                };
+                if let Some((candidate, prefix_match)) = preferred_like_candidate(pattern) {
+                    let candidate =
+                        serialize_datum(&Datum::String(candidate), effective_predicates[0].2);
+                    let probe_op = if prefix_match {
+                        PredicateOperator::StartsWith
+                    } else {
+                        PredicateOperator::Eq
+                    };
+                    let cmp = make_key_comparator(effective_predicates[0].2);
+                    for plan in &query_plans {
+                        let entry = &entries[plan.entry_idx];
+                        if entry.index_type != GlobalIndexFileKind::BTree
+                            || !entry.meta.may_match(
+                                probe_op,
+                                std::slice::from_ref(&candidate),
+                                cmp.as_ref(),
+                            )
+                        {
+                            continue;
+                        }
+                        let _permit = self.query_semaphore.acquire().await.map_err(|error| {
+                            Error::UnexpectedError {
+                                message: "global-index query concurrency budget was closed"
+                                    .to_string(),
+                                source: Some(Box::new(error)),
+                            }
+                        })?;
+                        let remaining = limit.saturating_sub(all_row_ids.len() as usize);
+                        if let Some(bitmap) = self
+                            .query_entry_preferred_like(
+                                entry,
+                                data_type,
+                                plan,
+                                effective_predicates,
+                                remaining,
+                            )
+                            .await?
+                        {
+                            for row_id in bitmap.iter() {
+                                all_row_ids.insert(row_id + entry.row_range_start as u64);
+                            }
+                        }
+                        if all_row_ids.len() >= limit as u64 {
+                            return Ok(Some(bitmap_to_ranges(&all_row_ids)));
+                        }
+                    }
+                    // The fallback query is capped to the remaining result count
+                    // per shard. Keeping probe hits would let the full LIKE scan
+                    // rediscover those same row IDs and spend that cap on
+                    // duplicates, potentially stopping before enough new matches
+                    // are found. Discard them until fallback can exclude probe IDs
+                    // or account for a per-shard duplicate budget.
+                    all_row_ids.clear();
+                }
+            }
+            for plan in query_plans {
+                let entry = &entries[plan.entry_idx];
+                let _permit = self.query_semaphore.acquire().await.map_err(|error| {
+                    Error::UnexpectedError {
+                        message: "global-index query concurrency budget was closed".to_string(),
+                        source: Some(Box::new(error)),
+                    }
+                })?;
+                #[cfg(test)]
+                let _query_io_probe_guard = match &self.query_io_probe {
+                    Some(probe) => Some(probe.enter().await),
+                    None => None,
+                };
+                let remaining = limit.saturating_sub(all_row_ids.len() as usize);
+                let result = self
+                    .query_entry(
+                        entry,
+                        data_type,
+                        between,
+                        &plan,
+                        effective_predicates,
+                        Some(remaining),
+                    )
+                    .await?;
+                if let Some(bitmap) = result {
+                    for row_id in bitmap.iter() {
+                        all_row_ids.insert(row_id + entry.row_range_start as u64);
+                    }
+                }
+                if all_row_ids.len() >= limit as u64 {
+                    break;
+                }
+            }
+            all_row_ids
+        } else {
+            let futures = query_plans.into_iter().map(|plan| async move {
                 let entry = &entries[plan.entry_idx];
                 let _permit = self.query_semaphore.acquire().await.map_err(|error| {
                     Error::UnexpectedError {
@@ -723,25 +859,58 @@ impl GlobalIndexScanner {
                     None => None,
                 };
                 let result = self
-                    .query_entry(entry, data_type, between, &plan, effective_predicates)
+                    .query_entry(entry, data_type, between, &plan, effective_predicates, None)
                     .await?;
                 Ok((entry.row_range_start, result))
             });
-        let all_row_ids = try_fold_bounded(
-            futures,
-            self.global_index_thread_num,
-            RoaringTreemap::new(),
-            |all_row_ids, (row_range_start, file_result)| {
-                if let Some(bitmap) = file_result {
-                    for row_id in bitmap.iter() {
-                        all_row_ids.insert(row_id + row_range_start as u64);
+            try_fold_bounded(
+                futures,
+                self.global_index_thread_num,
+                RoaringTreemap::new(),
+                |all_row_ids, (row_range_start, file_result)| {
+                    if let Some(bitmap) = file_result {
+                        for row_id in bitmap.iter() {
+                            all_row_ids.insert(row_id + row_range_start as u64);
+                        }
                     }
-                }
-            },
-        )
-        .await?;
+                },
+            )
+            .await?
+        };
 
         Ok(Some(bitmap_to_ranges(&all_row_ids)))
+    }
+
+    async fn query_entry_preferred_like(
+        &self,
+        entry: &GlobalIndexEntry,
+        data_type: &DataType,
+        plan: &EntryQueryPlan,
+        effective_predicates: &[(PredicateOperator, &[Datum], &DataType)],
+        limit: usize,
+    ) -> Result<Option<RoaringTreemap>> {
+        let [predicate_idx] = plan.matching_predicates.as_slice() else {
+            return Ok(None);
+        };
+        let (op, literals, _) = &effective_predicates[*predicate_idx];
+        if *op != PredicateOperator::Like {
+            return Ok(None);
+        }
+        let pattern = match literals.first() {
+            Some(Datum::String(pattern)) => pattern,
+            _ => unreachable!("LIKE predicate has a validated string literal"),
+        };
+        let reader = self
+            .open_reader_for_entry(entry, &entry.meta, data_type)
+            .await?;
+        let result = reader
+            .query_preferred_like(pattern, limit)
+            .await
+            .map_err(|error| Self::query_error(entry, error))?;
+        if let OpenedGlobalIndexReader::BTree(reader) = reader {
+            self.return_reader(entry.file_name.clone(), reader);
+        }
+        Ok(result)
     }
 
     async fn query_entry(
@@ -751,6 +920,7 @@ impl GlobalIndexScanner {
         between: Option<&BetweenInfo<'_>>,
         plan: &EntryQueryPlan,
         effective_predicates: &[(PredicateOperator, &[Datum], &DataType)],
+        limit: Option<usize>,
     ) -> Result<Option<RoaringTreemap>> {
         let mut reader = if (plan.between_matches && plan.between_evaluated)
             || !plan.matching_predicates.is_empty()
@@ -792,7 +962,7 @@ impl GlobalIndexScanner {
             let bitmap = reader
                 .as_ref()
                 .expect("reader is opened when predicates match")
-                .query(*op, literals, data_type)
+                .query(*op, literals, data_type, limit)
                 .await
                 .map_err(|error| Self::query_error(entry, error))?;
             file_result = Some(match file_result {
@@ -904,6 +1074,7 @@ impl GlobalIndexScanner {
         &self,
         entries: &[GlobalIndexEntry],
         selected: &[bool],
+        allow_large_btree: bool,
     ) -> FallbackScanPlan {
         let mut plan = FallbackScanPlan::default();
         let mut btree_total = 0i64;
@@ -929,8 +1100,9 @@ impl GlobalIndexScanner {
 
         plan.allow_btree = plan.selected_btree > 0
             && btree_valid
-            && self.btree_fallback_scan_max_size > 0
-            && btree_total <= self.btree_fallback_scan_max_size;
+            && (allow_large_btree
+                || (self.btree_fallback_scan_max_size > 0
+                    && btree_total <= self.btree_fallback_scan_max_size));
         plan.allow_bitmap = plan.selected_bitmap > 0
             && bitmap_valid
             && self.bitmap_fallback_scan_max_size > 0
@@ -1457,6 +1629,8 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
     pub(crate) bitmap_fallback_scan_max_size: i64,
     pub(crate) next_row_id: Option<i64>,
     pub(crate) data_ranges: &'a [RowRange],
+    /// Safe early-stop hint for non-PK scans without deletion vectors.
+    pub(crate) limit: Option<usize>,
 }
 
 pub(crate) async fn evaluate_global_index(
@@ -1477,11 +1651,17 @@ pub(crate) async fn evaluate_global_index(
 
     let combined = Predicate::and(evaluation.predicates.to_vec());
 
-    let scan_result = match scanner.evaluate(&combined).await? {
+    let scan_result = match scanner.evaluate(&combined, evaluation.limit).await? {
         Some(scan_result) => scan_result,
         None => return Ok(None),
     };
     let mut row_ranges = scan_result.row_ranges;
+    if evaluation
+        .limit
+        .is_some_and(|limit| row_ranges_cardinality_at_least(&row_ranges, limit))
+    {
+        return Ok(Some(super::merge_row_ranges(row_ranges)));
+    }
     row_ranges.extend(scanner.unindexed_ranges_for_field_ids(
         &scan_result.evaluated_field_ids,
         evaluation.search_mode,
@@ -1489,6 +1669,18 @@ pub(crate) async fn evaluate_global_index(
         evaluation.data_ranges,
     ));
     Ok(Some(super::merge_row_ranges(row_ranges)))
+}
+
+fn row_ranges_cardinality_at_least(ranges: &[RowRange], limit: usize) -> bool {
+    let mut total = 0usize;
+    for range in ranges {
+        let len = range.to().saturating_sub(range.from()).saturating_add(1);
+        total = total.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+        if total >= limit {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1933,6 +2125,7 @@ mod tests {
             bitmap_fallback_scan_max_size,
             next_row_id: None,
             data_ranges: &[],
+            limit: None,
         })
         .await
     }
@@ -2899,6 +3092,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_btree_like_limit_stops_fallback_scan_before_raw_tail() {
+        let (file_io, table_path, file_name, tmp) =
+            setup_testdata_table("btree_varchar_100_no_compress.bin");
+        let meta = BTreeIndexMeta::new(Some(b"a".to_vec()), Some(b"yyyy".to_vec()), false);
+        let fields = string_schema_fields();
+        let predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type: DataType::VarChar(crate::spec::VarCharType::string_type()),
+            op: PredicateOperator::Like,
+            literals: vec![Datum::String("%".to_string())],
+        }];
+        let newer_file_name = "btree_varchar_100_no_compress_newer.bin";
+        std::fs::copy(
+            tmp.path().join("index").join(&file_name),
+            tmp.path().join("index").join(newer_file_name),
+        )
+        .unwrap();
+        let mut entries = vec![
+            make_global_index_entry(&file_name, 1, 0, 99, &meta),
+            make_global_index_entry(newer_file_name, 1, 100, 199, &meta),
+        ];
+        for entry in &mut entries {
+            entry.index_file.file_size = 2;
+        }
+
+        let row_ranges = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 32,
+            btree_fallback_scan_max_size: 1,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: Some(300),
+            data_ranges: &[],
+            limit: Some(3),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            row_ranges
+                .iter()
+                .map(|range| range.to() - range.from() + 1)
+                .sum::<i64>(),
+            3
+        );
+        assert!(
+            row_ranges
+                .iter()
+                .all(|range| range.from() >= 100 && range.to() < 200),
+            "limit scans should query the newest shard first and stop before the raw tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_btree_like_limit_probes_candidate_shards_before_full_fallback() {
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BTreeIndexWriter::new(Box::new(output), 32, BlockCompressionType::None);
+        for row_id in 0..5 {
+            writer.write(Some(b"a_ice"), row_id).await.unwrap();
+        }
+        let write_result = writer.finish().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let candidate_file = "candidate.index";
+        std::fs::write(index_dir.join(candidate_file), captured.to_vec()).unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+
+        let mut candidate = make_global_index_entry(candidate_file, 1, 0, 4, &write_result.meta);
+        candidate.index_file.file_size = 2;
+        let mut disjoint_missing = make_global_index_entry(
+            "newer-but-disjoint-missing.index",
+            1,
+            100,
+            104,
+            &BTreeIndexMeta::new(Some(b"z".to_vec()), Some(b"zz".to_vec()), false),
+        );
+        disjoint_missing.index_file.file_size = 2;
+        let fields = string_schema_fields();
+        let predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type: DataType::VarChar(crate::spec::VarCharType::string_type()),
+            op: PredicateOperator::Like,
+            literals: vec![Datum::String("a_ice%".to_string())],
+        }];
+
+        let row_ranges = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &[candidate, disjoint_missing],
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 1,
+            btree_fallback_scan_max_size: 1,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: Some(200),
+            data_ranges: &[],
+            limit: Some(3),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(row_ranges, vec![RowRange::new(0, 2)]);
+    }
+
+    #[tokio::test]
     async fn test_fallback_scan_over_limit_with_mixed_index_kinds_is_unsupported() {
         let (file_io, table_path, file_name, _tmp) =
             setup_testdata_table("btree_varchar_100_no_compress.bin");
@@ -3018,6 +3329,7 @@ mod tests {
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(150),
             data_ranges: &[],
+            limit: None,
         })
         .await
         .unwrap();
@@ -3071,6 +3383,7 @@ mod tests {
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(100),
             data_ranges: &[],
+            limit: None,
         })
         .await
         .unwrap();
@@ -3105,6 +3418,7 @@ mod tests {
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: Some(150),
             data_ranges: &data_ranges,
+            limit: None,
         })
         .await
         .unwrap();
@@ -3415,7 +3729,7 @@ mod tests {
             let probe = Arc::new(QueryIoProbe::default());
             scanner.query_io_probe = Some(Arc::clone(&probe));
 
-            let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+            let result = scanner.evaluate(&predicate, None).await.unwrap().unwrap();
 
             assert_eq!(result.row_ranges, vec![RowRange::new(25, 25)]);
             assert_eq!(result.evaluated_field_ids, HashSet::from([1, 2, 3, 4]));

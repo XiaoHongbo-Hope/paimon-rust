@@ -1335,6 +1335,7 @@ mod tests {
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: snapshot.next_row_id(),
             data_ranges: &[],
+            limit: None,
         })
         .await
         .unwrap()
@@ -1665,6 +1666,7 @@ mod tests {
             bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: snapshot.next_row_id(),
             data_ranges: &[],
+            limit: None,
         })
         .await
         .unwrap()

@@ -24,6 +24,7 @@
 //! ```
 //! Null key flags distinguish empty serialized keys from absent keys.
 
+use crate::btree::key_serde::prefix_successor;
 use crate::spec::PredicateOperator;
 use std::cmp::Ordering;
 use std::io;
@@ -115,6 +116,12 @@ impl BTreeIndexMeta {
                         cmp(key, first_key) != Ordering::Less
                             && cmp(key, last_key) != Ordering::Greater
                     }),
+                    PredicateOperator::StartsWith => {
+                        let prefix = &serialized_literals[0];
+                        cmp(last_key, prefix) != Ordering::Less
+                            && prefix_successor(prefix)
+                                .is_none_or(|upper| cmp(first_key, &upper) == Ordering::Less)
+                    }
                     _ => true,
                 }
             }
@@ -273,6 +280,31 @@ mod tests {
         let decoded = BTreeIndexMeta::deserialize(&encoded).unwrap();
         assert!(!decoded.has_nulls);
         assert!(!decoded.only_nulls());
+    }
+
+    #[test]
+    fn test_meta_starts_with_prunes_disjoint_key_ranges() {
+        let cmp = |left: &[u8], right: &[u8]| left.cmp(right);
+        let literal = vec![b"foo".to_vec()];
+
+        let before = BTreeIndexMeta::new(Some(b"bar".to_vec()), Some(b"fon".to_vec()), false);
+        let overlapping = BTreeIndexMeta::new(Some(b"food".to_vec()), Some(b"fop".to_vec()), false);
+        let after = BTreeIndexMeta::new(Some(b"fop".to_vec()), Some(b"zap".to_vec()), false);
+
+        assert!(!before.may_match(PredicateOperator::StartsWith, &literal, &cmp));
+        assert!(overlapping.may_match(PredicateOperator::StartsWith, &literal, &cmp));
+        assert!(!after.may_match(PredicateOperator::StartsWith, &literal, &cmp));
+    }
+
+    #[test]
+    fn test_meta_starts_with_handles_prefix_without_finite_upper_bound() {
+        let cmp = |left: &[u8], right: &[u8]| left.cmp(right);
+        let literal = vec![vec![0xFF]];
+        let before = BTreeIndexMeta::new(Some(vec![0x01]), Some(vec![0xFE]), false);
+        let overlapping = BTreeIndexMeta::new(Some(vec![0xFF]), Some(vec![0xFF, 0x01]), false);
+
+        assert!(!before.may_match(PredicateOperator::StartsWith, &literal, &cmp));
+        assert!(overlapping.may_match(PredicateOperator::StartsWith, &literal, &cmp));
     }
 
     #[test]

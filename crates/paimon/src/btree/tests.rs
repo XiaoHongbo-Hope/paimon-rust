@@ -270,6 +270,44 @@ async fn test_string_fallback_scan_query() {
         .await
         .unwrap();
     assert_eq!(like.iter().collect::<Vec<_>>(), vec![0]);
+
+    let limited_like = reader
+        .query_limited(
+            PredicateOperator::Like,
+            &[Datum::String("%o%".to_string())],
+            &data_type,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited_like.len(), 2);
+    assert!(limited_like
+        .iter()
+        .all(|row_id| [2, 3, 5].contains(&row_id)));
+}
+
+#[tokio::test]
+async fn test_limited_like_probes_literal_underscore_subset() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 32, BlockCompressionType::None);
+    for row_id in 0..5 {
+        writer.write(Some(b"a_ice"), row_id).await.unwrap();
+    }
+    writer.write(Some(b"alice"), 5).await.unwrap();
+
+    let result = writer.finish().await.unwrap();
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| a.cmp(b)).await;
+    let matches = reader
+        .query_limited(
+            PredicateOperator::Like,
+            &[Datum::String("a_ice%".to_string())],
+            &DataType::VarChar(VarCharType::string_type()),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
 }
 
 #[tokio::test]
