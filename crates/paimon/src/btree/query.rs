@@ -146,8 +146,9 @@ impl<F> BTreeIndexReader<F>
 where
     F: Fn(&[u8], &[u8]) -> Ordering + Send + Sync,
 {
-    /// Evaluate a predicate while capping fallback string scans at `limit`
-    /// matching row ids. Other operators retain their normal query behavior.
+    /// Evaluate an exact point or LIKE predicate while capping the result at
+    /// `limit` matching row ids. Other operators retain their normal query
+    /// behavior and must not be used for global-index early-stop.
     pub(crate) async fn query_limited(
         &self,
         op: PredicateOperator,
@@ -155,6 +156,10 @@ where
         data_type: &DataType,
         limit: usize,
     ) -> io::Result<RoaringTreemap> {
+        if op == PredicateOperator::Eq {
+            let key = serialize_datum(&literals[0], data_type);
+            return self.query_equal_limited(&key, limit).await;
+        }
         if op != PredicateOperator::Like {
             return IndexQuery::query(self, op, literals, data_type).await;
         }

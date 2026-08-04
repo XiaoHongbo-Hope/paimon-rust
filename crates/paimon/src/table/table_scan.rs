@@ -36,8 +36,8 @@ use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
     DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
-    ManifestEntry, PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    ManifestEntry, PartitionComputer, Predicate, PredicateOperator, Snapshot, ROW_ID_FIELD_ID,
+    ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bin_pack::split_for_batch;
@@ -933,12 +933,29 @@ struct PaimonTableScan<'a> {
 
 fn safe_global_index_limit(
     limit: Option<usize>,
+    data_predicates: &[Predicate],
     has_primary_keys: bool,
     deletion_vectors_enabled: bool,
     has_partition_filter: bool,
     has_bucket_predicate: bool,
 ) -> Option<usize> {
-    if has_primary_keys || deletion_vectors_enabled || has_partition_filter || has_bucket_predicate
+    // Early-stop is valid only when every index row id is an exact match.
+    // In particular, bitmap floating-point range queries deliberately return
+    // all non-null rows as residual candidates, so they must see every shard.
+    // Multiple leaves are also unsafe because limiting either side before an
+    // intersection can under-fill the final result.
+    let exact_single_predicate = matches!(
+        data_predicates,
+        [Predicate::Leaf {
+            op: PredicateOperator::Eq | PredicateOperator::Like,
+            ..
+        }]
+    );
+    if !exact_single_predicate
+        || has_primary_keys
+        || deletion_vectors_enabled
+        || has_partition_filter
+        || has_bucket_predicate
     {
         None
     } else {
@@ -1245,6 +1262,7 @@ impl<'a> PaimonTableScan<'a> {
         // satisfy the limit entirely with rows that are discarded later.
         let limit = safe_global_index_limit(
             self.limit,
+            &self.data_predicates,
             !self.table.schema().primary_keys().is_empty(),
             core_options.deletion_vectors_enabled(),
             self.partition_filter.is_some(),
@@ -2570,28 +2588,73 @@ mod tests {
     }
 
     #[test]
-    fn test_global_index_limit_is_disabled_before_partition_or_bucket_pruning() {
+    fn test_global_index_limit_requires_exact_single_predicate_and_safe_pruning() {
+        let predicate = |op| {
+            vec![Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op,
+                literals: vec![Datum::Int(1)],
+            }]
+        };
+        let eq = predicate(PredicateOperator::Eq);
+        let like = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type: DataType::VarChar(VarCharType::string_type()),
+            op: PredicateOperator::Like,
+            literals: vec![Datum::String("a%".to_string())],
+        }];
         assert_eq!(
-            super::safe_global_index_limit(Some(1), false, false, false, false),
+            super::safe_global_index_limit(Some(1), &eq, false, false, false, false),
             Some(1)
         );
         assert_eq!(
-            super::safe_global_index_limit(Some(1), false, false, true, false),
+            super::safe_global_index_limit(Some(1), &like, false, false, false, false),
+            Some(1)
+        );
+        assert_eq!(
+            super::safe_global_index_limit(Some(1), &eq, false, false, true, false),
             None,
             "a partition filter may discard every row used by index early-stop"
         );
         assert_eq!(
-            super::safe_global_index_limit(Some(1), false, false, false, true),
+            super::safe_global_index_limit(Some(1), &eq, false, false, false, true),
             None,
             "a bucket predicate may discard every row used by index early-stop"
         );
         assert_eq!(
-            super::safe_global_index_limit(Some(1), true, false, false, false),
+            super::safe_global_index_limit(Some(1), &eq, true, false, false, false),
             None
         );
         assert_eq!(
-            super::safe_global_index_limit(Some(1), false, true, false, false),
+            super::safe_global_index_limit(Some(1), &eq, false, true, false, false),
             None
+        );
+        assert_eq!(
+            super::safe_global_index_limit(
+                Some(1),
+                &predicate(PredicateOperator::Gt),
+                false,
+                false,
+                false,
+                false,
+            ),
+            None,
+            "range indexes may return residual candidates rather than exact matches"
+        );
+        assert_eq!(
+            super::safe_global_index_limit(
+                Some(1),
+                &[eq[0].clone(), eq[0].clone()],
+                false,
+                false,
+                false,
+                false,
+            ),
+            None,
+            "per-leaf limits are unsafe before intersecting compound predicates"
         );
     }
 

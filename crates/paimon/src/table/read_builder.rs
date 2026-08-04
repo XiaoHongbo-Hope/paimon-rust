@@ -223,6 +223,14 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Whether the normalized filter contains predicates evaluated against data rows.
+    pub fn has_data_predicates(&self) -> bool {
+        match &self.0 {
+            ReadBuilderKind::Paimon(builder) => builder.has_data_predicates(),
+            ReadBuilderKind::Format(builder) => builder.has_data_predicates(),
+        }
+    }
+
     /// Set Data Evolution row ID ranges `[from, to]` (inclusive).
     /// An empty vector selects no rows. Format tables are not supported.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
@@ -411,6 +419,15 @@ impl<'a> PaimonReadBuilder<'a> {
             self.table.schema().partition_keys(),
             filter,
         )
+    }
+
+    /// Whether the normalized filter contains predicates evaluated against data rows.
+    ///
+    /// This is distinct from exact filter pushdown: an exact data predicate is
+    /// enforced by the reader, but manifest row counts are still measured before
+    /// that predicate and therefore cannot be exposed as exact scan statistics.
+    fn has_data_predicates(&self) -> bool {
+        !self.filter.data_predicates.is_empty()
     }
 
     /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.
