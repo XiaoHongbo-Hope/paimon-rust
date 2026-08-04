@@ -1296,6 +1296,7 @@ impl Plan {
     }
 
     /// Consume this plan and return its splits without cloning their file metadata.
+    #[must_use = "consuming a plan without using its splits drops the planned work"]
     pub fn into_splits(self) -> Vec<DataSplit> {
         self.splits
     }

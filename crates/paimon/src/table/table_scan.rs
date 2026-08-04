@@ -255,6 +255,9 @@ async fn read_all_manifest_entries(
                 Ok::<_, crate::Error>((filtered, counters))
             }
         })
+        // Keep manifest read concurrency bounded. `try_fold` releases each
+        // yielded result after merging it, so peak retained results are the
+        // accumulator plus at most this bounded set of in-flight reads.
         .buffered(64)
         .try_fold(
             (Vec::new(), ManifestReadCounters::default()),
