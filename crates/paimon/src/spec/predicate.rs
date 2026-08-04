@@ -1125,10 +1125,10 @@ impl PredicateBuilder {
     /// Mirrors Java `LikeOptimization`: rewrites `prefix%` / `%suffix` /
     /// `%mid%` / no-wildcard patterns into [`PredicateOperator::StartsWith`] /
     /// [`PredicateOperator::EndsWith`] / [`PredicateOperator::Contains`] /
-    /// [`PredicateOperator::Eq`]; falls back to a [`PredicateOperator::Like`]
-    /// leaf for anything more complex (`_`, multi-segment `%`, escaped
-    /// wildcards). The `Like` evaluator follows arrow_string `like` kernel
-    /// semantics for the residual cases.
+    /// [`PredicateOperator::Eq`], including equivalent shapes containing
+    /// escaped literal characters. It falls back to a [`PredicateOperator::Like`]
+    /// leaf for anything more complex (`_` or multi-segment `%`). The `Like`
+    /// evaluator follows arrow_string `like` kernel semantics for residuals.
     ///
     /// `escape == None` defaults to `\`. Any other ESCAPE character is
     /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
@@ -1554,7 +1554,7 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
 /// literal substrings extracted from the pattern (with escape sequences
 /// already decoded).
 enum LikeShape {
-    /// Empty pattern, or a pattern that contains no wildcards / escapes —
+    /// Empty pattern, or a pattern that contains no unescaped wildcards —
     /// equivalent to `Eq <literal>` (where the literal is the unescaped
     /// pattern, possibly empty).
     EmptyOrLiteral(String),
@@ -1564,38 +1564,63 @@ enum LikeShape {
     EndsWith(String),
     /// `%mid%` (exactly one leading and one trailing `%`).
     Contains(String),
-    /// Anything else: `_`, multi-segment `%`, or any escape sequence — must
-    /// fall through to a `Like` leaf evaluator.
+    /// Anything else: `_` or multi-segment `%` — must fall through to a `Like`
+    /// leaf evaluator.
     Residual,
 }
 
 /// Classify a SQL LIKE pattern. The escape character is hardcoded to `\` —
 /// callers wanting any other escape should bypass optimization and surface a
 /// `Like` leaf directly. Any presence of `\` in the pattern forces
-/// [`LikeShape::Residual`] (the simple shape rules don't account for escaped
-/// wildcards).
+/// Escaped characters are decoded as literals before classifying the shape.
 fn optimize_like_pattern(pattern: &str) -> LikeShape {
-    if pattern.contains('\\') || pattern.contains('_') {
-        return LikeShape::Residual;
+    #[derive(Clone, Copy)]
+    enum Token {
+        Literal(char),
+        Percent,
     }
-    let bytes = pattern.as_bytes();
-    let percent_count = bytes.iter().filter(|b| **b == b'%').count();
-    match percent_count {
-        0 => LikeShape::EmptyOrLiteral(pattern.to_string()),
-        1 => {
-            if let Some(prefix) = pattern.strip_suffix('%') {
-                LikeShape::StartsWith(prefix.to_string())
-            } else if let Some(suffix) = pattern.strip_prefix('%') {
-                LikeShape::EndsWith(suffix.to_string())
+
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => tokens.push(Token::Literal(chars.next().unwrap_or('\\'))),
+            '%' => tokens.push(Token::Percent),
+            '_' => return LikeShape::Residual,
+            literal => tokens.push(Token::Literal(literal)),
+        }
+    }
+    let percent_positions = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| matches!(token, Token::Percent).then_some(index))
+        .collect::<Vec<_>>();
+    let decoded = |tokens: &[Token]| {
+        tokens
+            .iter()
+            .filter_map(|token| match token {
+                Token::Literal(ch) => Some(*ch),
+                Token::Percent => None,
+            })
+            .collect::<String>()
+    };
+
+    match percent_positions.as_slice() {
+        [] => LikeShape::EmptyOrLiteral(decoded(&tokens)),
+        [position] => {
+            if *position + 1 == tokens.len() {
+                LikeShape::StartsWith(decoded(&tokens[..*position]))
+            } else if *position == 0 {
+                LikeShape::EndsWith(decoded(&tokens[1..]))
             } else {
                 LikeShape::Residual
             }
         }
-        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
+        [first, last] if *first == 0 && *last + 1 == tokens.len() => {
             // `%%` reduces to `Contains('')`, which itself short-circuits to
             // `IsNotNull` at the StartsWith/EndsWith/Contains builder boundary
             // — so no special-casing here.
-            LikeShape::Contains(pattern[1..pattern.len() - 1].to_string())
+            LikeShape::Contains(decoded(&tokens[1..tokens.len() - 1]))
         }
         _ => LikeShape::Residual,
     }
@@ -2888,12 +2913,18 @@ mod tests {
             PredicateOperator::Like,
             "a%b%c",
         );
-        // Escaped wildcards keep Like leaf (optimization is conservative).
+        // Escaped wildcards are literals and can be optimized exactly.
         assert_leaf(
             &pb.like("name", Datum::String(r"foo\%".to_string()), None)
                 .unwrap(),
-            PredicateOperator::Like,
-            r"foo\%",
+            PredicateOperator::Eq,
+            "foo%",
+        );
+        assert_leaf(
+            &pb.like("name", Datum::String(r"foo\_bar%".to_string()), None)
+                .unwrap(),
+            PredicateOperator::StartsWith,
+            "foo_bar",
         );
     }
 

@@ -32,9 +32,13 @@ use crate::btree::sst_file::{
 };
 use crate::btree::var_len::{decode_var_int, decode_var_long};
 use crate::io::FileRead;
+use futures::stream::BoxStream;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io::{self, Cursor};
+use std::sync::Arc;
+
+pub(crate) type BTreeKeyPredicate = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 /// BTree index reader with on-demand async data block loading.
 pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
@@ -311,6 +315,89 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             }
             None => read_block_from_bytes(&bytes, handle.size),
         }
+    }
+
+    /// Consume this reader and stream matching row IDs without first building
+    /// a query-wide `RoaringTreemap`.
+    pub(crate) fn into_row_id_stream(
+        self,
+        from: Option<Vec<u8>>,
+        to: Option<(Vec<u8>, bool)>,
+        matches: BTreeKeyPredicate,
+        batch_size: usize,
+        max_memory: usize,
+    ) -> BoxStream<'static, io::Result<Vec<u64>>>
+    where
+        F: Send + Sync + 'static,
+    {
+        let stream = async_stream::try_stream! {
+            let Some(from) = from.or_else(|| self.min_key.clone()) else {
+                return;
+            };
+            let cmp = &self.key_comparator;
+            let index_block = self.sst_reader.index_block();
+            let (_, mut index_iter) = index_block.seek_and_iter(&from, cmp);
+            let mut row_ids = Vec::with_capacity(batch_size);
+            let mut done = false;
+
+            while !done {
+                let Some((_key, handle_bytes)) = index_iter.next() else {
+                    break;
+                };
+                let handle = BlockHandle::decode(handle_bytes)?;
+                let block = self.read_data_block(&handle, Some(max_memory)).await?;
+                let mut offset = 0;
+                while offset < block.data.len() {
+                    let (key, value, next_offset) = block.read_entry_at(offset);
+                    offset = next_offset;
+
+                    if cmp(key, &from) == Ordering::Less {
+                        continue;
+                    }
+                    if to.as_ref().is_some_and(|(to, inclusive)| {
+                        let ordering = cmp(key, to);
+                        ordering == Ordering::Greater
+                            || (!*inclusive && ordering == Ordering::Equal)
+                    }) {
+                        done = true;
+                        break;
+                    }
+                    if !matches(key) {
+                        continue;
+                    }
+
+                    let mut cursor = Cursor::new(value);
+                    let count = decode_var_int(&mut cursor)?;
+                    if count < 0 {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Invalid row id count: {count}"),
+                        ))?;
+                    }
+                    for _ in 0..count {
+                        let row_id = decode_var_long(&mut cursor)?;
+                        if row_id < 0 {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Invalid negative BTree row id: {row_id}"),
+                            ))?;
+                        }
+                        row_ids.push(row_id as u64);
+                        if row_ids.len() == batch_size {
+                            yield std::mem::replace(
+                                &mut row_ids,
+                                Vec::with_capacity(batch_size),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !row_ids.is_empty() {
+                yield row_ids;
+            }
+        };
+        Box::pin(stream)
     }
 
     /// Equal query: returns row ids for the given key.

@@ -37,6 +37,7 @@ use crate::spec::{
 };
 use crate::table::{DeletionFile, RowRange, Table};
 use crate::{Error, Result};
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
@@ -1442,12 +1443,18 @@ fn add_file_size(total: &mut i64, file_size: i64) -> bool {
 
 /// Convert a RoaringTreemap to merged RowRanges (already sorted and deduplicated).
 fn bitmap_to_ranges(bitmap: &RoaringTreemap) -> Vec<RowRange> {
-    if bitmap.is_empty() {
+    row_ids_to_ranges(bitmap.iter())
+}
+
+fn bitmap_to_ranges_below(bitmap: &RoaringTreemap, upper_exclusive: u64) -> Vec<RowRange> {
+    row_ids_to_ranges(bitmap.iter().take_while(|row_id| *row_id < upper_exclusive))
+}
+
+fn row_ids_to_ranges(mut iter: impl Iterator<Item = u64>) -> Vec<RowRange> {
+    let Some(first) = iter.next() else {
         return Vec::new();
-    }
+    };
     let mut ranges = Vec::new();
-    let mut iter = bitmap.iter();
-    let first = iter.next().unwrap();
     let mut start = first as i64;
     let mut end = start;
 
@@ -1857,6 +1864,344 @@ pub(crate) async fn evaluate_global_index(
     Ok(Some(super::merge_row_ranges(row_ranges)))
 }
 
+/// A bounded stream of exact global row-id ranges. Each item contains matches
+/// that no later index shard can overlap.
+pub type GlobalIndexRowRangeStream = BoxStream<'static, Result<Vec<RowRange>>>;
+
+// Keep execution batches large enough to amortize manifest planning while
+// bounding both candidate row IDs and the corresponding file metadata.
+const STREAMING_GLOBAL_INDEX_BATCH_ROWS: u64 = 250_000;
+
+fn row_ranges_cardinality(ranges: &[RowRange]) -> u64 {
+    ranges.iter().fold(0, |total, range| {
+        let length = range.to().saturating_sub(range.from()).saturating_add(1);
+        total.saturating_add(u64::try_from(length).unwrap_or(u64::MAX))
+    })
+}
+
+/// Whether a predicate can use the execution-time global-index stream.
+///
+/// Keep this deliberately narrow. A single exact equality or LIKE leaf can be
+/// evaluated independently per shard and its batches can be concatenated after
+/// de-duplicating overlapping shard coverage. Compound predicates require a
+/// cross-shard intersection/union and stay on the eager planner for now.
+pub fn is_streaming_global_index_predicate(predicate: &Predicate) -> bool {
+    let predicate = match predicate {
+        Predicate::And(children) if children.len() == 1 => &children[0],
+        predicate => predicate,
+    };
+    matches!(
+        predicate,
+        Predicate::Leaf {
+            op: PredicateOperator::Eq | PredicateOperator::StartsWith | PredicateOperator::Like,
+            literals,
+            ..
+        } if literals.len() == 1
+    )
+}
+
+/// Build an execution-time stream for a single equality/LIKE predicate.
+///
+/// Unlike [`evaluate_global_index`], this never unions every shard into one
+/// query-wide bitmap. It sweeps shards in row-id order, de-duplicates the active
+/// overlap window, and emits row ids as soon as no later shard can contain them.
+/// The normal data reader still evaluates the exact residual.
+///
+/// Returns `None` when no compatible global index is available; callers should
+/// then execute their already-planned base scan.
+pub async fn stream_global_index_row_ranges(
+    table: Table,
+    snapshot_id: i64,
+    predicate: Predicate,
+    data_ranges: Vec<RowRange>,
+) -> Result<Option<GlobalIndexRowRangeStream>> {
+    if !is_streaming_global_index_predicate(&predicate) {
+        return Ok(None);
+    }
+    let core_options = table.schema().core_options();
+    if !core_options.data_evolution_enabled()
+        || !core_options.global_index_enabled()
+        || !table.schema().primary_keys().is_empty()
+        || core_options.deletion_vectors_enabled()
+    {
+        return Ok(None);
+    }
+
+    let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await?;
+    let Some(index_manifest_name) = snapshot.index_manifest() else {
+        return Ok(None);
+    };
+    let index_manifest_path = format!(
+        "{}/manifest/{index_manifest_name}",
+        table.location().trim_end_matches('/')
+    );
+    let index_entries =
+        crate::spec::IndexManifest::read(table.file_io(), &index_manifest_path).await?;
+    let scanner = match GlobalIndexScanner::create(
+        table.file_io(),
+        table.location().trim_end_matches('/'),
+        core_options.global_index_thread_num()?,
+        core_options.global_index_query_max_memory()?,
+        core_options.btree_index_fallback_scan_max_size()?,
+        core_options.bitmap_index_fallback_scan_max_size()?,
+        &index_entries,
+        table.schema().fields(),
+    )? {
+        Some(scanner) => Arc::new(scanner),
+        None => return Ok(None),
+    };
+
+    let predicate = match predicate {
+        Predicate::And(mut children) if children.len() == 1 => children.remove(0),
+        predicate => predicate,
+    };
+    let Predicate::Leaf {
+        column,
+        op,
+        literals,
+        data_type,
+        ..
+    } = predicate
+    else {
+        return Ok(None);
+    };
+    let Some(field_id) = scanner.find_field_id_by_name(&column)? else {
+        return Ok(None);
+    };
+    let Some(field_group_index) = scanner
+        .entries_by_field
+        .iter()
+        .position(|(candidate, _)| *candidate == field_id)
+    else {
+        return Ok(None);
+    };
+
+    let entries = &scanner.entries_by_field[field_group_index].1;
+    let btree_cmp = make_key_comparator(&data_type);
+    let btree_serialized = literals
+        .iter()
+        .map(|literal| serialize_datum(literal, &data_type))
+        .collect::<Vec<_>>();
+    let bitmap_cmp = make_bitmap_key_comparator(&data_type);
+    let bitmap_serialized = literals
+        .iter()
+        .map(|literal| serialize_bitmap_datum(literal, &data_type))
+        .collect::<Vec<_>>();
+    let mut matching_entries = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let may_match = match entry.index_type {
+                GlobalIndexFileKind::BTree => {
+                    entry.meta.may_match(op, &btree_serialized, &btree_cmp)
+                }
+                GlobalIndexFileKind::Bitmap => bitmap_meta_may_match(
+                    &entry.meta,
+                    op,
+                    &data_type,
+                    &bitmap_serialized,
+                    bitmap_cmp.as_ref(),
+                ),
+            };
+            may_match.then_some(index)
+        })
+        .collect::<Vec<_>>();
+    matching_entries.sort_unstable_by_key(|index| {
+        let entry = &entries[*index];
+        (
+            entry.row_range_start,
+            entry.row_range_end,
+            matches!(entry.index_type, GlobalIndexFileKind::Bitmap),
+        )
+    });
+    // A field can retain equivalent BTree and bitmap files for the same row-id
+    // shard. Evaluating both only duplicates candidates and creates an overlap
+    // window as large as the shard. Prefer BTree for identical coverage; both
+    // formats are exact for the predicates admitted by this streaming path.
+    matching_entries.dedup_by(|current, previous| {
+        let current = &entries[*current];
+        let previous = &entries[*previous];
+        current.index_type != previous.index_type
+            && current.row_range_start == previous.row_range_start
+            && current.row_range_end == previous.row_range_end
+    });
+
+    let search_mode = core_options.global_index_search_mode()?;
+    let next_row_id = snapshot.next_row_id();
+    // DETAIL normally uses live data-file ranges. Execution-time streaming
+    // intentionally avoids an eager full-table manifest plan, so use the
+    // snapshot row-id universe as a conservative superset when those ranges
+    // are unavailable. Per-batch manifest planning removes holes and deletes.
+    let conservative_data_ranges =
+        if search_mode == GlobalIndexSearchMode::Detail && data_ranges.is_empty() {
+            next_row_id
+                .filter(|next| *next > 0)
+                .map(|next| vec![RowRange::new(0, next - 1)])
+                .unwrap_or_default()
+        } else {
+            data_ranges
+        };
+    let unindexed_ranges = scanner.unindexed_ranges_for_field_ids(
+        &HashSet::from([field_id]),
+        search_mode,
+        next_row_id,
+        &conservative_data_ranges,
+    );
+    let query_max_memory = scanner.query_max_memory;
+    let stream = async_stream::try_stream! {
+        let mut pending_row_ids = RoaringTreemap::new();
+        let mut batch_ranges = Vec::new();
+        let mut batch_rows = 0u64;
+        for (position, index) in matching_entries.iter().copied().enumerate() {
+            let entry = &scanner.entries_by_field[field_group_index].1[index];
+            let entry_start = u64::try_from(entry.row_range_start).map_err(|_| {
+                Error::DataInvalid {
+                    message: format!(
+                        "Global-index shard '{}' has negative row_range_start {}",
+                        entry.file_name, entry.row_range_start
+                    ),
+                    source: None,
+                }
+            })?;
+
+            // Entries are sorted by coverage start. No later shard can contain
+            // IDs below this boundary, so they are globally de-duplicated and
+            // safe to emit now. Removing them bounds even a long chain of
+            // partially overlapping shard ranges to the active overlap window.
+            let ready = bitmap_to_ranges_below(&pending_row_ids, entry_start);
+            pending_row_ids.remove_range(..entry_start);
+            if !ready.is_empty() {
+                batch_rows = batch_rows.saturating_add(row_ranges_cardinality(&ready));
+                batch_ranges.extend(ready);
+                if batch_rows >= STREAMING_GLOBAL_INDEX_BATCH_ROWS {
+                    yield super::merge_row_ranges(std::mem::take(&mut batch_ranges));
+                    batch_rows = 0;
+                }
+            }
+
+            let mut reader = Some(scanner
+                .open_reader_for_entry(entry, &entry.meta, &data_type, Some(query_max_memory))
+                .await?);
+            let previous_overlaps = position > 0
+                && scanner.entries_by_field[field_group_index].1[matching_entries[position - 1]]
+                    .row_range_end
+                    >= entry.row_range_start;
+            let next_overlaps = matching_entries.get(position + 1).is_some_and(|next| {
+                scanner.entries_by_field[field_group_index].1[*next].row_range_start
+                    <= entry.row_range_end
+            });
+            if !previous_overlaps && !next_overlaps {
+                match reader.take().expect("global-index reader is present") {
+                    OpenedGlobalIndexReader::BTree(reader) => {
+                    // Cap the row-id vector independently from the encoded SST
+                    // block budget. Vec<u64> has predictable memory even for
+                    // sparse 64-bit IDs, unlike RoaringTreemap's high-key map.
+                    let row_id_batch_size = usize::try_from(STREAMING_GLOBAL_INDEX_BATCH_ROWS)
+                        .unwrap_or(usize::MAX)
+                        .min((query_max_memory / std::mem::size_of::<u64>()).max(1));
+                    let mut row_id_stream = reader
+                        .into_query_row_id_stream(
+                            op,
+                            &literals,
+                            &data_type,
+                            row_id_batch_size,
+                            query_max_memory,
+                        )
+                        .map_err(|error| GlobalIndexScanner::query_error(entry, error))?;
+                    while let Some(mut row_ids) = row_id_stream
+                        .try_next()
+                        .await
+                        .map_err(|error| GlobalIndexScanner::query_error(entry, error))?
+                    {
+                        for row_id in &mut row_ids {
+                            *row_id = row_id.checked_add(entry_start).ok_or_else(|| {
+                                Error::DataInvalid {
+                                    message: format!(
+                                        "Global-index shard '{}' row id overflow: {} + {entry_start}",
+                                        entry.file_name, *row_id
+                                    ),
+                                    source: None,
+                                }
+                            })?;
+                            if *row_id > i64::MAX as u64 {
+                                Err(Error::DataInvalid {
+                                    message: format!(
+                                        "Global-index shard '{}' produced row id {} beyond i64::MAX",
+                                        entry.file_name, *row_id
+                                    ),
+                                    source: None,
+                                })?;
+                            }
+                        }
+                        row_ids.sort_unstable();
+                        row_ids.dedup();
+                        let ranges = row_ids_to_ranges(row_ids.into_iter());
+                        if !ranges.is_empty() {
+                            yield ranges;
+                        }
+                    }
+                    continue;
+                    }
+                    bitmap @ OpenedGlobalIndexReader::Bitmap(_) => reader = Some(bitmap),
+                }
+            }
+            let reader = reader.expect("global-index reader was not consumed");
+            let shard_limit = entry
+                .row_range_end
+                .checked_sub(entry.row_range_start)
+                .and_then(|length| length.checked_add(1))
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or(usize::MAX);
+            // The shard's row coverage keeps all possible matches while
+            // retaining the per-block decompression budget added by #672.
+            let bitmap = reader
+                .query(op, &literals, &data_type, Some(shard_limit), query_max_memory)
+                .await
+                .map_err(|error| GlobalIndexScanner::query_error(entry, error))?;
+            for row_id in bitmap.iter() {
+                let absolute_row_id = row_id.checked_add(entry_start).ok_or_else(|| {
+                    Error::DataInvalid {
+                        message: format!(
+                            "Global-index shard '{}' row id overflow: {row_id} + {entry_start}",
+                            entry.file_name
+                        ),
+                        source: None,
+                    }
+                })?;
+                pending_row_ids.insert(absolute_row_id);
+            }
+            // Do not return BTree readers to the scan-wide cache here. A
+            // single-leaf streaming query visits each shard once; caching
+            // would retain every shard's index metadata until query end and
+            // recreate the query-wide memory growth this path avoids.
+            drop(reader);
+        }
+        let ready = bitmap_to_ranges(&pending_row_ids);
+        if !ready.is_empty() {
+            batch_ranges.extend(ready);
+        }
+        if !batch_ranges.is_empty() {
+            yield super::merge_row_ranges(batch_ranges);
+        }
+        // FULL / DETAIL can add a large unindexed tail. Split it by row-id
+        // cardinality as well so its lazy file plan cannot become query-wide.
+        for range in unindexed_ranges {
+            let mut start = range.from();
+            while start <= range.to() {
+                let end = start
+                    .saturating_add(STREAMING_GLOBAL_INDEX_BATCH_ROWS as i64 - 1)
+                    .min(range.to());
+                yield vec![RowRange::new(start, end)];
+                if end == i64::MAX {
+                    break;
+                }
+                start = end + 1;
+            }
+        }
+    };
+    Ok(Some(Box::pin(stream)))
+}
+
 fn row_ranges_cardinality_at_least(ranges: &[RowRange], limit: usize) -> bool {
     let mut total = 0usize;
     for range in ranges {
@@ -1969,6 +2314,13 @@ mod tests {
                 RowRange::new(10, 10),
             ]
         );
+        assert_eq!(row_ranges_cardinality(&bitmap_to_ranges(&bm)), 6);
+
+        assert_eq!(
+            bitmap_to_ranges_below(&bm, 6),
+            vec![RowRange::new(1, 3), RowRange::new(5, 5)]
+        );
+        assert!(bitmap_to_ranges_below(&bm, 1).is_empty());
     }
 
     #[test]

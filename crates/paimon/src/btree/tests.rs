@@ -23,6 +23,7 @@ use crate::btree::test_util::{BytesFileRead, VecFileWrite};
 use crate::btree::writer::BTreeIndexWriter;
 use crate::spec::{DataType, Datum, PredicateOperator, VarCharType};
 use bytes::Bytes;
+use futures::TryStreamExt;
 
 fn int_key(v: i32) -> Vec<u8> {
     v.to_be_bytes().to_vec()
@@ -343,6 +344,37 @@ async fn test_limited_equality_caps_single_hot_key() {
         .await
         .expect_err("a hot-key data block over budget must not be materialized");
     assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+}
+
+#[tokio::test]
+async fn test_equality_row_ids_stream_in_bounded_batches() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 32, BlockCompressionType::None);
+    for row_id in 0..10_000 {
+        writer.write(Some(b"hot"), row_id).await.unwrap();
+    }
+
+    let result = writer.finish().await.unwrap();
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| a.cmp(b)).await;
+    let batches = reader
+        .into_query_row_id_stream(
+            PredicateOperator::Eq,
+            &[Datum::String("hot".to_string())],
+            &DataType::VarChar(VarCharType::string_type()),
+            1_024,
+            usize::MAX,
+        )
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.len(), 10);
+    assert!(batches.iter().all(|batch| batch.len() <= 1_024));
+    assert_eq!(
+        batches.into_iter().flatten().collect::<Vec<_>>(),
+        (0..10_000).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
