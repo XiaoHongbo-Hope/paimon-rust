@@ -21,11 +21,15 @@
 //! and query optimization utilities like between-pattern detection.
 
 use crate::btree::key_serde::serialize_datum;
-use crate::btree::reader::BTreeIndexReader;
+use crate::btree::reader::{BTreeIndexReader, BTreeKeyPredicate};
 use crate::spec::{like_match, DataType, Datum, PredicateOperator};
+use futures::stream::BoxStream;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io;
+use std::sync::Arc;
+
+type BTreeRowIdQueryBounds = (Option<Vec<u8>>, Option<(Vec<u8>, bool)>, BTreeKeyPredicate);
 
 /// Trait for index readers that can evaluate predicates and return row ID bitmaps.
 #[async_trait::async_trait]
@@ -142,6 +146,66 @@ where
     }
 }
 
+impl<F> BTreeIndexReader<F>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering + Send + Sync,
+{
+    /// Stream exact point/prefix/LIKE matches in bounded row-id batches.
+    pub(crate) fn into_query_row_id_stream(
+        self,
+        op: PredicateOperator,
+        literals: &[Datum],
+        data_type: &DataType,
+        batch_size: usize,
+        max_memory: usize,
+    ) -> io::Result<BoxStream<'static, io::Result<Vec<u64>>>>
+    where
+        F: 'static,
+    {
+        let (from, to, matches): BTreeRowIdQueryBounds = match op {
+            PredicateOperator::Eq => {
+                let key = serialize_datum(&literals[0], data_type);
+                (Some(key.clone()), Some((key, true)), Arc::new(|_| true))
+            }
+            PredicateOperator::StartsWith => {
+                ensure_character_string(data_type, op)?;
+                let prefix = serialize_datum(&literals[0], data_type);
+                let upper = prefix_successor(&prefix).map(|upper| (upper, false));
+                (Some(prefix), upper, Arc::new(|_| true))
+            }
+            PredicateOperator::Like => {
+                ensure_character_string(data_type, op)?;
+                let pattern = string_literal(literals, op)?.to_string();
+                (
+                    None,
+                    None,
+                    Arc::new(move |key| {
+                        std::str::from_utf8(key).is_ok_and(|value| like_match(value, &pattern))
+                    }),
+                )
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("BTree row-id streaming does not support {op:?}"),
+                ));
+            }
+        };
+        Ok(self.into_row_id_stream(from, to, matches, batch_size.max(1), max_memory))
+    }
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(&last) = bound.last() {
+        if last != u8::MAX {
+            *bound.last_mut().expect("bound is non-empty") = last + 1;
+            return Some(bound);
+        }
+        bound.pop();
+    }
+    None
+}
 fn ensure_character_string(data_type: &DataType, op: PredicateOperator) -> io::Result<()> {
     if matches!(data_type, DataType::Char(_) | DataType::VarChar(_)) {
         Ok(())

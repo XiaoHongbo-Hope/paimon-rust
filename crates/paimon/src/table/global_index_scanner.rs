@@ -37,6 +37,7 @@ use crate::spec::{
 };
 use crate::table::{DeletionFile, RowRange, Table};
 use crate::{Error, Result};
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
@@ -149,6 +150,7 @@ struct GlobalIndexEntry {
     index_type: GlobalIndexFileKind,
     file_size: i64,
     row_range_start: i64,
+    row_range_end: i64,
     meta: BTreeIndexMeta,
 }
 
@@ -346,6 +348,7 @@ impl GlobalIndexScanner {
                 },
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
+                row_range_end: global_meta.row_range_end,
                 meta: sorted_meta,
             };
 
@@ -879,6 +882,31 @@ impl GlobalIndexScanner {
         }
     }
 
+    /// Open a BTree reader for the execution-time row-id stream without adding
+    /// it to the scan-wide cache. The stream visits each shard once, so caching
+    /// would retain every shard's index metadata until the query completes.
+    async fn open_streaming_btree_reader(
+        &self,
+        entry: &GlobalIndexEntry,
+        data_type: &DataType,
+        max_memory: usize,
+    ) -> Result<BTreeIndexReader<BoxedCmp>> {
+        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
+        let input = self.file_io.new_input(&path)?;
+        let file_size = input.metadata().await?.size;
+        let file_reader = input.reader().await?;
+        let cmp = make_key_comparator(data_type);
+        BTreeIndexReader::open_with_memory_limit(
+            Box::new(file_reader),
+            file_size,
+            &entry.meta,
+            cmp,
+            max_memory,
+        )
+        .await
+        .map_err(|error| Self::query_error(entry, error))
+    }
+
     async fn open_bitmap_reader(
         &self,
         file_name: &str,
@@ -1086,12 +1114,14 @@ fn add_file_size(total: &mut i64, file_size: i64) -> bool {
 
 /// Convert a RoaringTreemap to merged RowRanges (already sorted and deduplicated).
 fn bitmap_to_ranges(bitmap: &RoaringTreemap) -> Vec<RowRange> {
-    if bitmap.is_empty() {
+    row_ids_to_ranges(bitmap.iter())
+}
+
+fn row_ids_to_ranges(mut iter: impl Iterator<Item = u64>) -> Vec<RowRange> {
+    let Some(first) = iter.next() else {
         return Vec::new();
-    }
+    };
     let mut ranges = Vec::new();
-    let mut iter = bitmap.iter();
-    let first = iter.next().unwrap();
     let mut start = first as i64;
     let mut end = start;
 
@@ -1491,6 +1521,283 @@ pub(crate) async fn evaluate_global_index(
     Ok(Some(super::merge_row_ranges(row_ranges)))
 }
 
+/// A bounded stream of exact global row-id ranges.
+pub type GlobalIndexRowRangeStream = BoxStream<'static, Result<Vec<RowRange>>>;
+
+// Large enough to amortize file planning while keeping row-id vectors bounded.
+const STREAMING_GLOBAL_INDEX_BATCH_ROWS: usize = 250_000;
+// A corrupt or unusually large hotspot block must not exhaust an 8 GiB worker.
+const STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY: usize = 256 * 1024 * 1024;
+
+/// Whether a predicate can use the execution-time BTree row-id stream.
+///
+/// Keep this deliberately narrow. Compound predicates still use the regular
+/// planner because their shard-local results require global set operations.
+pub fn is_streaming_global_index_predicate(predicate: &Predicate) -> bool {
+    let predicate = match predicate {
+        Predicate::And(children) if children.len() == 1 => &children[0],
+        predicate => predicate,
+    };
+    matches!(
+        predicate,
+        Predicate::Leaf {
+            op: PredicateOperator::Eq | PredicateOperator::StartsWith | PredicateOperator::Like,
+            literals,
+            ..
+        } if literals.len() == 1
+    )
+}
+
+/// Build an execution-time BTree row-id stream for one equality or LIKE leaf.
+///
+/// The stream visits shards in coverage order and emits fixed-size row-id
+/// batches. Overlapping shards are assigned disjoint row-id intervals (the
+/// earliest shard owns the overlap), so no query-wide de-duplication bitmap is
+/// required. The normal data reader retains and evaluates the exact residual.
+///
+/// Returns `None` when no compatible BTree index is available; callers should
+/// then execute a normal scan.
+pub async fn stream_global_index_row_ranges(
+    table: Table,
+    snapshot_id: i64,
+    predicate: Predicate,
+    data_ranges: Vec<RowRange>,
+) -> Result<Option<GlobalIndexRowRangeStream>> {
+    if !is_streaming_global_index_predicate(&predicate) {
+        return Ok(None);
+    }
+
+    let core_options = table.schema().core_options();
+    if !core_options.data_evolution_enabled()
+        || !core_options.global_index_enabled()
+        || !table.schema().primary_keys().is_empty()
+        || core_options.deletion_vectors_enabled()
+    {
+        return Ok(None);
+    }
+
+    let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await?;
+    let Some(index_manifest_name) = snapshot.index_manifest() else {
+        return Ok(None);
+    };
+    let index_manifest_path = format!(
+        "{}/manifest/{index_manifest_name}",
+        table.location().trim_end_matches('/')
+    );
+    let index_entries =
+        crate::spec::IndexManifest::read(table.file_io(), &index_manifest_path).await?;
+    let scanner = match GlobalIndexScanner::create(
+        table.file_io(),
+        table.location().trim_end_matches('/'),
+        core_options.global_index_thread_num()?,
+        core_options.btree_index_fallback_scan_max_size()?,
+        core_options.bitmap_index_fallback_scan_max_size()?,
+        &index_entries,
+        table.schema().fields(),
+    )? {
+        Some(scanner) => Arc::new(scanner),
+        None => return Ok(None),
+    };
+
+    let predicate = match predicate {
+        Predicate::And(mut children) if children.len() == 1 => children.remove(0),
+        predicate => predicate,
+    };
+    let Predicate::Leaf {
+        column,
+        op,
+        literals,
+        data_type,
+        ..
+    } = predicate
+    else {
+        return Ok(None);
+    };
+    let Some(field_id) = scanner.find_field_id_by_name(&column)? else {
+        return Ok(None);
+    };
+    let Some(field_group_index) = scanner
+        .entries_by_field
+        .iter()
+        .position(|(candidate, _)| *candidate == field_id)
+    else {
+        return Ok(None);
+    };
+
+    let entries = &scanner.entries_by_field[field_group_index].1;
+    let mut btree_entries = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (entry.index_type == GlobalIndexFileKind::BTree).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if btree_entries.is_empty() {
+        return Ok(None);
+    }
+    btree_entries.sort_unstable_by_key(|index| {
+        let entry = &entries[*index];
+        (entry.row_range_start, entry.row_range_end)
+    });
+
+    let search_mode = core_options.global_index_search_mode()?;
+    let next_row_id = snapshot.next_row_id();
+    // Until the prepared snapshot supplies exact live ranges, DETAIL uses the
+    // snapshot row-id universe as a conservative superset. Batch file planning
+    // removes holes and deleted files before data is read.
+    let coverage_data_ranges =
+        if search_mode == GlobalIndexSearchMode::Detail && data_ranges.is_empty() {
+            next_row_id
+                .filter(|next| *next > 0)
+                .map(|next| vec![RowRange::new(0, next - 1)])
+                .unwrap_or_default()
+        } else {
+            data_ranges
+        };
+    let unindexed_ranges = unindexed_ranges_for_global_index_entries(
+        &index_entries,
+        &HashSet::from([field_id]),
+        search_mode,
+        next_row_id,
+        &coverage_data_ranges,
+        |index_file| {
+            matches!(
+                normalize_sorted_global_index_type(&index_file.index_type),
+                Some(index_type) if index_type == BTREE_GLOBAL_INDEX_TYPE
+            )
+        },
+    );
+
+    let serialized_literals = literals
+        .iter()
+        .map(|literal| serialize_datum(literal, &data_type))
+        .collect::<Vec<_>>();
+    let comparator = make_key_comparator(&data_type);
+    let stream = async_stream::try_stream! {
+        let mut covered_end: Option<i64> = None;
+
+        for index in btree_entries {
+            let entry = &scanner.entries_by_field[field_group_index].1[index];
+            if entry.row_range_start < 0 || entry.row_range_end < entry.row_range_start {
+                Err(Error::DataInvalid {
+                    message: format!(
+                        "Global-index shard '{}' has invalid row range [{}, {}]",
+                        entry.file_name, entry.row_range_start, entry.row_range_end
+                    ),
+                    source: None,
+                })?;
+            }
+
+            let first_uncovered = match covered_end {
+                Some(i64::MAX) => None,
+                Some(end) => Some(entry.row_range_start.max(end + 1)),
+                None => Some(entry.row_range_start),
+            };
+            covered_end = Some(
+                covered_end
+                    .map(|end| end.max(entry.row_range_end))
+                    .unwrap_or(entry.row_range_end),
+            );
+
+            let Some(first_uncovered) =
+                first_uncovered.filter(|start| *start <= entry.row_range_end)
+            else {
+                continue;
+            };
+            if !entry.meta.may_match(op, &serialized_literals, &comparator) {
+                continue;
+            }
+
+            let entry_start = u64::try_from(entry.row_range_start).map_err(|_| {
+                Error::DataInvalid {
+                    message: format!(
+                        "Global-index shard '{}' has negative row_range_start {}",
+                        entry.file_name, entry.row_range_start
+                    ),
+                    source: None,
+                }
+            })?;
+            let reader = scanner
+                .open_streaming_btree_reader(
+                    entry,
+                    &data_type,
+                    STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY,
+                )
+                .await?;
+            let mut row_id_stream = reader
+                .into_query_row_id_stream(
+                    op,
+                    &literals,
+                    &data_type,
+                    STREAMING_GLOBAL_INDEX_BATCH_ROWS,
+                    STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY,
+                )
+                .map_err(|error| GlobalIndexScanner::query_error(entry, error))?;
+
+            while let Some(row_ids) = row_id_stream
+                .try_next()
+                .await
+                .map_err(|error| GlobalIndexScanner::query_error(entry, error))?
+            {
+                let mut absolute_row_ids = Vec::with_capacity(row_ids.len());
+                for row_id in row_ids {
+                    let absolute = row_id.checked_add(entry_start).ok_or_else(|| {
+                        Error::DataInvalid {
+                            message: format!(
+                                "Global-index shard '{}' row id overflow: {row_id} + {entry_start}",
+                                entry.file_name
+                            ),
+                            source: None,
+                        }
+                    })?;
+                    let absolute = i64::try_from(absolute).map_err(|_| Error::DataInvalid {
+                        message: format!(
+                            "Global-index shard '{}' produced a row id beyond i64::MAX",
+                            entry.file_name
+                        ),
+                        source: None,
+                    })?;
+                    if absolute > entry.row_range_end {
+                        Err(Error::DataInvalid {
+                            message: format!(
+                                "Global-index shard '{}' produced row id {absolute} outside [{}, {}]",
+                                entry.file_name, entry.row_range_start, entry.row_range_end
+                            ),
+                            source: None,
+                        })?;
+                    }
+                    if absolute >= first_uncovered {
+                        absolute_row_ids.push(absolute as u64);
+                    }
+                }
+
+                absolute_row_ids.sort_unstable();
+                absolute_row_ids.dedup();
+                let ranges = row_ids_to_ranges(absolute_row_ids.into_iter());
+                if !ranges.is_empty() {
+                    yield ranges;
+                }
+            }
+        }
+
+        // FULL and DETAIL include data not covered by a BTree index. Keep that
+        // tail bounded too; upstream Limit/TopK can stop polling when complete.
+        for range in unindexed_ranges {
+            let mut start = range.from();
+            while start <= range.to() {
+                let end = start
+                    .saturating_add(STREAMING_GLOBAL_INDEX_BATCH_ROWS as i64 - 1)
+                    .min(range.to());
+                yield vec![RowRange::new(start, end)];
+                if end == i64::MAX {
+                    break;
+                }
+                start = end + 1;
+            }
+        }
+    };
+    Ok(Some(Box::pin(stream)))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

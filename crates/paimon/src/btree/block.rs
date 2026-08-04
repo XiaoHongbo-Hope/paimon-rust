@@ -315,6 +315,13 @@ impl BlockReader {
             });
         }
 
+        if block.len() < 5 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("BTree block is too short: {} bytes", block.len()),
+            ));
+        }
+
         let aligned_type = BlockAlignedType::from_byte(block[block.len() - 1])?;
         let int_value = i32::from_le_bytes([
             block[block.len() - 5],
@@ -325,9 +332,23 @@ impl BlockReader {
 
         match aligned_type {
             BlockAlignedType::Aligned => {
+                if int_value <= 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid aligned BTree record size: {int_value}"),
+                    ));
+                }
                 let record_size = int_value as usize;
                 let data_len = block.len() - 5;
-                let record_count = data_len.checked_div(record_size).unwrap_or(0);
+                if !data_len.is_multiple_of(record_size) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Aligned BTree data length {data_len} is not divisible by record size {record_size}"
+                        ),
+                    ));
+                }
+                let record_count = data_len / record_size;
                 block.truncate(data_len);
                 Ok(Self {
                     data: block,
@@ -336,12 +357,33 @@ impl BlockReader {
                 })
             }
             BlockAlignedType::Unaligned => {
+                if int_value < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid unaligned BTree entry count: {int_value}"),
+                    ));
+                }
                 let num_entries = int_value as usize;
-                let index_len = num_entries * 4;
-                let data_end = block.len() - 5 - index_len;
+                let index_len = num_entries.checked_mul(4).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("BTree entry count is too large: {num_entries}"),
+                    )
+                })?;
+                let payload_len = block.len() - 5;
+                if index_len > payload_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "BTree offset index requires {index_len} bytes but block payload has {payload_len}"
+                        ),
+                    ));
+                }
+                let data_end = payload_len - index_len;
                 let index_start = data_end;
 
                 let mut offsets = Vec::with_capacity(num_entries);
+                let mut previous = None;
                 for i in 0..num_entries {
                     let pos = index_start + i * 4;
                     let off = i32::from_le_bytes([
@@ -350,7 +392,19 @@ impl BlockReader {
                         block[pos + 2],
                         block[pos + 3],
                     ]);
+                    if off < 0
+                        || off as usize >= data_end
+                        || previous.is_some_and(|previous| off <= previous)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "Invalid BTree entry offset {off} at position {i} for {data_end}-byte data block"
+                            ),
+                        ));
+                    }
                     offsets.push(off);
+                    previous = Some(off);
                 }
 
                 block.truncate(data_end);
@@ -546,6 +600,34 @@ mod tests {
         assert_eq!(entries[0], (&b"a"[..], &b"1"[..]));
         assert_eq!(entries[1], (&b"bb"[..], &b"22"[..]));
         assert_eq!(entries[2], (&b"ccc"[..], &b"333"[..]));
+    }
+
+    #[test]
+    fn test_block_rejects_untrusted_entry_count_before_allocating() {
+        let mut block = vec![0; 5];
+        block[..4].copy_from_slice(&i32::MAX.to_le_bytes());
+        block[4] = BlockAlignedType::Unaligned as u8;
+
+        let error = match BlockReader::create_from_vec(block) {
+            Ok(_) => panic!("malformed block should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("offset index requires"));
+    }
+
+    #[test]
+    fn test_block_rejects_invalid_aligned_record_size() {
+        let mut block = vec![0; 5];
+        block[..4].copy_from_slice(&0i32.to_le_bytes());
+        block[4] = BlockAlignedType::Aligned as u8;
+
+        let error = match BlockReader::create_from_vec(block) {
+            Ok(_) => panic!("malformed block should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("record size"));
     }
 
     #[test]

@@ -295,6 +295,7 @@ impl TableProvider for HybridSearchTableProvider {
             target_partitions: state.config_options().execution.target_partitions,
             filter_exact: false,
             case_sensitive: true,
+            streaming_global_index: None,
         }
         .build_with_read_fields(input_read_fields)?;
         let scores = search_result

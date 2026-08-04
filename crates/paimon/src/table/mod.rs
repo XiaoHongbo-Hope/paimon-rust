@@ -109,6 +109,9 @@ pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
 pub use global_index_drop_builder::GlobalIndexDropBuilder;
+pub use global_index_scanner::{
+    is_streaming_global_index_predicate, stream_global_index_row_ranges, GlobalIndexRowRangeStream,
+};
 pub use global_index_types::{
     normalize_global_index_type_for_drop, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };

@@ -853,6 +853,32 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Resolve the snapshot selected by this scan without materializing its
+    /// manifests or data-file splits.
+    #[doc(hidden)]
+    pub async fn resolve_snapshot_id(&self) -> crate::Result<Option<i64>> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.resolve_snapshot_id().await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not expose a Paimon snapshot id".to_string(),
+            }),
+        }
+    }
+
+    /// Plan this scan against one already-resolved snapshot.
+    ///
+    /// Execution-time global-index scans use this after attaching a bounded
+    /// row-range batch, so they never need an eager query-wide file plan.
+    #[doc(hidden)]
+    pub async fn plan_snapshot_id(&self, snapshot_id: i64) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_id(snapshot_id).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support snapshot-id planning".to_string(),
+            }),
+        }
+    }
+
     pub(crate) async fn plan_manifest_entries(
         &self,
         snapshot: &Snapshot,
@@ -1008,6 +1034,25 @@ impl<'a> PaimonTableScan<'a> {
             Some(snapshot) => snapshot,
             None => return Ok(Plan::new(Vec::new())),
         };
+        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
+            .await
+    }
+
+    async fn resolve_snapshot_id(&self) -> crate::Result<Option<i64>> {
+        self.ensure_query_auth_allowed()?;
+        Ok(super::time_travel::resolve_snapshot(self.table)
+            .await?
+            .map(|snapshot| snapshot.id()))
+    }
+
+    async fn plan_snapshot_id(&self, snapshot_id: i64) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        let snapshot = self
+            .table
+            .snapshot_manager()
+            .get_snapshot(snapshot_id)
+            .await?;
         self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
             .await
     }
@@ -1178,12 +1223,14 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if should_use_global_index_row_range_optimization(
-            self.row_range_optimization_disabled,
-            data_evolution_enabled,
-            core_options.global_index_enabled(),
-            !self.data_predicates.is_empty(),
-        ) {
+        if self.row_ranges.is_none()
+            && should_use_global_index_row_range_optimization(
+                self.row_range_optimization_disabled,
+                data_evolution_enabled,
+                core_options.global_index_enabled(),
+                !self.data_predicates.is_empty(),
+            )
+        {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.global_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,

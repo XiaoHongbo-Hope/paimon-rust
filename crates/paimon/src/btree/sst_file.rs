@@ -195,7 +195,40 @@ impl SstFileWriter {
 /// Read and decode a block from raw bytes where offset 0 is the start of the block.
 /// The bytes must contain exactly: block_data (handle.size) + trailer (5 bytes).
 pub fn read_block_from_bytes(bytes: &[u8], size: u32) -> io::Result<BlockReader> {
+    read_block_from_bytes_impl(bytes, size, None)
+}
+
+/// Read a block while rejecting encoded or decompressed data above
+/// `max_memory` before allocating the output buffer.
+pub(crate) fn read_block_from_bytes_with_memory_limit(
+    bytes: &[u8],
+    size: u32,
+    max_memory: usize,
+) -> io::Result<BlockReader> {
+    read_block_from_bytes_impl(bytes, size, Some(max_memory))
+}
+
+fn read_block_from_bytes_impl(
+    bytes: &[u8],
+    size: u32,
+    max_memory: Option<usize>,
+) -> io::Result<BlockReader> {
     let size = size as usize;
+    let required = size
+        .checked_add(BLOCK_TRAILER_LENGTH)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Block size overflow"))?;
+    if bytes.len() < required {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("Block requires {required} bytes, got {}", bytes.len()),
+        ));
+    }
+    if max_memory.is_some_and(|limit| size > limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("Encoded block size {size} exceeds memory limit"),
+        ));
+    }
     let trailer = BlockTrailer::read_from(&bytes[size..size + BLOCK_TRAILER_LENGTH])?;
     let block_data = &bytes[..size];
 
@@ -210,16 +243,35 @@ pub fn read_block_from_bytes(bytes: &[u8], size: u32) -> io::Result<BlockReader>
         ));
     }
 
-    let decompressed = decompress_block(block_data, &trailer)?;
+    let decompressed = decompress_block(block_data, &trailer, max_memory)?;
     BlockReader::create_from_vec(decompressed)
 }
 
-fn decompress_block(data: &[u8], trailer: &BlockTrailer) -> io::Result<Vec<u8>> {
+fn decompress_block(
+    data: &[u8],
+    trailer: &BlockTrailer,
+    max_memory: Option<usize>,
+) -> io::Result<Vec<u8>> {
     match trailer.compression_type {
         BlockCompressionType::None => Ok(data.to_vec()),
         BlockCompressionType::Zstd => {
             let mut cursor = Cursor::new(data);
-            let uncompressed_size = crate::btree::var_len::decode_var_int(&mut cursor)? as usize;
+            let uncompressed_size = crate::btree::var_len::decode_var_int(&mut cursor)?;
+            if uncompressed_size < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid negative decompressed block size: {uncompressed_size}"),
+                ));
+            }
+            let uncompressed_size = uncompressed_size as usize;
+            if max_memory.is_some_and(|limit| uncompressed_size > limit) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!(
+                        "Decompressed block size {uncompressed_size} exceeds memory limit"
+                    ),
+                ));
+            }
             let compressed_start = cursor.position() as usize;
             let compressed_data = &data[compressed_start..];
             let mut decompressed = vec![0u8; uncompressed_size];
