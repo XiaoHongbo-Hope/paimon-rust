@@ -760,8 +760,10 @@ pub struct PaimonTableScan {
     /// Optional limit hint pushed to paimon-core planning.
     limit: Option<usize>,
     /// Whether the pushed predicate is exact (no residual filtering needed).
-    /// When true and all splits have known merged_row_count, statistics can be exact.
     filter_exact: bool,
+    /// Whether any pushed predicate is evaluated against data rows. Exact filter
+    /// execution does not make pre-filter manifest row counts exact.
+    has_data_predicates: bool,
     /// Metadata-pruning trace captured during eager scan planning.
     scan_trace: Option<ScanTrace>,
     /// Human-readable Variant extraction summary for explain output.
@@ -864,6 +866,11 @@ impl PaimonTableScan {
         case_sensitive: bool,
         parquet_read_budget: Arc<ParquetReadBudget>,
     ) -> Self {
+        let has_data_predicates = pushed_predicate.as_ref().is_some_and(|predicate| {
+            let mut read_builder = table.new_read_builder();
+            read_builder.with_filter(predicate.clone());
+            read_builder.has_data_predicates()
+        });
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(planned_partitions.len()),
@@ -878,6 +885,7 @@ impl PaimonTableScan {
             plan_properties,
             limit,
             filter_exact,
+            has_data_predicates,
             scan_trace,
             pushed_variants,
             case_sensitive,
@@ -1159,9 +1167,11 @@ impl ExecutionPlan for PaimonTableScan {
         // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
         // 2. No limit is applied (limit would make row count inexact)
         // 3. Filter is exact (no residual filtering needed above the scan)
+        // 4. No data predicate is applied (manifest counts are pre-filter)
         let num_rows_precision = if all_row_counts_known
             && self.limit.is_none()
             && self.filter_exact
+            && !self.has_data_predicates
             && self.runtime_filters.is_empty()
         {
             Precision::Exact(total_rows)
@@ -1462,6 +1472,33 @@ mod tests {
 
         assert_eq!(statistics.num_rows, Precision::Exact(4));
         assert_eq!(statistics.total_byte_size, Precision::Absent);
+    }
+
+    #[test]
+    fn test_partition_statistics_keep_exact_data_filter_row_count_inexact() {
+        let table = dummy_table();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(2))
+            .unwrap();
+        let split = split_with_int_stats(None, None);
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            table,
+            test_read_type(),
+            Some(predicate),
+            vec![Arc::from(vec![split])],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(
+            scan.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(4),
+            "exact filter execution must not make pre-filter manifest row counts exact"
+        );
     }
 
     #[test]

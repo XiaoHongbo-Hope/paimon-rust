@@ -149,6 +149,7 @@ struct GlobalIndexEntry {
     index_type: GlobalIndexFileKind,
     file_size: i64,
     row_range_start: i64,
+    row_range_end: i64,
     meta: BTreeIndexMeta,
 }
 
@@ -243,7 +244,10 @@ impl OpenedGlobalIndexReader {
                 Some(limit) => reader.query_limited(op, literals, data_type, limit).await,
                 None => reader.query(op, literals, data_type).await,
             },
-            Self::Bitmap(reader) => reader.query(op, literals, data_type).await,
+            Self::Bitmap(reader) => match limit {
+                Some(limit) => reader.query_limited(op, literals, data_type, limit).await,
+                None => reader.query(op, literals, data_type).await,
+            },
         }
     }
 
@@ -361,6 +365,7 @@ impl GlobalIndexScanner {
                 },
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
+                row_range_end: global_meta.row_range_end,
                 meta: sorted_meta,
             };
 
@@ -623,6 +628,17 @@ impl GlobalIndexScanner {
         let limit_fallback_scan = limit.is_some()
             && effective_predicates.len() == 1
             && effective_predicates[0].0 == PredicateOperator::Like;
+        let bounded_like_fallback_supported = if limit_fallback_scan {
+            let plan = self.fallback_scan_plan(entries, &predicate_matches[0], false);
+            entries
+                .iter()
+                .zip(&predicate_matches[0])
+                .all(|(entry, predicate_matches_entry)| {
+                    fallback_plan_evaluates_entry(plan, entry.index_type, *predicate_matches_entry)
+                })
+        } else {
+            true
+        };
         let predicate_fallback_plans: Vec<Option<FallbackScanPlan>> = effective_predicates
             .iter()
             .enumerate()
@@ -741,6 +757,7 @@ impl GlobalIndexScanner {
             .unwrap_or(predicates[0].2);
         let between = between.as_ref();
         let all_row_ids = if let Some(limit) = limit {
+            let per_shard_limit_safe = !query_plan_ranges_overlap(entries, &query_plans);
             // An unordered LIMIT may return any matching rows. Prefer the newest
             // row-id ranges so recent point-like patterns do not scan historical
             // index shards before reaching the limit. Keep this path sequential:
@@ -750,7 +767,7 @@ impl GlobalIndexScanner {
                 std::cmp::Reverse(entries[plan.entry_idx].row_range_start)
             });
             let mut all_row_ids = RoaringTreemap::new();
-            if limit_fallback_scan {
+            if limit_fallback_scan && per_shard_limit_safe {
                 let pattern = match effective_predicates[0].1.first() {
                     Some(Datum::String(pattern)) => pattern,
                     _ => unreachable!("LIKE predicate has a validated string literal"),
@@ -793,22 +810,29 @@ impl GlobalIndexScanner {
                             )
                             .await?
                         {
-                            for row_id in bitmap.iter() {
-                                all_row_ids.insert(row_id + entry.row_range_start as u64);
-                            }
+                            extend_offset_row_ids_until_limit(
+                                &mut all_row_ids,
+                                &bitmap,
+                                entry.row_range_start,
+                                limit,
+                            );
                         }
                         if all_row_ids.len() >= limit as u64 {
                             return Ok(Some(bitmap_to_ranges(&all_row_ids)));
                         }
                     }
-                    // The fallback query is capped to the remaining result count
-                    // per shard. Keeping probe hits would let the full LIKE scan
-                    // rediscover those same row IDs and spend that cap on
-                    // duplicates, potentially stopping before enough new matches
-                    // are found. Discard them until fallback can exclude probe IDs
-                    // or account for a per-shard duplicate budget.
-                    all_row_ids.clear();
                 }
+            }
+            if limit_fallback_scan {
+                if !bounded_like_fallback_supported {
+                    // The preferred point/prefix probe is cheap enough to run
+                    // above the fallback byte budget. A full complex-LIKE scan
+                    // is not: hand the predicate back to the normal data scan.
+                    return Ok(None);
+                }
+                // Keeping probe hits would let the full LIKE scan rediscover
+                // those same row IDs and spend its per-shard cap on duplicates.
+                all_row_ids.clear();
             }
             for plan in query_plans {
                 let entry = &entries[plan.entry_idx];
@@ -824,6 +848,11 @@ impl GlobalIndexScanner {
                     None => None,
                 };
                 let remaining = limit.saturating_sub(all_row_ids.len() as usize);
+                // Overlapping identities or index kinds can produce duplicate
+                // global row IDs. In that case a reader-local cap may contain
+                // only duplicates, so read the shard fully and stop only after
+                // global de-duplication has contributed enough unique IDs.
+                let shard_limit = per_shard_limit_safe.then_some(remaining);
                 let result = self
                     .query_entry(
                         entry,
@@ -831,13 +860,16 @@ impl GlobalIndexScanner {
                         between,
                         &plan,
                         effective_predicates,
-                        Some(remaining),
+                        shard_limit,
                     )
                     .await?;
                 if let Some(bitmap) = result {
-                    for row_id in bitmap.iter() {
-                        all_row_ids.insert(row_id + entry.row_range_start as u64);
-                    }
+                    extend_offset_row_ids_until_limit(
+                        &mut all_row_ids,
+                        &bitmap,
+                        entry.row_range_start,
+                        limit,
+                    );
                 }
                 if all_row_ids.len() >= limit as u64 {
                     break;
@@ -1681,6 +1713,45 @@ fn row_ranges_cardinality_at_least(ranges: &[RowRange], limit: usize) -> bool {
         }
     }
     false
+}
+
+fn query_plan_ranges_overlap(entries: &[GlobalIndexEntry], query_plans: &[EntryQueryPlan]) -> bool {
+    let mut ranges = query_plans
+        .iter()
+        .map(|plan| {
+            let entry = &entries[plan.entry_idx];
+            (entry.row_range_start, entry.row_range_end)
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.0);
+
+    let Some(&(first_start, mut max_end)) = ranges.first() else {
+        return false;
+    };
+    if max_end < first_start {
+        return true;
+    }
+    for &(start, end) in &ranges[1..] {
+        if end < start || start <= max_end {
+            return true;
+        }
+        max_end = max_end.max(end);
+    }
+    false
+}
+
+fn extend_offset_row_ids_until_limit(
+    all_row_ids: &mut RoaringTreemap,
+    shard_row_ids: &RoaringTreemap,
+    row_range_start: i64,
+    limit: usize,
+) {
+    for row_id in shard_row_ids.iter() {
+        if all_row_ids.len() >= limit as u64 {
+            break;
+        }
+        all_row_ids.insert(row_id + row_range_start as u64);
+    }
 }
 
 #[cfg(test)]
@@ -3092,7 +3163,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_like_limit_stops_fallback_scan_before_raw_tail() {
+    async fn test_btree_equality_limit_caps_single_hot_shard() {
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BTreeIndexWriter::new(Box::new(output), 32, BlockCompressionType::None);
+        for row_id in 0..10_000 {
+            writer.write(Some(b"hot-key"), row_id).await.unwrap();
+        }
+        let write_result = writer.finish().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let file_name = "hot-key.index";
+        std::fs::write(index_dir.join(file_name), captured.to_vec()).unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        let entries = vec![make_global_index_entry(
+            file_name,
+            1,
+            0,
+            9_999,
+            &write_result.meta,
+        )];
+        let fields = string_schema_fields();
+        let predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type: DataType::VarChar(crate::spec::VarCharType::string_type()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::String("hot-key".to_string())],
+        }];
+
+        let row_ranges = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 32,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: Some(10_000),
+            data_ranges: &[],
+            limit: Some(3),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(row_ranges, vec![RowRange::new(0, 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_equality_limit_counts_unique_ids_across_overlapping_index_kinds() {
+        let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
+
+        let btree_output = VecFileWrite::new();
+        let captured_btree = btree_output.clone();
+        let mut btree_writer =
+            BTreeIndexWriter::new(Box::new(btree_output), 32, BlockCompressionType::None);
+        for row_id in 0..3 {
+            btree_writer.write(Some(b"hot-key"), row_id).await.unwrap();
+        }
+        let btree_result = btree_writer.finish().await.unwrap();
+
+        let bitmap_output = VecFileWrite::new();
+        let captured_bitmap = bitmap_output.clone();
+        let mut bitmap_writer = BitmapGlobalIndexWriter::new(
+            Box::new(bitmap_output),
+            32,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+        let cold_key = serialize_bitmap_datum(&Datum::String("cold".to_string()), &data_type);
+        bitmap_writer.write(Some(&cold_key), 0).unwrap();
+        let hot_key = serialize_bitmap_datum(&Datum::String("hot-key".to_string()), &data_type);
+        for row_id in 1..5 {
+            bitmap_writer.write(Some(&hot_key), row_id).unwrap();
+        }
+        let bitmap_result = bitmap_writer.finish().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let btree_file = "overlap-btree.index";
+        let bitmap_file = "overlap-bitmap.index";
+        std::fs::write(index_dir.join(btree_file), captured_btree.to_vec()).unwrap();
+        std::fs::write(index_dir.join(bitmap_file), captured_bitmap.to_vec()).unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+
+        let entries = vec![
+            make_global_index_entry_with_type(
+                BTREE_GLOBAL_INDEX_TYPE,
+                btree_file,
+                1,
+                1,
+                3,
+                &btree_result.meta,
+            ),
+            make_global_index_entry_with_type(
+                BITMAP_GLOBAL_INDEX_TYPE,
+                bitmap_file,
+                1,
+                0,
+                4,
+                &bitmap_result.meta,
+            ),
+        ];
+        let fields = string_schema_fields();
+        let predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type,
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::String("hot-key".to_string())],
+        }];
+
+        let row_ranges = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 1,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: Some(5),
+            data_ranges: &[],
+            limit: Some(4),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(row_ranges, vec![RowRange::new(1, 4)]);
+    }
+
+    #[tokio::test]
+    async fn test_btree_like_limit_preserves_fallback_scan_bound() {
         let (file_io, table_path, file_name, tmp) =
             setup_testdata_table("btree_varchar_100_no_compress.bin");
         let meta = BTreeIndexMeta::new(Some(b"a".to_vec()), Some(b"yyyy".to_vec()), false);
@@ -3133,21 +3345,11 @@ mod tests {
             limit: Some(3),
         })
         .await
-        .unwrap()
         .unwrap();
 
-        assert_eq!(
-            row_ranges
-                .iter()
-                .map(|range| range.to() - range.from() + 1)
-                .sum::<i64>(),
-            3
-        );
         assert!(
-            row_ranges
-                .iter()
-                .all(|range| range.from() >= 100 && range.to() < 200),
-            "limit scans should query the newest shard first and stop before the raw tail"
+            row_ranges.is_none(),
+            "an unprobeable complex LIKE must respect the configured fallback byte bound"
         );
     }
 

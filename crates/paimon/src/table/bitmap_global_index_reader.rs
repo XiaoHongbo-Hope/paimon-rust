@@ -26,7 +26,7 @@ use crate::btree::{make_key_comparator, serialize_datum, BlockCompressionType};
 use crate::io::{FileRead, FileWrite};
 use crate::spec::{like_match, DataType, Datum, PredicateOperator};
 use bytes::Bytes;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -400,6 +400,39 @@ impl BitmapGlobalIndexReader {
         }
     }
 
+    pub(crate) async fn query_limited(
+        &self,
+        op: PredicateOperator,
+        literals: &[Datum],
+        data_type: &DataType,
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        match op {
+            PredicateOperator::Eq => {
+                let key = serialize_bitmap_datum(&literals[0], data_type);
+                self.equal_limited(&key, data_type, limit).await
+            }
+            PredicateOperator::Like => {
+                if !is_character_string(data_type) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Bitmap global index like only supports string columns",
+                    ));
+                }
+                let pattern = string_literal(literals, op)?.to_string();
+                self.scan_serialized_dictionary_limited(
+                    |candidate| {
+                        std::str::from_utf8(candidate)
+                            .is_ok_and(|value| like_match(value, &pattern))
+                    },
+                    limit,
+                )
+                .await
+            }
+            _ => self.query(op, literals, data_type).await,
+        }
+    }
+
     pub(crate) async fn range_query(
         &self,
         from: &[u8],
@@ -431,6 +464,19 @@ impl BitmapGlobalIndexReader {
     async fn equal(&self, key: &[u8], data_type: &DataType) -> io::Result<RoaringTreemap> {
         let logical_cmp = make_bitmap_key_comparator(data_type);
         self.equal_with_comparator(key, logical_cmp.as_ref()).await
+    }
+
+    async fn equal_limited(
+        &self,
+        key: &[u8],
+        data_type: &DataType,
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        let logical_cmp = make_bitmap_key_comparator(data_type);
+        match self.find_bitmap_block(key, logical_cmp.as_ref()).await? {
+            Some(block) => self.read_bitmap_limited(block, limit).await,
+            None => Ok(RoaringTreemap::new()),
+        }
     }
 
     async fn equal_with_comparator(
@@ -478,6 +524,28 @@ impl BitmapGlobalIndexReader {
             for entry in self.read_dictionary_block(block_meta.block).await? {
                 if predicate(&entry.key) {
                     result |= self.read_bitmap(entry.bitmap_block).await?;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn scan_serialized_dictionary_limited(
+        &self,
+        predicate: impl Fn(&[u8]) -> bool,
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        let mut result = RoaringTreemap::new();
+        for block_meta in &self.dictionary_blocks {
+            for entry in self.read_dictionary_block(block_meta.block).await? {
+                if predicate(&entry.key) {
+                    let remaining = limit.saturating_sub(result.len() as usize);
+                    result |= self
+                        .read_bitmap_limited(entry.bitmap_block, remaining)
+                        .await?;
+                    if result.len() >= limit as u64 {
+                        return Ok(result);
+                    }
                 }
             }
         }
@@ -556,6 +624,48 @@ impl BitmapGlobalIndexReader {
         RoaringTreemap::deserialize_from(bytes.as_ref())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
+
+    async fn read_bitmap_limited(
+        &self,
+        block: BlockInfo,
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        if limit == 0 {
+            return Ok(RoaringTreemap::new());
+        }
+        let bytes = self
+            .reader
+            .read(block.offset..block.offset + block.length as u64)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        deserialize_treemap_limited(bytes.as_ref(), limit)
+    }
+}
+
+fn deserialize_treemap_limited(mut reader: impl Read, limit: usize) -> io::Result<RoaringTreemap> {
+    let mut u64_bytes = [0u8; 8];
+    reader.read_exact(&mut u64_bytes)?;
+    let map_count = u64::from_le_bytes(u64_bytes);
+    let mut result = RoaringTreemap::new();
+
+    for _ in 0..map_count {
+        let mut u32_bytes = [0u8; 4];
+        reader.read_exact(&mut u32_bytes)?;
+        let high = u32::from_le_bytes(u32_bytes) as u64;
+        let bitmap = RoaringBitmap::deserialize_from(&mut reader)?;
+        let remaining = limit.saturating_sub(result.len() as usize);
+        result.extend(
+            bitmap
+                .iter()
+                .take(remaining)
+                .map(|low| (high << 32) | low as u64),
+        );
+        if result.len() >= limit as u64 {
+            break;
+        }
+    }
+
+    Ok(result)
 }
 
 async fn read_footer(reader: &dyn FileRead, file_size: u64) -> io::Result<Footer> {
@@ -991,7 +1101,7 @@ fn u64_to_i64(value: u64) -> io::Result<i64> {
 mod tests {
     use super::*;
     use crate::btree::test_util::{BytesFileRead, VecFileWrite};
-    use crate::spec::{DoubleType, FloatType, IntType};
+    use crate::spec::{DoubleType, FloatType, IntType, VarCharType};
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
 
@@ -1045,6 +1155,64 @@ mod tests {
             entries.extend(reader.read_dictionary_block(block.block).await.unwrap());
         }
         (reader, entries)
+    }
+
+    #[tokio::test]
+    async fn test_limited_equality_caps_single_hot_key() {
+        let data_type = DataType::VarChar(VarCharType::string_type());
+        let values = (0..10_000)
+            .map(|row_id| (Datum::String("hot".to_string()), row_id))
+            .collect::<Vec<_>>();
+        let bytes = write_bitmap_bytes(&data_type, &values, 1 << 20).await;
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+
+        let matches = reader
+            .query_limited(
+                PredicateOperator::Eq,
+                &[Datum::String("hot".to_string())],
+                &data_type,
+                3,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_limited_like_caps_across_dictionary_values() {
+        let data_type = DataType::VarChar(VarCharType::string_type());
+        let values = (0..5)
+            .map(|row_id| (Datum::String("alpha".to_string()), row_id))
+            .chain((5..10).map(|row_id| (Datum::String("alpine".to_string()), row_id)))
+            .collect::<Vec<_>>();
+        let bytes = write_bitmap_bytes(&data_type, &values, 1).await;
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+
+        let matches = reader
+            .query_limited(
+                PredicateOperator::Like,
+                &[Datum::String("al%".to_string())],
+                &data_type,
+                7,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            matches.iter().collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
     }
 
     #[test]

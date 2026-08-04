@@ -199,6 +199,26 @@ async fn test_count_star_with_non_partition_equality_does_not_push_down() {
     assert_eq!(count, 1, "COUNT(*) should return 1");
 }
 
+#[tokio::test]
+async fn test_count_star_with_exact_like_does_not_push_down() {
+    let (_tmp, sql_context) = setup_table("(id INT, name STRING)").await;
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t VALUES (1, 'alice'), (2, 'alina'), (3, 'bob')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let sql = "SELECT COUNT(*) FROM paimon.test_db.t WHERE name LIKE 'ali%'";
+    assert!(
+        verify_count_pushdown(&sql_context, sql).await.is_err(),
+        "COUNT(*) with an exact LIKE data filter must scan filtered rows"
+    );
+    assert_eq!(run_count_query(&sql_context, sql).await, 2);
+}
+
 // ============================================================================
 // Test: COUNT(*) on table with single row should push down
 // ============================================================================

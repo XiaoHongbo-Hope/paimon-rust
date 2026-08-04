@@ -98,6 +98,10 @@ impl<'a> FormatReadBuilder<'a> {
         false
     }
 
+    pub(crate) fn has_data_predicates(&self) -> bool {
+        !self.data_predicates.is_empty()
+    }
+
     pub(crate) fn with_row_ranges(&mut self, _ranges: Vec<RowRange>) -> &mut Self {
         self
     }
