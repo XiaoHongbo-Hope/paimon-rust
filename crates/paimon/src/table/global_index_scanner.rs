@@ -223,6 +223,12 @@ struct EntryQueryPlan {
     matching_predicates: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct EntryQueryLimits {
+    row_limit: Option<usize>,
+    max_memory: Option<usize>,
+}
+
 enum EntryQueryResult {
     Complete(Option<RoaringTreemap>),
     MemoryLimitExceeded,
@@ -243,11 +249,16 @@ impl OpenedGlobalIndexReader {
         op: PredicateOperator,
         literals: &[Datum],
         data_type: &DataType,
-        limit: Option<usize>,
-        max_memory: usize,
+        row_limit: Option<usize>,
+        max_memory: Option<usize>,
     ) -> std::io::Result<RoaringTreemap> {
+        // Overlapping shards cannot cap rows independently because a shard may
+        // contribute only IDs already seen globally. Keep the memory budget in
+        // that case by using an effectively unlimited row cap.
+        let bounded_row_limit = row_limit.or(max_memory.map(|_| usize::MAX));
+        let max_memory = max_memory.unwrap_or(usize::MAX);
         match self {
-            Self::BTree(reader) => match limit {
+            Self::BTree(reader) => match bounded_row_limit {
                 Some(limit) => {
                     reader
                         .query_limited_with_memory_limit(op, literals, data_type, limit, max_memory)
@@ -255,7 +266,7 @@ impl OpenedGlobalIndexReader {
                 }
                 None => reader.query(op, literals, data_type).await,
             },
-            Self::Bitmap(reader) => match limit {
+            Self::Bitmap(reader) => match bounded_row_limit {
                 Some(limit) => {
                     reader
                         .query_limited_with_memory_limit(op, literals, data_type, limit, max_memory)
@@ -936,7 +947,10 @@ impl GlobalIndexScanner {
                         between,
                         &plan,
                         effective_predicates,
-                        shard_limit,
+                        EntryQueryLimits {
+                            row_limit: shard_limit,
+                            max_memory: Some(self.query_max_memory),
+                        },
                     )
                     .await?;
                 let EntryQueryResult::Complete(result) = result else {
@@ -970,7 +984,14 @@ impl GlobalIndexScanner {
                     None => None,
                 };
                 let result = self
-                    .query_entry(entry, data_type, between, &plan, effective_predicates, None)
+                    .query_entry(
+                        entry,
+                        data_type,
+                        between,
+                        &plan,
+                        effective_predicates,
+                        EntryQueryLimits::default(),
+                    )
                     .await?;
                 match result {
                     EntryQueryResult::Complete(result) => Ok((entry.row_range_start, result)),
@@ -1045,19 +1066,14 @@ impl GlobalIndexScanner {
         between: Option<&BetweenInfo<'_>>,
         plan: &EntryQueryPlan,
         effective_predicates: &[(PredicateOperator, &[Datum], &DataType)],
-        limit: Option<usize>,
+        limits: EntryQueryLimits,
     ) -> Result<EntryQueryResult> {
         let mut reader = if (plan.between_matches && plan.between_evaluated)
             || !plan.matching_predicates.is_empty()
         {
             Some(
                 match self
-                    .open_reader_for_entry(
-                        entry,
-                        &entry.meta,
-                        data_type,
-                        limit.map(|_| self.query_max_memory),
-                    )
+                    .open_reader_for_entry(entry, &entry.meta, data_type, limits.max_memory)
                     .await
                 {
                     Ok(reader) => reader,
@@ -1100,7 +1116,13 @@ impl GlobalIndexScanner {
             let bitmap = match reader
                 .as_ref()
                 .expect("reader is opened when predicates match")
-                .query(*op, literals, data_type, limit, self.query_max_memory)
+                .query(
+                    *op,
+                    literals,
+                    data_type,
+                    limits.row_limit,
+                    limits.max_memory,
+                )
                 .await
             {
                 Ok(bitmap) => bitmap,
@@ -3515,6 +3537,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(row_ranges, vec![RowRange::new(1, 4)]);
+
+        let fallback = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 1,
+            query_max_memory: 1,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: Some(5),
+            data_ranges: &[],
+            limit: Some(4),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            fallback.is_none(),
+            "overlapping shards must retain the query memory budget when row limiting is disabled"
+        );
     }
 
     #[tokio::test]
