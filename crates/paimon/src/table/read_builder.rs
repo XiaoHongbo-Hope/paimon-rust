@@ -26,7 +26,7 @@ use super::incremental_scan::{IncrementalScan, IncrementalScanMode};
 use super::partition_filter::PartitionFilter;
 use super::table_read::{configured_parquet_read_budget, TableRead};
 use super::{Table, TableScan};
-use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::spec::{CoreOptions, DataField, Predicate, PredicateOperator};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -41,9 +41,12 @@ struct NormalizedFilter {
 
 /// Whether a translated predicate is exact at the table-provider boundary.
 ///
-/// Exact filters are fully enforced by paimon-core scan planning using only
-/// partition-owned semantics, without requiring residual filtering above the
-/// scan.
+/// Partition filters are exact through scan planning. Residual `LIKE` data
+/// predicates are exact because every physical format capable of storing their
+/// string column applies a row-level residual filter. This must not depend on
+/// the current `file.format` writer option: existing files may use an older
+/// format. Reporting them as exact lets query engines pass an unordered limit
+/// into global-index planning without retaining a second filter above the scan.
 fn is_exact_filter_pushdown_for_schema(
     fields: &[DataField],
     partition_keys: &[String],
@@ -56,6 +59,15 @@ fn is_exact_filter_pushdown_for_schema(
     let (_, data_predicates) =
         split_partition_and_data_predicates(filter.clone(), fields, partition_keys);
     data_predicates.is_empty()
+        || data_predicates.iter().all(|predicate| {
+            matches!(
+                predicate,
+                Predicate::Leaf {
+                    op: PredicateOperator::Like,
+                    ..
+                }
+            )
+        })
 }
 
 pub(super) fn split_scan_predicates(
@@ -389,8 +401,8 @@ impl<'a> PaimonReadBuilder<'a> {
 
     /// Whether a translated predicate is exact at the table-provider boundary.
     ///
-    /// Exact filters are fully enforced by paimon-core scan planning, without
-    /// requiring residual filtering above the scan.
+    /// Exact filters are fully enforced by paimon-core planning and reading,
+    /// without requiring residual filtering above the scan.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
         is_exact_filter_pushdown_for_schema(
             self.table.schema().fields(),
@@ -1202,6 +1214,63 @@ mod tests {
         let builder = table.new_read_builder();
 
         assert!(!builder.is_exact_filter_pushdown(&predicate));
+    }
+
+    #[test]
+    fn test_exact_filter_pushdown_is_true_for_residual_like_data_filter() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("dt", DataType::VarChar(VarCharType::string_type()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .partition_keys(["dt"])
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-read-builder-like".to_string(),
+            table_schema,
+            None,
+        );
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .like("name", crate::spec::Datum::String("a_b%".to_string()), None)
+            .unwrap();
+
+        assert!(table
+            .new_read_builder()
+            .is_exact_filter_pushdown(&predicate));
+    }
+
+    #[test]
+    fn test_exact_filter_pushdown_does_not_depend_on_current_writer_format() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("dt", DataType::VarChar(VarCharType::string_type()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .partition_keys(["dt"])
+                .option("file.format", "mosaic")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-read-builder-mosaic-like".to_string(),
+            table_schema,
+            None,
+        );
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .like("name", crate::spec::Datum::String("a_b%".to_string()), None)
+            .unwrap();
+
+        assert!(table
+            .new_read_builder()
+            .is_exact_filter_pushdown(&predicate));
     }
 
     #[tokio::test]

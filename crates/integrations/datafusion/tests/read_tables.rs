@@ -26,7 +26,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::Like;
+use datafusion::logical_expr::{col, lit, Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 use paimon::catalog::Identifier;
@@ -265,9 +266,21 @@ async fn test_supports_partition_filters_pushdown() {
     let partition_filter = col("dt").eq(lit("2024-01-01"));
     let mixed_and_filter = col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)));
     let data_filter = col("id").gt(lit(1));
+    let like_filter = Expr::Like(Like::new(
+        false,
+        Box::new(col("name")),
+        Box::new(lit("a_b%")),
+        None,
+        false,
+    ));
 
     let supports = provider
-        .supports_filters_pushdown(&[&partition_filter, &mixed_and_filter, &data_filter])
+        .supports_filters_pushdown(&[
+            &partition_filter,
+            &mixed_and_filter,
+            &data_filter,
+            &like_filter,
+        ])
         .expect("supports_filters_pushdown should succeed");
 
     assert_eq!(
@@ -276,6 +289,7 @@ async fn test_supports_partition_filters_pushdown() {
             TableProviderFilterPushDown::Exact,
             TableProviderFilterPushDown::Inexact,
             TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Exact,
         ]
     );
 }
@@ -695,6 +709,30 @@ async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
     assert_eq!(
         total_rows, 1,
         "Inexact filter + LIMIT should still return exactly 1 row"
+    );
+}
+
+#[tokio::test]
+async fn test_residual_like_pushes_limit_into_paimon_planning() {
+    let sql = "SELECT id, name FROM paimon.default.partitioned_log_table \
+               WHERE name LIKE '_%' LIMIT 1";
+    let plan = create_physical_plan(sql)
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        scan_lines.iter().any(|line| line.contains("limit=1")),
+        "An exact residual LIKE should carry LIMIT into Paimon planning, plan:\n{plan_text}"
+    );
+
+    let batches = collect_query(sql)
+        .await
+        .expect("LIKE + LIMIT query should succeed");
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
     );
 }
 

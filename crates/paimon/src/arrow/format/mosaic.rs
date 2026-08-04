@@ -57,7 +57,11 @@ impl FormatFileReader for MosaicFormatReader {
             message: "Mosaic reader requires a Tokio runtime".to_string(),
             source: Some(Box::new(e)),
         })?;
-        let read_fields = read_fields.to_vec();
+        // Mosaic stats only prune whole row groups. Widen the physical read with
+        // predicate columns so the exact residual pass below can filter every
+        // emitted row, including when the predicate column is not projected.
+        let output_fields = read_fields.to_vec();
+        let read_fields = crate::arrow::residual::widen_scan_fields(read_fields, predicates);
         let predicates = predicates.map(|predicates| FilePredicates {
             predicates: predicates.predicates.clone(),
             row_filter_factory: None,
@@ -72,6 +76,7 @@ impl FormatFileReader for MosaicFormatReader {
                     reader,
                     file_size,
                     read_fields,
+                    output_fields,
                     predicates,
                     batch_size,
                     row_selection,
@@ -101,6 +106,7 @@ struct MosaicReadRequest {
     reader: Box<dyn FileRead>,
     file_size: u64,
     read_fields: Vec<DataField>,
+    output_fields: Vec<DataField>,
     predicates: Option<FilePredicates>,
     batch_size: usize,
     row_selection: Option<Vec<RowRange>>,
@@ -115,6 +121,7 @@ fn read_mosaic_batches_blocking(
         reader,
         file_size,
         read_fields,
+        output_fields,
         predicates,
         batch_size,
         row_selection,
@@ -134,21 +141,22 @@ fn read_mosaic_batches_blocking(
         .filter(|field| file_column_names.contains(field.name()))
         .cloned()
         .collect::<Vec<_>>();
-    let read_schema = build_target_arrow_schema(&existing_read_fields)?;
-    validate_mosaic_schema(&read_schema)?;
+    let existing_output_fields = output_fields
+        .iter()
+        .filter(|field| file_column_names.contains(field.name()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let physical_read_schema = build_target_arrow_schema(&existing_read_fields)?;
+    validate_mosaic_schema(&physical_read_schema)?;
     let projected_names = existing_read_fields
         .iter()
         .map(|field| field.name().to_string())
         .collect::<Vec<_>>();
     let all_projected_columns_missing = !read_fields.is_empty() && projected_names.is_empty();
-    let predicate_state = predicates.map(|predicates| {
+    let predicate_column_indices = predicates.as_ref().map(|predicates| {
         let file_column_indices =
             build_file_column_indices(mosaic_reader.schema(), &predicates.file_fields);
-        (
-            predicates.predicates,
-            predicates.file_fields,
-            file_column_indices,
-        )
+        file_column_indices
     });
 
     let mut row_group_start = 0usize;
@@ -175,7 +183,9 @@ fn read_mosaic_batches_blocking(
             }
         }
 
-        if let Some((predicates, file_fields, file_column_indices)) = &predicate_state {
+        if let (Some(predicates), Some(file_column_indices)) =
+            (&predicates, &predicate_column_indices)
+        {
             let row_group_stats = mosaic_reader
                 .row_group_stats(row_group_index)
                 .map_err(mosaic_read_error)?;
@@ -183,8 +193,8 @@ fn read_mosaic_batches_blocking(
                 row_group_rows,
                 row_group_stats,
                 file_column_indices,
-                predicates,
-                file_fields,
+                &predicates.predicates,
+                &predicates.file_fields,
             )? {
                 continue;
             }
@@ -194,7 +204,7 @@ fn read_mosaic_batches_blocking(
             let row_count = selected_slices
                 .as_ref()
                 .map_or(row_group_rows, |slices| selected_row_count(slices));
-            empty_batch(read_schema.clone(), row_count)?
+            empty_batch(physical_read_schema.clone(), row_count)?
         } else {
             let names = projected_names
                 .iter()
@@ -205,8 +215,18 @@ fn read_mosaic_batches_blocking(
                 .map_err(mosaic_read_error)?;
 
             let batch = row_group_reader.read_columns().map_err(mosaic_read_error)?;
-            take_row_slices(batch, selected_slices.as_deref(), &read_schema)?
+            take_row_slices(batch, selected_slices.as_deref(), &physical_read_schema)?
         };
+        let batch = align_batch_to_scan_fields(batch, &read_fields)?;
+        let batch = match predicates.as_ref() {
+            Some(predicates) => crate::arrow::residual::filter_record_batch_by_predicates(
+                batch,
+                predicates,
+                &read_fields,
+            )?,
+            None => batch,
+        };
+        let batch = project_batch_to_output_fields(batch, &existing_output_fields)?;
         for chunk in split_batch(batch, batch_size) {
             if !send_batch(chunk) {
                 return Ok(());
@@ -214,6 +234,67 @@ fn read_mosaic_batches_blocking(
         }
     }
     Ok(())
+}
+
+fn project_batch_to_output_fields(
+    batch: RecordBatch,
+    output_fields: &[DataField],
+) -> crate::Result<RecordBatch> {
+    let output_schema = build_target_arrow_schema(output_fields)?;
+    if output_fields.is_empty() {
+        return empty_batch(output_schema, batch.num_rows());
+    }
+    let columns = output_fields
+        .iter()
+        .map(|field| {
+            batch
+                .schema()
+                .index_of(field.name())
+                .map(|index| Arc::clone(batch.column(index)))
+                .map_err(|e| Error::UnexpectedError {
+                    message: format!(
+                        "Mosaic output column '{}' is missing after residual filtering: {e}",
+                        field.name()
+                    ),
+                    source: None,
+                })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    RecordBatch::try_new(output_schema, columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to project Mosaic output fields: {e}"),
+        source: Some(Box::new(e)),
+    })
+}
+
+fn align_batch_to_scan_fields(
+    batch: RecordBatch,
+    scan_fields: &[DataField],
+) -> crate::Result<RecordBatch> {
+    let target_schema = build_target_arrow_schema(scan_fields)?;
+    let columns = scan_fields
+        .iter()
+        .zip(target_schema.fields())
+        .map(|(field, arrow_field)| {
+            batch
+                .schema()
+                .index_of(field.name())
+                .ok()
+                .map(|index| Arc::clone(batch.column(index)))
+                .unwrap_or_else(|| {
+                    arrow_array::new_null_array(arrow_field.data_type(), batch.num_rows())
+                })
+        })
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new_with_options(
+        target_schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to align Mosaic scan fields: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 struct MosaicRowGroupStats<'a> {
@@ -1124,7 +1205,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(collect_i32_column(&batches, 0), vec![10, 11]);
+        assert_eq!(collect_i32_column(&batches, 0), vec![10]);
     }
 
     #[tokio::test]
@@ -1149,14 +1230,14 @@ mod tests {
         let builder = PredicateBuilder::new(&fields);
         let predicates = predicate_file_predicates(
             fields.clone(),
-            vec![builder.equal("id", Datum::Int(99)).unwrap()],
+            vec![builder.equal("id", Datum::Int(20)).unwrap()],
         );
         let data = multi_row_group_mosaic(vec!["score".to_string()]);
         let batches = read_batches_with_predicates(data, &fields, Some(&predicates), None)
             .await
             .unwrap();
 
-        assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert_eq!(collect_i32_column(&batches, 0), vec![20]);
     }
 
     #[tokio::test]
@@ -1194,7 +1275,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(collect_i32_column(&batches, 0), vec![30, 40]);
+        assert_eq!(collect_i32_column(&batches, 0), vec![30]);
     }
 
     #[tokio::test]

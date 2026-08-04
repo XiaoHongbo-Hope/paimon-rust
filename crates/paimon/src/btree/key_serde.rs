@@ -159,6 +159,20 @@ pub fn serialize_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
     }
 }
 
+/// Return the exclusive lexicographic upper bound for all byte strings with
+/// `prefix`, or `None` when the prefix has no finite upper bound.
+pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(&last) = bound.last() {
+        if last != 0xFF {
+            *bound.last_mut().unwrap() = last + 1;
+            return Some(bound);
+        }
+        bound.pop();
+    }
+    None
+}
+
 fn encode_java_big_integer_i128(value: i128) -> Vec<u8> {
     let bytes = value.to_be_bytes();
     let mut start = 0;

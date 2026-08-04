@@ -1319,12 +1319,15 @@ mod row_tests {
 mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, VarCharType,
+        ArrayType, BinaryRowBuilder, DataFileMeta, DataType, Datum, IntType, Predicate,
+        PredicateBuilder, Schema, TableSchema, VarCharType,
     };
     use crate::table::source::{DataSplitBuilder, DeletionFile};
+    use crate::table::Table;
     use arrow_array::{Int32Array, StringArray};
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -1600,6 +1603,75 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn test_old_mosaic_file_with_current_parquet_option_filters_like_exactly() {
+        let data = write_mosaic(&pk_batch(vec![1, 2, 3], vec!["apple", "banana", "apricot"]));
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/old_mosaic_current_parquet";
+        let bucket_path = format!("{table_path}/dt=2026/bucket-0");
+        let file_name = "old-data.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+
+        let table_schema = TableSchema::new(
+            1,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column(
+                    "name",
+                    DataType::VarChar(VarCharType::with_nullable(true, 20).unwrap()),
+                )
+                .column("dt", DataType::VarChar(VarCharType::string_type()))
+                .partition_keys(["dt"])
+                // This controls new writes only. The split below deliberately
+                // points at a Mosaic file written before the option changed.
+                .option("file.format", "parquet")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "mixed_formats"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+        let mut partition = BinaryRowBuilder::new(1);
+        partition.write_string(0, "2026");
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(partition.build())
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(file_name, data.len() as i64, 3, 1)])
+            .build()
+            .unwrap();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            // Keep this as residual LIKE instead of the simple-prefix rewrite.
+            .like("name", Datum::String("a_%".to_string()), None)
+            .unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_filter(predicate.clone());
+        builder.with_projection(&["id"]).unwrap();
+        assert!(builder.is_exact_filter_pushdown(&predicate));
+
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&batches), vec![1, 3]);
+    }
+
     fn write_multi_row_group_mosaic(batches: &[RecordBatch], stats_columns: Vec<String>) -> Bytes {
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(
@@ -1869,7 +1941,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(batches.iter().map(|b| b.num_columns()).max(), Some(1));
-        assert_eq!(collect_ids(&batches), vec![11]);
+        assert!(collect_ids(&batches).is_empty());
     }
 }
 

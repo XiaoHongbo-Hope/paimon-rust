@@ -142,6 +142,82 @@ where
     }
 }
 
+impl<F> BTreeIndexReader<F>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering + Send + Sync,
+{
+    /// Evaluate a predicate while capping fallback string scans at `limit`
+    /// matching row ids. Other operators retain their normal query behavior.
+    pub(crate) async fn query_limited(
+        &self,
+        op: PredicateOperator,
+        literals: &[Datum],
+        data_type: &DataType,
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        if op != PredicateOperator::Like {
+            return IndexQuery::query(self, op, literals, data_type).await;
+        }
+        ensure_character_string(data_type, op)?;
+        let pattern = string_literal(literals, op)?.to_string();
+        if let Some(candidate_matches) = self.query_preferred_like_limited(&pattern, limit).await? {
+            if candidate_matches.len() >= limit as u64 {
+                return Ok(candidate_matches);
+            }
+        }
+        self.scan_entries_limited(
+            move |key| std::str::from_utf8(key).is_ok_and(|value| like_match(value, &pattern)),
+            Some(limit),
+        )
+        .await
+    }
+
+    pub(crate) async fn query_preferred_like_limited(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> io::Result<Option<RoaringTreemap>> {
+        let Some((candidate, prefix_match)) = preferred_like_candidate(pattern) else {
+            return Ok(None);
+        };
+        let matches = if prefix_match {
+            self.query_prefix_limited(candidate.as_bytes(), limit)
+                .await?
+        } else {
+            self.query_equal_limited(candidate.as_bytes(), limit)
+                .await?
+        };
+        Ok(Some(matches))
+    }
+}
+
+/// Pick one concrete subset of a LIKE language for a cheap BTree probe.
+/// `%` chooses the empty string and `_` chooses a literal underscore. If the
+/// pattern ends in an unescaped `%`, every value with the resulting prefix is
+/// still an exact LIKE match; otherwise only the concrete value is probed.
+pub(crate) fn preferred_like_candidate(pattern: &str) -> Option<(String, bool)> {
+    let mut candidate = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    let mut trailing_percent = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => candidate.push(chars.next().unwrap_or('\\')),
+            '%' => trailing_percent = chars.peek().is_none(),
+            '_' => {
+                candidate.push('_');
+                trailing_percent = false;
+            }
+            literal => {
+                candidate.push(literal);
+                trailing_percent = false;
+            }
+        }
+    }
+
+    (!candidate.is_empty()).then_some((candidate, trailing_percent))
+}
+
 fn ensure_character_string(data_type: &DataType, op: PredicateOperator) -> io::Result<()> {
     if matches!(data_type, DataType::Char(_) | DataType::VarChar(_)) {
         Ok(())
@@ -258,5 +334,23 @@ pub(crate) fn extract_between<'a>(
             (Some(between), remaining)
         }
         _ => (None, predicates.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preferred_like_candidate;
+
+    #[test]
+    fn test_preferred_like_candidate_is_exact_subset() {
+        assert_eq!(
+            preferred_like_candidate("lowprec_abc\\_def%"),
+            Some(("lowprec_abc_def".to_string(), true))
+        );
+        assert_eq!(
+            preferred_like_candidate("%foo_bar"),
+            Some(("foo_bar".to_string(), false))
+        );
+        assert_eq!(preferred_like_candidate("%"), None);
     }
 }

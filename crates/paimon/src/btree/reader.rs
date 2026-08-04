@@ -25,6 +25,7 @@
 
 use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::footer::{BTreeFileFooter, BTREE_FOOTER_ENCODED_LENGTH};
+use crate::btree::key_serde::prefix_successor;
 use crate::btree::meta::BTreeIndexMeta;
 use crate::btree::sst_file::{read_block_from_bytes, SstFileReader};
 use crate::btree::var_len::{decode_var_int, decode_var_long};
@@ -118,6 +119,16 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         &self,
         predicate: impl Fn(&[u8]) -> bool + Send + Sync,
     ) -> io::Result<RoaringTreemap> {
+        self.scan_entries_limited(predicate, None).await
+    }
+
+    /// Scan non-null entries until `limit` matching row ids have been collected.
+    /// A `None` limit scans the complete file.
+    pub(crate) async fn scan_entries_limited(
+        &self,
+        predicate: impl Fn(&[u8]) -> bool + Send + Sync,
+        limit: Option<usize>,
+    ) -> io::Result<RoaringTreemap> {
         let Some(min_key) = self.min_key.as_deref() else {
             return Ok(RoaringTreemap::new());
         };
@@ -135,7 +146,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
                 let (key, value, next_offset) = block.read_entry_at(offset);
                 offset = next_offset;
                 if predicate(key) {
-                    insert_row_ids_into(value, &mut result)?;
+                    insert_row_ids_into_limited(value, &mut result, limit)?;
+                    if limit.is_some_and(|limit| result.len() >= limit as u64) {
+                        return Ok(result);
+                    }
                 }
             }
         }
@@ -152,6 +166,21 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         from_inclusive: bool,
         to_inclusive: bool,
     ) -> io::Result<RoaringTreemap> {
+        self.range_query_limited(from, to, from_inclusive, to_inclusive, None)
+            .await
+    }
+
+    async fn range_query_limited(
+        &self,
+        from: &[u8],
+        to: &[u8],
+        from_inclusive: bool,
+        to_inclusive: bool,
+        limit: Option<usize>,
+    ) -> io::Result<RoaringTreemap> {
+        if limit == Some(0) {
+            return Ok(RoaringTreemap::new());
+        }
         let cmp = &self.key_comparator;
         let mut result = RoaringTreemap::new();
 
@@ -180,6 +209,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             from_inclusive,
             to_inclusive,
             &mut result,
+            limit,
         )? {
             return Ok(result);
         }
@@ -197,6 +227,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
                 from_inclusive,
                 to_inclusive,
                 &mut result,
+                limit,
             )? {
                 return Ok(result);
             }
@@ -217,6 +248,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         from_inclusive: bool,
         to_inclusive: bool,
         result: &mut RoaringTreemap,
+        limit: Option<usize>,
     ) -> io::Result<bool> {
         let cmp = &self.key_comparator;
         while *offset < block.data.len() {
@@ -232,7 +264,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
                 return Ok(true);
             }
 
-            insert_row_ids_into(value, result)?;
+            insert_row_ids_into_limited(value, result, limit)?;
+            if limit.is_some_and(|limit| result.len() >= limit as u64) {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -286,22 +321,39 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
     }
 
     pub async fn query_prefix(&self, prefix: &[u8]) -> io::Result<RoaringTreemap> {
-        match Self::prefix_successor(prefix) {
+        match prefix_successor(prefix) {
             Some(upper) => self.range_query(prefix, &upper, true, false).await,
             None => self.query_greater_or_equal(prefix).await,
         }
     }
 
-    fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-        let mut bound = prefix.to_vec();
-        while let Some(&last) = bound.last() {
-            if last != 0xFF {
-                *bound.last_mut().unwrap() = last + 1;
-                return Some(bound);
+    pub(crate) async fn query_equal_limited(
+        &self,
+        key: &[u8],
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        self.range_query_limited(key, key, true, true, Some(limit))
+            .await
+    }
+
+    pub(crate) async fn query_prefix_limited(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> io::Result<RoaringTreemap> {
+        match prefix_successor(prefix) {
+            Some(upper) => {
+                self.range_query_limited(prefix, &upper, true, false, Some(limit))
+                    .await
             }
-            bound.pop();
+            None => match &self.max_key {
+                Some(max) => {
+                    self.range_query_limited(prefix, max, true, true, Some(limit))
+                        .await
+                }
+                None => Ok(RoaringTreemap::new()),
+            },
         }
-        None
     }
 
     /// Between query (inclusive on both ends).
@@ -455,6 +507,14 @@ fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<(
 
 /// Deserialize row ids from value bytes and insert directly into bitmap.
 fn insert_row_ids_into(data: &[u8], bitmap: &mut RoaringTreemap) -> io::Result<()> {
+    insert_row_ids_into_limited(data, bitmap, None)
+}
+
+fn insert_row_ids_into_limited(
+    data: &[u8],
+    bitmap: &mut RoaringTreemap,
+    limit: Option<usize>,
+) -> io::Result<()> {
     let mut cursor = Cursor::new(data);
     let count = decode_var_int(&mut cursor)?;
     if count < 0 {
@@ -464,6 +524,9 @@ fn insert_row_ids_into(data: &[u8], bitmap: &mut RoaringTreemap) -> io::Result<(
         ));
     }
     for _ in 0..count {
+        if limit.is_some_and(|limit| bitmap.len() >= limit as u64) {
+            break;
+        }
         bitmap.insert(decode_var_long(&mut cursor)? as u64);
     }
     Ok(())
