@@ -3977,7 +3977,7 @@ async fn test_read_orc_with_unsupported_date_predicate_remains_residual() {
 }
 
 #[tokio::test]
-async fn test_read_orc_predicate_pushdown_remains_conservative() {
+async fn test_read_orc_equality_predicate_pushdown_is_exact() {
     use paimon::spec::{Datum, PredicateBuilder};
 
     let catalog = create_file_system_catalog();
@@ -3986,8 +3986,8 @@ async fn test_read_orc_predicate_pushdown_remains_conservative() {
     let filter = pb.equal("id", Datum::Int(2)).expect("build id predicate");
 
     assert!(
-        !table.new_read_builder().is_exact_filter_pushdown(&filter),
-        "ORC reader pruning must not make data predicates exact at the table boundary"
+        table.new_read_builder().is_exact_filter_pushdown(&filter),
+        "ORC applies an exact row-level residual after reader pruning"
     );
 
     assert_full_types_orc_filter_matches(filter, "col_string", &["orc-world"]).await;
