@@ -62,14 +62,12 @@ fn find_time_travel_selector(opts: &HashMap<String, String>) -> Option<(&str, &s
         .find_map(|&name| opts.get(name).map(|v| (name, v.as_str())))
 }
 
-/// Apply projection/limit/filter from a config snapshot onto a core ReadBuilder.
-/// Shared by PyTableScan::plan and PyTableRead::read so scan and read stay consistent.
+/// Apply common scan/read config onto a core ReadBuilder.
 fn apply_read_config(
     builder: &mut paimon::table::ReadBuilder<'_>,
     projection: &Option<Vec<String>>,
     limit: Option<usize>,
     filter: &Option<Predicate>,
-    row_ranges: &Option<Vec<RowRange>>,
     case_sensitive: bool,
 ) -> PyResult<()> {
     builder.with_case_sensitive(case_sensitive);
@@ -82,9 +80,6 @@ fn apply_read_config(
     }
     if let Some(filter) = filter {
         builder.with_filter(filter.clone());
-    }
-    if let Some(row_ranges) = row_ranges {
-        builder.with_row_ranges(row_ranges.clone());
     }
     Ok(())
 }
@@ -210,7 +205,8 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
-    /// Set inclusive row ID ranges for Data Evolution scans.
+    /// Set inclusive row ID ranges for Data Evolution scan planning.
+    /// Planned splits carry the ranges used by readers.
     fn with_row_ranges(
         mut slf: PyRefMut<'_, Self>,
         ranges: Vec<(i64, i64)>,
@@ -245,7 +241,6 @@ impl PyReadBuilder {
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
-            row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
         }
     }
@@ -273,9 +268,11 @@ impl PyTableScan {
                     &self.projection,
                     self.limit,
                     &self.filter,
-                    &self.row_ranges,
                     self.case_sensitive,
                 )?;
+                if let Some(row_ranges) = &self.row_ranges {
+                    builder.with_row_ranges(row_ranges.clone());
+                }
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
                 Ok::<_, PyErr>(plan.splits().to_vec())
             })
@@ -290,7 +287,6 @@ pub struct PyTableRead {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
-    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
 }
 
@@ -308,7 +304,6 @@ impl PyTableRead {
                     &self.projection,
                     self.limit,
                     &self.filter,
-                    &self.row_ranges,
                     self.case_sensitive,
                 )?;
                 // Validate config (e.g. projection) before the empty-splits fast

@@ -210,7 +210,7 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -399,13 +399,9 @@ impl<'a> PaimonReadBuilder<'a> {
         )
     }
 
-    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
-        self.row_ranges = if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        };
+        self.row_ranges = Some(ranges);
         self
     }
 
@@ -778,6 +774,15 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_with_empty_row_ranges_is_preserved() {
+        let table = simple_table();
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+
+        assert_eq!(paimon_builder(&builder).row_ranges, Some(Vec::new()));
     }
 
     fn dv_pk_table(table_path: &str, merge_engine: &str) -> Table {

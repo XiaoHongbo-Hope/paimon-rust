@@ -82,6 +82,15 @@ def test_with_row_ranges():
         batches = builder.new_read().read(plan.splits())
         assert pa.Table.from_batches(batches).column("id").to_pylist() == [1, 2]
 
+        restored_splits = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
+        restored_batches = builder.new_read().read(restored_splits)
+        assert pa.Table.from_batches(restored_batches).column("id").to_pylist() == [1, 2]
+
+        empty_builder = table.new_read_builder().with_row_ranges([])
+        empty_plan = empty_builder.new_scan().plan()
+        assert empty_plan.splits() == []
+        assert empty_builder.new_read().read(empty_plan.splits()) == []
+
         with pytest.raises(ValueError, match="start 2 exceeds end 1"):
             table.new_read_builder().with_row_ranges([(2, 1)])
 
