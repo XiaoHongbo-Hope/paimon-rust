@@ -1604,7 +1604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_old_mosaic_file_with_current_parquet_option_filters_like_exactly() {
+    async fn test_old_mosaic_file_with_current_parquet_option_filters_predicates_exactly() {
         let data = write_mosaic(&pk_batch(vec![1, 2, 3], vec!["apple", "banana", "apricot"]));
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/old_mosaic_current_parquet";
@@ -1664,12 +1664,30 @@ mod tests {
         let batches = builder
             .new_read()
             .unwrap()
-            .to_arrow(&[split])
+            .to_arrow(&[split.clone()])
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
         assert_eq!(collect_ids(&batches), vec![1, 3]);
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", Datum::String("banana".to_string()))
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_filter(predicate.clone());
+        builder.with_projection(&["id"]).unwrap();
+        assert!(builder.is_exact_filter_pushdown(&predicate));
+
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&batches), vec![2]);
     }
 
     fn write_multi_row_group_mosaic(batches: &[RecordBatch], stats_columns: Vec<String>) -> Bytes {

@@ -41,12 +41,13 @@ struct NormalizedFilter {
 
 /// Whether a translated predicate is exact at the table-provider boundary.
 ///
-/// Partition filters are exact through scan planning. Residual `LIKE` data
-/// predicates are exact because every physical format capable of storing their
-/// string column applies a row-level residual filter. This must not depend on
-/// the current `file.format` writer option: existing files may use an older
-/// format. Reporting them as exact lets query engines pass an unordered limit
-/// into global-index planning without retaining a second filter above the scan.
+/// Partition filters are exact through scan planning. Equality and residual
+/// `LIKE` data predicates are exact because every physical format capable of
+/// storing their column applies a row-level residual filter. This must not
+/// depend on the current `file.format` writer option: existing files may use an
+/// older format. Reporting them as exact lets query engines pass an unordered
+/// limit into global-index planning without retaining a second filter above the
+/// scan.
 fn is_exact_filter_pushdown_for_schema(
     fields: &[DataField],
     partition_keys: &[String],
@@ -63,7 +64,7 @@ fn is_exact_filter_pushdown_for_schema(
             matches!(
                 predicate,
                 Predicate::Leaf {
-                    op: PredicateOperator::Like,
+                    op: PredicateOperator::Eq | PredicateOperator::Like,
                     ..
                 }
             )
@@ -1255,6 +1256,18 @@ mod tests {
         let builder = table.new_read_builder();
 
         assert!(!builder.is_exact_filter_pushdown(&predicate));
+    }
+
+    #[test]
+    fn test_exact_filter_pushdown_is_true_for_equality_data_filter() {
+        let table = simple_table();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", crate::spec::Datum::Int(1))
+            .unwrap();
+
+        assert!(table
+            .new_read_builder()
+            .is_exact_filter_pushdown(&predicate));
     }
 
     #[test]
