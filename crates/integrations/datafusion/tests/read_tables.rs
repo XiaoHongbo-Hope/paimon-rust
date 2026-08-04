@@ -266,6 +266,7 @@ async fn test_supports_partition_filters_pushdown() {
     let partition_filter = col("dt").eq(lit("2024-01-01"));
     let mixed_and_filter = col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)));
     let data_filter = col("id").gt(lit(1));
+    let equality_filter = col("name").eq(lit("alice"));
     let like_filter = Expr::Like(Like::new(
         false,
         Box::new(col("name")),
@@ -279,6 +280,7 @@ async fn test_supports_partition_filters_pushdown() {
             &partition_filter,
             &mixed_and_filter,
             &data_filter,
+            &equality_filter,
             &like_filter,
         ])
         .expect("supports_filters_pushdown should succeed");
@@ -289,6 +291,7 @@ async fn test_supports_partition_filters_pushdown() {
             TableProviderFilterPushDown::Exact,
             TableProviderFilterPushDown::Inexact,
             TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Exact,
             TableProviderFilterPushDown::Exact,
         ]
     );
@@ -733,6 +736,30 @@ async fn test_residual_like_pushes_limit_into_paimon_planning() {
     assert_eq!(
         batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
         1
+    );
+}
+
+#[tokio::test]
+async fn test_equality_pushes_limit_into_paimon_planning() {
+    let sql = "SELECT id, name FROM paimon.default.partitioned_log_table \
+               WHERE name = 'alice' LIMIT 1";
+    let plan = create_physical_plan(sql)
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        scan_lines.iter().any(|line| line.contains("limit=1")),
+        "An exact equality filter should carry LIMIT into Paimon planning, plan:\n{plan_text}"
+    );
+
+    let batches = collect_query(sql)
+        .await
+        .expect("Equality + LIMIT query should succeed");
+    assert_eq!(
+        extract_id_name_rows(&batches),
+        vec![(1, "alice".to_string())]
     );
 }
 
