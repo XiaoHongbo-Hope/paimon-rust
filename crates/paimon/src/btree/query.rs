@@ -149,6 +149,7 @@ where
     /// Evaluate an exact point or LIKE predicate while capping the result at
     /// `limit` matching row ids. Other operators retain their normal query
     /// behavior and must not be used for global-index early-stop.
+    #[cfg(test)]
     pub(crate) async fn query_limited(
         &self,
         op: PredicateOperator,
@@ -156,16 +157,33 @@ where
         data_type: &DataType,
         limit: usize,
     ) -> io::Result<RoaringTreemap> {
+        self.query_limited_with_memory_limit(op, literals, data_type, limit, usize::MAX)
+            .await
+    }
+
+    pub(crate) async fn query_limited_with_memory_limit(
+        &self,
+        op: PredicateOperator,
+        literals: &[Datum],
+        data_type: &DataType,
+        limit: usize,
+        max_memory: usize,
+    ) -> io::Result<RoaringTreemap> {
         if op == PredicateOperator::Eq {
             let key = serialize_datum(&literals[0], data_type);
-            return self.query_equal_limited(&key, limit).await;
+            return self
+                .query_equal_limited_with_memory_limit(&key, limit, max_memory)
+                .await;
         }
         if op != PredicateOperator::Like {
             return IndexQuery::query(self, op, literals, data_type).await;
         }
         ensure_character_string(data_type, op)?;
         let pattern = string_literal(literals, op)?.to_string();
-        if let Some(candidate_matches) = self.query_preferred_like_limited(&pattern, limit).await? {
+        if let Some(candidate_matches) = self
+            .query_preferred_like_limited_with_memory_limit(&pattern, limit, max_memory)
+            .await?
+        {
             if candidate_matches.len() >= limit as u64 {
                 return Ok(candidate_matches);
             }
@@ -173,23 +191,25 @@ where
         self.scan_entries_limited(
             move |key| std::str::from_utf8(key).is_ok_and(|value| like_match(value, &pattern)),
             Some(limit),
+            Some(max_memory),
         )
         .await
     }
 
-    pub(crate) async fn query_preferred_like_limited(
+    pub(crate) async fn query_preferred_like_limited_with_memory_limit(
         &self,
         pattern: &str,
         limit: usize,
+        max_memory: usize,
     ) -> io::Result<Option<RoaringTreemap>> {
         let Some((candidate, prefix_match)) = preferred_like_candidate(pattern) else {
             return Ok(None);
         };
         let matches = if prefix_match {
-            self.query_prefix_limited(candidate.as_bytes(), limit)
+            self.query_prefix_limited_with_memory_limit(candidate.as_bytes(), limit, max_memory)
                 .await?
         } else {
-            self.query_equal_limited(candidate.as_bytes(), limit)
+            self.query_equal_limited_with_memory_limit(candidate.as_bytes(), limit, max_memory)
                 .await?
         };
         Ok(Some(matches))

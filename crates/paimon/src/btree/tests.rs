@@ -331,6 +331,18 @@ async fn test_limited_equality_caps_single_hot_key() {
         .unwrap();
 
     assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+
+    let error = reader
+        .query_limited_with_memory_limit(
+            PredicateOperator::Eq,
+            &[Datum::String("hot".to_string())],
+            &DataType::VarChar(VarCharType::string_type()),
+            3,
+            64,
+        )
+        .await
+        .expect_err("a hot-key data block over budget must not be materialized");
+    assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
 }
 
 #[tokio::test]

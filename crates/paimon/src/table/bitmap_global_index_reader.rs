@@ -20,6 +20,7 @@
 //! Reference: `org.apache.paimon.globalindex.bitmap.BitmapGlobalIndexFormat`.
 
 use crate::btree::key_serde::KeyComparator;
+use crate::btree::query::preferred_like_candidate;
 use crate::btree::var_len::{decode_var_int, decode_var_long, encode_var_int, encode_var_long};
 use crate::btree::BTreeIndexMeta;
 use crate::btree::{make_key_comparator, serialize_datum, BlockCompressionType};
@@ -253,9 +254,19 @@ pub(crate) struct BitmapGlobalIndexReader {
 }
 
 impl BitmapGlobalIndexReader {
+    #[cfg(test)]
     pub(crate) async fn open(reader: Box<dyn FileRead>, file_size: u64) -> io::Result<Self> {
+        Self::open_with_memory_limit(reader, file_size, None).await
+    }
+
+    pub(crate) async fn open_with_memory_limit(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        max_memory: Option<usize>,
+    ) -> io::Result<Self> {
         let footer = read_footer(reader.as_ref(), file_size).await?;
-        let index_block = read_compressible_block(reader.as_ref(), footer.index_block).await?;
+        let index_block =
+            read_compressible_block(reader.as_ref(), footer.index_block, max_memory).await?;
         let dictionary_blocks = read_index_block(&index_block)?;
         Ok(Self {
             reader,
@@ -400,6 +411,7 @@ impl BitmapGlobalIndexReader {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn query_limited(
         &self,
         op: PredicateOperator,
@@ -407,10 +419,22 @@ impl BitmapGlobalIndexReader {
         data_type: &DataType,
         limit: usize,
     ) -> io::Result<RoaringTreemap> {
+        self.query_limited_with_memory_limit(op, literals, data_type, limit, usize::MAX)
+            .await
+    }
+
+    pub(crate) async fn query_limited_with_memory_limit(
+        &self,
+        op: PredicateOperator,
+        literals: &[Datum],
+        data_type: &DataType,
+        limit: usize,
+        max_memory: usize,
+    ) -> io::Result<RoaringTreemap> {
         match op {
             PredicateOperator::Eq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
-                self.equal_limited(&key, data_type, limit).await
+                self.equal_limited(&key, data_type, limit, max_memory).await
             }
             PredicateOperator::Like => {
                 if !is_character_string(data_type) {
@@ -426,11 +450,28 @@ impl BitmapGlobalIndexReader {
                             .is_ok_and(|value| like_match(value, &pattern))
                     },
                     limit,
+                    max_memory,
                 )
                 .await
             }
             _ => self.query(op, literals, data_type).await,
         }
+    }
+
+    pub(crate) async fn query_preferred_like_limited_with_memory_limit(
+        &self,
+        pattern: &str,
+        data_type: &DataType,
+        limit: usize,
+        max_memory: usize,
+    ) -> io::Result<Option<RoaringTreemap>> {
+        let Some((candidate, _)) = preferred_like_candidate(pattern) else {
+            return Ok(None);
+        };
+        let key = serialize_bitmap_datum(&Datum::String(candidate), data_type);
+        self.equal_limited(&key, data_type, limit, max_memory)
+            .await
+            .map(Some)
     }
 
     pub(crate) async fn range_query(
@@ -471,10 +512,14 @@ impl BitmapGlobalIndexReader {
         key: &[u8],
         data_type: &DataType,
         limit: usize,
+        max_memory: usize,
     ) -> io::Result<RoaringTreemap> {
         let logical_cmp = make_bitmap_key_comparator(data_type);
-        match self.find_bitmap_block(key, logical_cmp.as_ref()).await? {
-            Some(block) => self.read_bitmap_limited(block, limit).await,
+        match self
+            .find_bitmap_block_limited(key, logical_cmp.as_ref(), max_memory)
+            .await?
+        {
+            Some(block) => self.read_bitmap_limited(block, limit, max_memory).await,
             None => Ok(RoaringTreemap::new()),
         }
     }
@@ -534,14 +579,18 @@ impl BitmapGlobalIndexReader {
         &self,
         predicate: impl Fn(&[u8]) -> bool,
         limit: usize,
+        max_memory: usize,
     ) -> io::Result<RoaringTreemap> {
         let mut result = RoaringTreemap::new();
         for block_meta in &self.dictionary_blocks {
-            for entry in self.read_dictionary_block(block_meta.block).await? {
+            for entry in self
+                .read_dictionary_block_with_memory_limit(block_meta.block, Some(max_memory))
+                .await?
+            {
                 if predicate(&entry.key) {
                     let remaining = limit.saturating_sub(result.len() as usize);
                     result |= self
-                        .read_bitmap_limited(entry.bitmap_block, remaining)
+                        .read_bitmap_limited(entry.bitmap_block, remaining, max_memory)
                         .await?;
                     if result.len() >= limit as u64 {
                         return Ok(result);
@@ -561,6 +610,28 @@ impl BitmapGlobalIndexReader {
             return Ok(None);
         };
         for entry in self.read_dictionary_block(block_meta.block).await? {
+            match logical_cmp(&entry.key, key) {
+                Ordering::Equal => return Ok(Some(entry.bitmap_block)),
+                Ordering::Greater => return Ok(None),
+                Ordering::Less => {}
+            }
+        }
+        Ok(None)
+    }
+
+    async fn find_bitmap_block_limited(
+        &self,
+        key: &[u8],
+        logical_cmp: &(dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync),
+        max_memory: usize,
+    ) -> io::Result<Option<BlockInfo>> {
+        let Some(block_meta) = self.find_dictionary_block_meta(key, logical_cmp) else {
+            return Ok(None);
+        };
+        for entry in self
+            .read_dictionary_block_with_memory_limit(block_meta.block, Some(max_memory))
+            .await?
+        {
             match logical_cmp(&entry.key, key) {
                 Ordering::Equal => return Ok(Some(entry.bitmap_block)),
                 Ordering::Greater => return Ok(None),
@@ -593,7 +664,16 @@ impl BitmapGlobalIndexReader {
     }
 
     async fn read_dictionary_block(&self, block: BlockInfo) -> io::Result<Vec<DictionaryEntry>> {
-        let bytes = read_compressible_block(self.reader.as_ref(), block).await?;
+        self.read_dictionary_block_with_memory_limit(block, None)
+            .await
+    }
+
+    async fn read_dictionary_block_with_memory_limit(
+        &self,
+        block: BlockInfo,
+        max_memory: Option<usize>,
+    ) -> io::Result<Vec<DictionaryEntry>> {
+        let bytes = read_compressible_block(self.reader.as_ref(), block, max_memory).await?;
         let mut cursor = Cursor::new(bytes.as_slice());
         let entry_count = decode_var_int(&mut cursor)?;
         if entry_count < 0 {
@@ -629,10 +709,12 @@ impl BitmapGlobalIndexReader {
         &self,
         block: BlockInfo,
         limit: usize,
+        max_memory: usize,
     ) -> io::Result<RoaringTreemap> {
         if limit == 0 {
             return Ok(RoaringTreemap::new());
         }
+        ensure_within_memory_limit(block.length, Some(max_memory), "bitmap block")?;
         let bytes = self
             .reader
             .read(block.offset..block.offset + block.length as u64)
@@ -735,13 +817,22 @@ fn read_index_block(bytes: &[u8]) -> io::Result<Vec<DictionaryBlockMeta>> {
     Ok(blocks)
 }
 
-async fn read_compressible_block(reader: &dyn FileRead, block: BlockInfo) -> io::Result<Vec<u8>> {
+async fn read_compressible_block(
+    reader: &dyn FileRead,
+    block: BlockInfo,
+    max_memory: Option<usize>,
+) -> io::Result<Vec<u8>> {
     if block.length > usize::MAX - BLOCK_TRAILER_LENGTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Bitmap block is too large",
         ));
     }
+    ensure_within_memory_limit(
+        block.length + BLOCK_TRAILER_LENGTH,
+        max_memory,
+        "encoded bitmap block",
+    )?;
     let bytes = reader
         .read(block.offset..block.offset + (block.length + BLOCK_TRAILER_LENGTH) as u64)
         .await
@@ -764,7 +855,15 @@ async fn read_compressible_block(reader: &dyn FileRead, block: BlockInfo) -> io:
         BlockCompressionType::None => Ok(block_bytes.to_vec()),
         BlockCompressionType::Zstd => {
             let mut cursor = Cursor::new(block_bytes);
-            let uncompressed_size = decode_var_int(&mut cursor)? as usize;
+            let uncompressed_size = decode_var_int(&mut cursor)?;
+            if uncompressed_size < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid bitmap uncompressed block size: {uncompressed_size}"),
+                ));
+            }
+            let uncompressed_size = uncompressed_size as usize;
+            ensure_within_memory_limit(uncompressed_size, max_memory, "decoded bitmap block")?;
             let compressed_start = cursor.position() as usize;
             let compressed_data = &block_bytes[compressed_start..];
             let mut decompressed = vec![0u8; uncompressed_size];
@@ -788,6 +887,20 @@ async fn read_compressible_block(reader: &dyn FileRead, block: BlockInfo) -> io:
             ),
         )),
     }
+}
+
+fn ensure_within_memory_limit(
+    size: usize,
+    max_memory: Option<usize>,
+    what: &str,
+) -> io::Result<()> {
+    if let Some(max_memory) = max_memory.filter(|max_memory| size > *max_memory) {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("{what} requires {size} bytes, exceeding the {max_memory}-byte limit"),
+        ));
+    }
+    Ok(())
 }
 
 fn compute_crc32(data: &[u8], compression_type: BlockCompressionType) -> u32 {
@@ -1182,6 +1295,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        let (_, entries) = write_and_read_entries(&data_type, &values).await;
+        let bitmap_size = entries[0].bitmap_block.length;
+        let max_memory = reader
+            .dictionary_blocks
+            .iter()
+            .map(|block| block.block.length + BLOCK_TRAILER_LENGTH)
+            .max()
+            .unwrap()
+            .max(64);
+        assert!(
+            bitmap_size > max_memory,
+            "test fixture must isolate the oversized bitmap from its dictionary block"
+        );
+        let error = reader
+            .query_limited_with_memory_limit(
+                PredicateOperator::Eq,
+                &[Datum::String("hot".to_string())],
+                &data_type,
+                3,
+                max_memory,
+            )
+            .await
+            .expect_err("an oversized bitmap block must not be materialized");
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
+const GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION: &str = "global-index.query-max-memory";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
@@ -132,6 +133,7 @@ const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
         i32_max as i64
     }
 };
+const DEFAULT_GLOBAL_INDEX_QUERY_MAX_MEMORY: i64 = 256 * 1024 * 1024;
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
@@ -683,6 +685,34 @@ impl<'a> CoreOptions<'a> {
             });
         }
         Ok(value as usize)
+    }
+
+    /// Maximum encoded or decoded index bytes materialized by one LIMIT query.
+    /// Oversized index files or blocks are handed back to the normal data scan.
+    pub fn global_index_query_max_memory(&self) -> crate::Result<usize> {
+        let value = match self.options.get(GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION}' must be a valid memory size, got: {raw}"
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_GLOBAL_INDEX_QUERY_MAX_MEMORY,
+        };
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION}' must be greater than 0, got: {value}"
+                ),
+                source: None,
+            });
+        }
+        usize::try_from(value).map_err(|_| crate::Error::DataInvalid {
+            message: format!(
+                "Option '{GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION}' is too large for this platform: {value}"
+            ),
+            source: None,
+        })
     }
 
     pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
@@ -1616,6 +1646,38 @@ mod tests {
             CoreOptions::new(&at_max).global_index_thread_num().unwrap(),
             MAX_GLOBAL_INDEX_THREAD_NUM as usize
         );
+    }
+
+    #[test]
+    fn test_global_index_query_max_memory() {
+        let empty = HashMap::new();
+        assert_eq!(
+            CoreOptions::new(&empty)
+                .global_index_query_max_memory()
+                .unwrap(),
+            256 * 1024 * 1024
+        );
+
+        let options = HashMap::from([(
+            GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION.to_string(),
+            "64 mb".to_string(),
+        )]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .global_index_query_max_memory()
+                .unwrap(),
+            64 * 1024 * 1024
+        );
+
+        for value in ["0", "-1", "bad"] {
+            let options = HashMap::from([(
+                GLOBAL_INDEX_QUERY_MAX_MEMORY_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            assert!(CoreOptions::new(&options)
+                .global_index_query_max_memory()
+                .is_err());
+        }
     }
 
     #[test]
