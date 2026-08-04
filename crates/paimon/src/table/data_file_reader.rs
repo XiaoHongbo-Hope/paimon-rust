@@ -1664,7 +1664,7 @@ mod tests {
         let batches = builder
             .new_read()
             .unwrap()
-            .to_arrow(&[split.clone()])
+            .to_arrow(std::slice::from_ref(&split))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
