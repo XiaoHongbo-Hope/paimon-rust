@@ -1105,6 +1105,27 @@ mod tests {
     }
 
     #[test]
+    fn test_translate_like_with_escaped_underscore_rewrites_to_starts_with() {
+        let fields = test_fields();
+        let filter = Expr::Like(Like::new(
+            false,
+            Box::new(Expr::Column(Column::from_name("dt"))),
+            Box::new(lit(r"lowprec\_clip%")),
+            Some('\\'),
+            false,
+        ));
+        let predicate = build_pushed_predicate(&[filter], &fields)
+            .expect("escaped LIKE prefix should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::StartsWith);
+                assert_eq!(literals, vec![Datum::String("lowprec_clip".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_translate_like_rewrites_to_ends_with() {
         let fields = test_fields();
         let predicate = build_pushed_predicate(&[like_filter("%01-01", false, false)], &fields)
