@@ -38,7 +38,7 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
-use crate::table::postpone_batch_table_write::PostponeFixedBucketWriter;
+use crate::table::postpone_batch_table_write::{PostponeBucketPlan, PostponeFixedBucketWriter};
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
@@ -132,20 +132,29 @@ pub struct TableWrite {
 
 impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
-        Self::new_inner(table, commit_user, false)
+        Self::new_inner(table, commit_user, false, None)
     }
 
     pub(crate) fn new_postpone_fixed_bucket(
         table: &Table,
         commit_user: String,
     ) -> crate::Result<Self> {
-        Self::new_inner(table, commit_user, true)
+        Self::new_inner(table, commit_user, true, None)
+    }
+
+    pub(crate) fn new_postpone_fixed_bucket_with_plan(
+        table: &Table,
+        commit_user: String,
+        bucket_plan: PostponeBucketPlan,
+    ) -> crate::Result<Self> {
+        Self::new_inner(table, commit_user, true, Some(bucket_plan))
     }
 
     fn new_inner(
         table: &Table,
         commit_user: String,
         use_postpone_fixed_bucket: bool,
+        postpone_bucket_plan: Option<PostponeBucketPlan>,
     ) -> crate::Result<Self> {
         let is_overwrite = false;
         let schema = table.schema();
@@ -319,6 +328,7 @@ impl TableWrite {
                     partition_field_indices.clone(),
                     bucket_key_indices.clone(),
                     bucket_function_type,
+                    postpone_bucket_plan,
                 )
             })
             .transpose()?;
@@ -3798,6 +3808,46 @@ mod tests {
         .unwrap()
     }
 
+    fn make_partition_bucket_plan(
+        table: &Table,
+        partitions: Vec<&str>,
+        total_buckets: Vec<i32>,
+    ) -> PostponeBucketPlan {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("pt", ArrowDataType::Utf8, false),
+                ArrowField::new("total_buckets", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(partitions)),
+                Arc::new(Int32Array::from(total_buckets)),
+            ],
+        )
+        .unwrap();
+        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+    }
+
+    #[test]
+    fn test_postpone_bucket_plan_rejects_non_positive_counts() {
+        let file_io = test_file_io();
+        let table =
+            test_postpone_partitioned_table(&file_io, "memory:/test_postpone_invalid_bucket_plan");
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("pt", ArrowDataType::Utf8, false),
+                ArrowField::new("total_buckets", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["p"])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        let error = PostponeBucketPlan::from_arrow(&table, &batch).unwrap_err();
+        assert!(error.to_string().contains("must be positive"));
+    }
+
     #[tokio::test]
     async fn test_postpone_write_and_commit() {
         let file_io = test_file_io();
@@ -3883,6 +3933,169 @@ mod tests {
             read_id_value_rows(&table).await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
         );
+    }
+
+    #[tokio::test]
+    async fn test_postpone_distributed_writers_share_bucket_plan() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_shared_bucket_plan";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+        let plan = make_partition_bucket_plan(&table, vec!["p"], vec![3]);
+
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("shared-plan-user")
+            .unwrap()
+            .with_postpone_bucket_plan(plan)
+            .unwrap();
+        let mut first = builder.new_write().unwrap();
+        let mut second = builder.new_write().unwrap();
+        first
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
+            .await
+            .unwrap();
+        second
+            .write_arrow_batch(&make_partitioned_batch_3col(
+                vec!["p", "p", "p", "p"],
+                vec![2, 3, 4, 5],
+                vec![20, 30, 40, 50],
+            ))
+            .await
+            .unwrap();
+
+        let mut messages = first.prepare_commit().await.unwrap();
+        messages.extend(second.prepare_commit().await.unwrap());
+        assert!(!messages.is_empty());
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(3)));
+        builder.new_commit().commit(messages).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_postpone_provided_plan_must_cover_input_partitions() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_incomplete_bucket_plan";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+        let plan = make_partition_bucket_plan(&table, vec!["p"], vec![2]);
+        let mut write = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_postpone_bucket_plan(plan)
+            .unwrap()
+            .new_write()
+            .unwrap();
+
+        let error = write
+            .write_arrow_batch(&make_partitioned_batch_3col(
+                vec!["missing"],
+                vec![1],
+                vec![10],
+            ))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not contain an input partition"));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_overwrite_allows_bucket_rescale() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_overwrite_bucket_rescale";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+
+        let initial_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("initial-layout")
+            .unwrap()
+            .with_postpone_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]))
+            .unwrap();
+        let mut initial_write = initial_builder.new_write().unwrap();
+        initial_write
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
+            .await
+            .unwrap();
+        initial_builder
+            .new_commit()
+            .commit(initial_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let overwrite_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("replacement-layout")
+            .unwrap()
+            .with_postpone_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![3]))
+            .unwrap()
+            .with_overwrite();
+        let mut overwrite_write = overwrite_builder.new_write().unwrap();
+        overwrite_write
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![2], vec![20]))
+            .await
+            .unwrap();
+        let messages = overwrite_write.prepare_commit().await.unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(3)));
+        overwrite_builder
+            .new_commit()
+            .overwrite(messages, None)
+            .await
+            .unwrap();
+
+        let snapshot = SnapshotManager::new(file_io, table_path.to_string())
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let entries = TableScan::new(&table, None, vec![], None, None, None)
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|entry| entry.total_buckets() == 3));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_row_target_ignores_invalid_size_target() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_row_target_precedence";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "-2")
+            .option("postpone.target-row-num-per-bucket", "2")
+            .option("postpone.target-size-per-bucket", "invalid")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_postpone_row_target_precedence"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(&table, "row-target".to_string()).unwrap();
+        write
+            .write_arrow_batch(&make_batch(vec![1, 2, 3], vec![10, 20, 30]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(2)));
     }
 
     #[tokio::test]

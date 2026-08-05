@@ -30,8 +30,125 @@ use crate::table::bucket_function::{batch_bucket_ids, validate_bucket_function};
 use crate::table::postpone_bucket::binary_row_batch_size;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Array, Int32Array, RecordBatch, UInt32Array};
 use std::collections::HashMap;
+
+/// Column name used by [`PostponeBucketPlan::from_arrow`] for bucket counts.
+pub const POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD: &str = "total_buckets";
+
+/// A shared fixed-bucket plan for distributed writers.
+///
+/// The plan must be computed from global partition statistics and supplied to
+/// every writer participating in one logical batch commit.
+#[derive(Debug, Clone)]
+pub struct PostponeBucketPlan {
+    bucket_counts: HashMap<Vec<u8>, i32>,
+}
+
+impl PostponeBucketPlan {
+    /// Build a plan from an Arrow batch containing the table's partition
+    /// columns, in partition-key order, followed by a non-null Int32
+    /// `total_buckets` column. For an unpartitioned table, the batch contains
+    /// only `total_buckets` and normally has one row.
+    pub fn from_arrow(table: &Table, batch: &RecordBatch) -> Result<Self> {
+        let partition_fields = table.schema().partition_fields();
+        let partition_count = partition_fields.len();
+        if batch.num_columns() != partition_count + 1 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Postpone bucket plan expected {} partition column(s) plus '{POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD}', got {} columns",
+                    partition_count,
+                    batch.num_columns()
+                ),
+                source: None,
+            });
+        }
+
+        let expected_partition_schema = crate::arrow::build_target_arrow_schema(&partition_fields)?;
+        let batch_schema = batch.schema();
+        for (index, expected) in expected_partition_schema.fields().iter().enumerate() {
+            let actual = batch_schema.field(index);
+            if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Postpone bucket plan partition field mismatch at index {index}: expected '{}': {:?}, got '{}': {:?}",
+                        expected.name(),
+                        expected.data_type(),
+                        actual.name(),
+                        actual.data_type()
+                    ),
+                    source: None,
+                });
+            }
+            if !expected.is_nullable() && batch.column(index).null_count() != 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Postpone bucket plan partition column '{}' is NOT NULL but contains null values",
+                        expected.name()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        let count_field = batch_schema.field(partition_count);
+        if count_field.name() != POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD
+            || count_field.data_type() != &arrow_schema::DataType::Int32
+        {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Postpone bucket plan final field must be '{POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD}': Int32, got '{}': {:?}",
+                    count_field.name(),
+                    count_field.data_type()
+                ),
+                source: None,
+            });
+        }
+        let counts = batch
+            .column(partition_count)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "Postpone bucket plan total_buckets column is not Int32".to_string(),
+                source: None,
+            })?;
+        let partition_indices = (0..partition_count).collect::<Vec<_>>();
+        let partitions = batch_to_serialized_bytes(batch, &partition_indices, &partition_fields)?;
+        let mut bucket_counts = HashMap::with_capacity(batch.num_rows());
+        for (row, partition) in partitions.into_iter().enumerate() {
+            if counts.is_null(row) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Postpone bucket plan total_buckets is null at row {row}"),
+                    source: None,
+                });
+            }
+            let total_buckets = counts.value(row);
+            if total_buckets <= 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Postpone bucket plan total_buckets must be positive at row {row}, got {total_buckets}"
+                    ),
+                    source: None,
+                });
+            }
+            if let Some(previous) = bucket_counts.insert(partition, total_buckets) {
+                if previous != total_buckets {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone bucket plan contains conflicting total bucket counts {previous} and {total_buckets} for one partition"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(Self { bucket_counts })
+    }
+
+    fn into_bucket_counts(self) -> HashMap<Vec<u8>, i32> {
+        self.bucket_counts
+    }
+}
 
 pub(super) struct PostponeBucketBatch {
     pub(super) partition: Vec<u8>,
@@ -46,7 +163,8 @@ pub(super) struct PostponeFixedBucketWriter {
     bucket_function_type: BucketFunctionType,
     max_parallelism: i32,
     target_rows_per_bucket: Option<i64>,
-    target_size_per_bucket: i64,
+    target_size_per_bucket: Option<i64>,
+    plan_provided: bool,
     metadata_loaded: bool,
     known_bucket_counts: HashMap<Vec<u8>, i32>,
     postpone_row_counts: HashMap<Vec<u8>, i64>,
@@ -62,6 +180,7 @@ impl PostponeFixedBucketWriter {
         partition_field_indices: Vec<usize>,
         bucket_key_indices: Vec<usize>,
         bucket_function_type: BucketFunctionType,
+        bucket_plan: Option<PostponeBucketPlan>,
     ) -> Result<Self> {
         let schema = table.schema();
         let options = CoreOptions::new(schema.options());
@@ -91,15 +210,27 @@ impl PostponeFixedBucketWriter {
             validate_bucket_function(bucket_function_type, &bucket_key_fields)?;
         }
 
+        let target_rows_per_bucket = options.postpone_target_row_num_per_bucket()?;
+        let target_size_per_bucket = if target_rows_per_bucket.is_none() {
+            Some(options.postpone_target_size_per_bucket()?)
+        } else {
+            None
+        };
+        let plan_provided = bucket_plan.is_some();
+        let known_bucket_counts = bucket_plan
+            .map(PostponeBucketPlan::into_bucket_counts)
+            .unwrap_or_default();
+
         Ok(Self {
             partition_field_indices,
             bucket_key_indices,
             bucket_function_type,
             max_parallelism: options.postpone_batch_write_fixed_bucket_max_parallelism()?,
-            target_rows_per_bucket: options.postpone_target_row_num_per_bucket()?,
-            target_size_per_bucket: options.postpone_target_size_per_bucket()?,
-            metadata_loaded: false,
-            known_bucket_counts: HashMap::new(),
+            target_rows_per_bucket,
+            target_size_per_bucket,
+            plan_provided,
+            metadata_loaded: plan_provided,
+            known_bucket_counts,
             postpone_row_counts: HashMap::new(),
             buffered_batches: HashMap::new(),
             bucket_counts: HashMap::new(),
@@ -142,6 +273,17 @@ impl PostponeFixedBucketWriter {
         let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         for (row, partition) in partitions.into_iter().enumerate() {
             groups.entry(partition).or_default().push(row);
+        }
+
+        if self.plan_provided
+            && groups
+                .keys()
+                .any(|partition| !self.known_bucket_counts.contains_key(partition))
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Postpone bucket plan does not contain an input partition".to_string(),
+                source: None,
+            });
         }
 
         let mut output = Vec::new();
@@ -324,13 +466,15 @@ fn infer_bucket_count(
     input_size: i64,
     postpone_rows: i64,
     target_rows_per_bucket: Option<i64>,
-    target_size_per_bucket: i64,
+    target_size_per_bucket: Option<i64>,
     max_parallelism: i32,
 ) -> i32 {
     let buckets = if let Some(target_rows) = target_rows_per_bucket {
         let total_rows = input_rows.saturating_add(postpone_rows);
         total_rows.saturating_add(target_rows - 1) / target_rows
     } else {
+        let target_size_per_bucket = target_size_per_bucket
+            .expect("size target is validated when row-count target is absent");
         let estimated_size = if postpone_rows > 0 && input_rows > 0 {
             let numerator = i128::from(input_size)
                 .saturating_mul(i128::from(input_rows.saturating_add(postpone_rows)));

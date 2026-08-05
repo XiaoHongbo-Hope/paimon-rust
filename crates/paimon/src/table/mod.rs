@@ -122,6 +122,9 @@ pub use incremental_scan::{
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use partition_stat::PartitionStat;
+pub use postpone_batch_table_write::{
+    PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD,
+};
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;

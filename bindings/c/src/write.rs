@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow_array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
-use paimon::table::Table;
+use paimon::table::{PostponeBucketPlan, Table};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
@@ -76,6 +76,7 @@ unsafe fn new_write_builder(
         commit_user,
         overwrite: false,
         postpone_fixed_bucket,
+        postpone_bucket_plan: None,
     };
     let inner = Box::into_raw(Box::new(state)) as *mut c_void;
     paimon_result_write_builder {
@@ -194,6 +195,54 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
     ptr::null_mut()
 }
 
+/// Supply a shared bucket plan for distributed postpone fixed-bucket writers.
+///
+/// The Arrow batch must contain the table's partition columns in partition-key
+/// order followed by a non-null Int32 column named `total_buckets`. For an
+/// unpartitioned table, only the `total_buckets` column is present. Ownership
+/// of the Arrow C Data structs is transferred to this function.
+///
+/// Every writer whose commit messages will be merged must receive the same
+/// plan, and the plan must contain every partition written by those writers.
+///
+/// # Safety
+/// `wb` must be an explicit postpone fixed-bucket builder. `array` and
+/// `schema` must point to initialized Arrow C Data structs.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
+    wb: *mut paimon_write_builder,
+    array: *mut c_void,
+    schema: *mut c_void,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(wb, "wb") {
+        return error;
+    }
+    if let Err(error) = check_non_null(array, "array") {
+        return error;
+    }
+    if let Err(error) = check_non_null(schema, "schema") {
+        return error;
+    }
+    let state = &mut *((*wb).inner as *mut WriteBuilderState);
+    if !state.postpone_fixed_bucket {
+        return invalid_input(
+            "a postpone bucket plan requires an explicit postpone fixed-bucket write builder",
+        );
+    }
+
+    let batch = match import_record_batch(array, schema) {
+        Ok(batch) => batch,
+        Err(error) => return error,
+    };
+    match PostponeBucketPlan::from_arrow(&state.table, &batch) {
+        Ok(plan) => {
+            state.postpone_bucket_plan = Some(plan);
+            ptr::null_mut()
+        }
+        Err(error) => paimon_error::from_paimon(error),
+    }
+}
+
 // ======================= TableWrite ===============================
 
 fn invalid_input(message: impl Into<String>) -> *mut paimon_error {
@@ -301,16 +350,20 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
     } else {
         Ok(state.table.new_write_builder())
     };
-    let mut builder =
-        match builder.and_then(|builder| builder.with_commit_user(state.commit_user.clone())) {
-            Ok(b) => b,
-            Err(e) => {
-                return paimon_result_table_write {
-                    write: ptr::null_mut(),
-                    error: paimon_error::from_paimon(e),
-                }
+    let mut builder = match builder
+        .and_then(|builder| builder.with_commit_user(state.commit_user.clone()))
+        .and_then(|builder| match state.postpone_bucket_plan.clone() {
+            Some(plan) => builder.with_postpone_bucket_plan(plan),
+            None => Ok(builder),
+        }) {
+        Ok(b) => b,
+        Err(e) => {
+            return paimon_result_table_write {
+                write: ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
             }
-        };
+        }
+    };
 
     if state.overwrite {
         builder = builder.with_overwrite();
@@ -845,6 +898,11 @@ const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_tabl
     paimon_write_builder_new_write;
 const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_table_commit =
     paimon_write_builder_new_commit;
+const _: unsafe extern "C" fn(
+    *mut paimon_write_builder,
+    *mut c_void,
+    *mut c_void,
+) -> *mut paimon_error = paimon_write_builder_with_postpone_bucket_plan;
 const _: unsafe extern "C" fn(*mut paimon_table_write) -> paimon_result_prepare_commit =
     paimon_table_write_prepare_commit;
 const _: unsafe extern "C" fn(

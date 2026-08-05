@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
-use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
+use paimon::table::{CommitMessage, PostponeBucketPlan, Table, TableCommit, TableWrite};
 
 /// C-compatible key-value pair for options.
 #[repr(C)]
@@ -211,6 +211,7 @@ pub(crate) struct WriteBuilderState {
     pub commit_user: String,
     pub overwrite: bool,
     pub postpone_fixed_bucket: bool,
+    pub postpone_bucket_plan: Option<PostponeBucketPlan>,
 }
 
 pub(crate) struct TableWriteState {

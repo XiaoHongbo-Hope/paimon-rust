@@ -84,6 +84,19 @@ fn postpone_table_schema() -> TableSchema {
     TableSchema::new(0, &schema)
 }
 
+fn partitioned_postpone_table_schema() -> TableSchema {
+    let schema = Schema::builder()
+        .column("pt", DataType::VarChar(VarCharType::string_type()))
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["pt", "id"])
+        .partition_keys(["pt"])
+        .option("bucket", "-2")
+        .build()
+        .unwrap();
+    TableSchema::new(0, &schema)
+}
+
 unsafe fn wrap_table(table: Table) -> *mut paimon_table {
     let inner = Box::into_raw(Box::new(table)) as *mut c_void;
     Box::into_raw(Box::new(paimon_table { inner }))
@@ -110,6 +123,38 @@ fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
         vec![
             Arc::new(Int32Array::from(ids)),
             Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
+fn make_partitioned_write_batch(pts: Vec<&str>, ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("pt", ArrowDataType::Utf8, false),
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(pts)),
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
+fn make_postpone_bucket_plan_batch(partitions: Vec<&str>, counts: Vec<i32>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("pt", ArrowDataType::Utf8, false),
+        ArrowField::new("total_buckets", ArrowDataType::Int32, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(partitions)),
+            Arc::new(Int32Array::from(counts)),
         ],
     )
     .unwrap()
@@ -1495,6 +1540,90 @@ fn test_commit_messages_merge_preserves_all_writer_files() {
 }
 
 #[test]
+fn test_distributed_postpone_writers_share_bucket_plan() {
+    let path = "memory:/test_distributed_postpone_bucket_plan";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("distributed-postpone-job").unwrap();
+
+    unsafe {
+        let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        let wb2 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+
+        for wb in [wb1, wb2] {
+            let (array, schema) =
+                export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![3]));
+            let error = paimon_write_builder_with_postpone_bucket_plan(
+                wb,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(error.is_null());
+        }
+
+        let tw1 = paimon_write_builder_new_write(wb1).write;
+        let tw2 = paimon_write_builder_new_write(wb2).write;
+        for (tw, ids, names) in [
+            (tw1, vec![1], vec!["a"]),
+            (tw2, vec![2, 3, 4, 5], vec!["b", "c", "d", "e"]),
+        ] {
+            let (array, schema) = export_batch_to_ffi(make_partitioned_write_batch(
+                vec!["p"; ids.len()],
+                ids,
+                names,
+            ));
+            let error = paimon_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(error.is_null());
+        }
+
+        let messages1 = paimon_table_write_prepare_commit(tw1).messages;
+        let messages2 = paimon_table_write_prepare_commit(tw2).messages;
+        for messages in [messages1, messages2] {
+            let state = &*((*messages).inner as *const CommitMessagesState);
+            assert!(!state.messages.is_empty());
+            assert!(state
+                .messages
+                .iter()
+                .all(|message| message.total_buckets == Some(3)));
+        }
+        let error = paimon_commit_messages_merge(messages1, messages2);
+        assert!(error.is_null());
+        let commit = paimon_write_builder_new_commit(wb1).commit;
+        let error = paimon_table_commit_commit(commit, messages1);
+        assert!(error.is_null());
+
+        paimon_table_commit_free(commit);
+        paimon_commit_messages_free(messages2);
+        paimon_commit_messages_free(messages1);
+        paimon_table_write_free(tw2);
+        paimon_table_write_free(tw1);
+        paimon_write_builder_free(wb2);
+        paimon_write_builder_free(wb1);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_write_multiple_batches() {
     let path = "memory:/test_write_multi_batch";
     let file_io = memory_file_io();
@@ -1787,6 +1916,14 @@ fn test_null_pointer_handling() {
         assert!(!result.error.is_null());
         assert!(result.commit.is_null());
         paimon_error_free(result.error);
+
+        let err = paimon_write_builder_with_postpone_bucket_plan(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        assert!(!err.is_null());
+        paimon_error_free(err);
 
         let err =
             paimon_table_write_write_arrow_batch(ptr::null_mut(), ptr::null_mut(), ptr::null_mut());

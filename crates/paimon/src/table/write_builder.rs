@@ -20,7 +20,9 @@
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
 use super::format_write_builder::FormatWriteBuilder;
-use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
+use crate::table::{
+    DataEvolutionDeleteWriter, PostponeBucketPlan, Table, TableCommit, TableUpdate, TableWrite,
+};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -92,6 +94,19 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
+    /// Supply a bucket plan shared by all distributed postpone writers in one
+    /// logical batch. The plan must cover every input partition.
+    pub fn with_postpone_bucket_plan(self, bucket_plan: PostponeBucketPlan) -> crate::Result<Self> {
+        match self.0 {
+            WriteBuilderKind::Paimon(builder) => Ok(Self(WriteBuilderKind::Paimon(
+                builder.with_postpone_bucket_plan(bucket_plan)?,
+            ))),
+            WriteBuilderKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Postpone bucket plans are only supported for Paimon tables".to_string(),
+            }),
+        }
+    }
+
     /// Create a new TableCommit for committing write results.
     pub fn new_commit(&self) -> TableCommit {
         match &self.0 {
@@ -138,6 +153,7 @@ struct PaimonWriteBuilder<'a> {
     commit_user: String,
     overwrite: bool,
     postpone_fixed_bucket: bool,
+    postpone_bucket_plan: Option<PostponeBucketPlan>,
 }
 
 impl<'a> PaimonWriteBuilder<'a> {
@@ -147,12 +163,24 @@ impl<'a> PaimonWriteBuilder<'a> {
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
             postpone_fixed_bucket: false,
+            postpone_bucket_plan: None,
         }
     }
 
     fn with_postpone_fixed_bucket(mut self) -> Self {
         self.postpone_fixed_bucket = true;
         self
+    }
+
+    fn with_postpone_bucket_plan(mut self, bucket_plan: PostponeBucketPlan) -> crate::Result<Self> {
+        if !self.postpone_fixed_bucket {
+            return Err(crate::Error::Unsupported {
+                message: "A postpone bucket plan requires an explicit postpone fixed-bucket write builder"
+                    .to_string(),
+            });
+        }
+        self.postpone_bucket_plan = Some(bucket_plan);
+        Ok(self)
     }
 
     /// Get the commit user shared by writers and committers created by this builder.
@@ -223,7 +251,16 @@ impl<'a> PaimonWriteBuilder<'a> {
             });
         }
         let write = if self.postpone_fixed_bucket {
-            TableWrite::new_postpone_fixed_bucket(self.table, self.commit_user.clone())?
+            match self.postpone_bucket_plan.clone() {
+                Some(bucket_plan) => TableWrite::new_postpone_fixed_bucket_with_plan(
+                    self.table,
+                    self.commit_user.clone(),
+                    bucket_plan,
+                )?,
+                None => {
+                    TableWrite::new_postpone_fixed_bucket(self.table, self.commit_user.clone())?
+                }
+            }
         } else {
             TableWrite::new(self.table, self.commit_user.clone())?
         };

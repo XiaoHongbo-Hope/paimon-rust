@@ -1857,7 +1857,20 @@ impl TableCommit {
         check_from_snapshot: Option<i64>,
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
-        self.check_total_bucket_conflicts(base_entries, delta_entries)?;
+
+        // Validate every file produced by this commit before merging entries.
+        // This catches inconsistent duplicate ADDs even when they describe the
+        // same file and would otherwise collapse during merge_active_entries.
+        self.check_total_bucket_conflicts(delta_entries)?;
+
+        // Check the final active layout rather than raw base + delta entries.
+        // In an overwrite, DELETE-old followed by ADD-new is a valid bucket
+        // rescale; concurrent APPENDs with incompatible counts remain active
+        // together and are still rejected.
+        let mut all_entries = base_entries.to_vec();
+        all_entries.extend(delta_entries.iter().cloned());
+        let merged_entries = merge_active_entries(all_entries);
+        self.check_total_bucket_conflicts(&merged_entries)?;
 
         if !self.data_evolution_enabled {
             return Ok(());
@@ -1866,22 +1879,15 @@ impl TableCommit {
         let next_row_id = latest_snapshot.and_then(Snapshot::next_row_id);
         self.check_row_id_existence(base_entries, delta_entries, next_row_id)?;
 
-        let mut all_entries = base_entries.to_vec();
-        all_entries.extend(delta_entries.iter().cloned());
-        let merged_entries = merge_active_entries(all_entries);
         self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
         self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
             .await
     }
 
-    fn check_total_bucket_conflicts(
-        &self,
-        base_entries: &[ManifestEntry],
-        delta_entries: &[ManifestEntry],
-    ) -> Result<()> {
+    fn check_total_bucket_conflicts(&self, entries: &[ManifestEntry]) -> Result<()> {
         let mut bucket_counts: HashMap<Vec<u8>, i32> = HashMap::new();
-        for entry in base_entries.iter().chain(delta_entries) {
-            if entry.bucket() < 0 || entry.total_buckets() <= 0 {
+        for entry in entries {
+            if *entry.kind() != FileKind::Add || entry.bucket() < 0 || entry.total_buckets() <= 0 {
                 continue;
             }
             let partition = entry.partition().to_vec();
