@@ -37,7 +37,7 @@ use crate::types::*;
 unsafe fn new_write_builder(
     table: *const paimon_table,
     commit_user: Option<String>,
-    postpone_fixed_bucket: bool,
+    force_postpone_fixed_bucket: bool,
 ) -> paimon_result_write_builder {
     if let Err(e) = check_non_null(table, "table") {
         return paimon_result_write_builder {
@@ -46,7 +46,7 @@ unsafe fn new_write_builder(
         };
     }
     let table_ref = &*((*table).inner as *const Table);
-    let builder = if postpone_fixed_bucket {
+    let builder = if force_postpone_fixed_bucket {
         match table_ref.new_postpone_fixed_bucket_write_builder() {
             Ok(builder) => builder,
             Err(e) => {
@@ -59,6 +59,7 @@ unsafe fn new_write_builder(
     } else {
         table_ref.new_write_builder()
     };
+    let postpone_fixed_bucket = builder.uses_postpone_fixed_bucket();
     let commit_user = match commit_user {
         Some(commit_user) => match builder.with_commit_user(commit_user) {
             Ok(builder) => builder.commit_user().to_string(),
@@ -100,11 +101,8 @@ pub unsafe extern "C" fn paimon_table_new_write_builder(
     new_write_builder(table, None, false)
 }
 
-/// Create an explicit one-shot fixed-bucket WriteBuilder for a postpone table.
-///
-/// Normal write builders retain `bucket = -2` postpone semantics. Use this
-/// entry point when the batch must be routed to immediately visible real
-/// buckets.
+/// Create a WriteBuilder which forces one-shot fixed-bucket writes for a
+/// postpone table, even when `postpone.batch-write-fixed-bucket=false`.
 ///
 /// # Safety
 /// `table` must be a valid table pointer, or null (returns error).
@@ -206,8 +204,9 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
 /// plan, and the plan must contain every partition written by those writers.
 ///
 /// # Safety
-/// `wb` must be an explicit postpone fixed-bucket builder. `array` and
-/// `schema` must point to initialized Arrow C Data structs.
+/// `wb` must select postpone fixed-bucket mode through table configuration or
+/// an explicit fixed-bucket constructor. `array` and `schema` must point to
+/// initialized Arrow C Data structs.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
     wb: *mut paimon_write_builder,
@@ -226,7 +225,7 @@ pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
     let state = &mut *((*wb).inner as *mut WriteBuilderState);
     if !state.postpone_fixed_bucket {
         return invalid_input(
-            "a postpone bucket plan requires an explicit postpone fixed-bucket write builder",
+            "a postpone bucket plan requires a postpone fixed-bucket write builder",
         );
     }
 

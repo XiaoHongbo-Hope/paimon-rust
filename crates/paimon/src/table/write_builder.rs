@@ -20,6 +20,7 @@
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
 use super::format_write_builder::FormatWriteBuilder;
+use crate::spec::{CoreOptions, POSTPONE_BUCKET};
 use crate::table::{
     DataEvolutionDeleteWriter, PostponeBucketPlan, Table, TableCommit, TableUpdate, TableWrite,
 };
@@ -45,11 +46,8 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
-    /// Create a builder for one-shot fixed-bucket writes to a postpone table.
-    ///
-    /// Unlike [`WriteBuilder::new`], writers created by this builder plan real
-    /// buckets for `bucket = -2` tables. Keeping this mode explicit prevents a
-    /// normal batch writer from silently changing postpone-write semantics.
+    /// Create a builder which forces one-shot fixed-bucket writes for a
+    /// postpone table, even when `postpone.batch-write-fixed-bucket=false`.
     pub fn new_postpone_fixed_bucket(table: &'a Table) -> crate::Result<Self> {
         if table.is_format_table() {
             return Err(crate::Error::Unsupported {
@@ -67,6 +65,15 @@ impl<'a> WriteBuilder<'a> {
         match &self.0 {
             WriteBuilderKind::Paimon(builder) => builder.commit_user(),
             WriteBuilderKind::Format(builder) => builder.commit_user(),
+        }
+    }
+
+    /// Whether writers created by this builder use the postpone fixed-bucket
+    /// batch path.
+    pub fn uses_postpone_fixed_bucket(&self) -> bool {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.postpone_fixed_bucket,
+            WriteBuilderKind::Format(_) => false,
         }
     }
 
@@ -158,11 +165,16 @@ struct PaimonWriteBuilder<'a> {
 
 impl<'a> PaimonWriteBuilder<'a> {
     pub fn new(table: &'a Table) -> Self {
+        let schema = table.schema();
+        let options = CoreOptions::new(schema.options());
+        let postpone_fixed_bucket = options.bucket() == POSTPONE_BUCKET
+            && !schema.primary_keys().is_empty()
+            && options.postpone_batch_write_fixed_bucket();
         Self {
             table,
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
-            postpone_fixed_bucket: false,
+            postpone_fixed_bucket,
             postpone_bucket_plan: None,
         }
     }
@@ -316,6 +328,7 @@ mod tests {
     };
     use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn test_file_io() -> FileIO {
@@ -460,7 +473,13 @@ mod tests {
         let table_path = "memory:/test_write_builder_commit_user";
         setup_dirs(&file_io, table_path).await;
 
-        let table = test_postpone_pk_table(&file_io, table_path);
+        // Keep this test on the legacy postpone writer because its file-name
+        // contract embeds commit_user; fixed-bucket files use regular names.
+        let table =
+            test_postpone_pk_table(&file_io, table_path).copy_with_options(HashMap::from([(
+                "postpone.batch-write-fixed-bucket".to_string(),
+                "false".to_string(),
+            )]));
         let wb = table
             .new_write_builder()
             .with_commit_user("my-commit-user")
@@ -475,6 +494,7 @@ mod tests {
 
         let messages = write.prepare_commit().await.unwrap();
         assert_eq!(messages[0].bucket, POSTPONE_BUCKET);
+        assert_eq!(messages[0].total_buckets, None);
         assert!(
             messages[0].new_files[0]
                 .file_name
@@ -496,30 +516,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_postpone_fixed_bucket_builder_is_explicit() {
+    async fn test_postpone_fixed_bucket_builder_respects_option() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_explicit_postpone_fixed_bucket_builder";
+        let table_path = "memory:/test_postpone_fixed_bucket_builder_option";
         setup_dirs(&file_io, table_path).await;
         let table = test_postpone_pk_table(&file_io, table_path);
 
-        let mut normal = table.new_write_builder().new_write().unwrap();
-        normal
+        let mut default_write = table.new_write_builder().new_write().unwrap();
+        default_write
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await
             .unwrap();
-        let normal_messages = normal.prepare_commit().await.unwrap();
-        assert_eq!(normal_messages.len(), 1);
-        assert_eq!(normal_messages[0].bucket, POSTPONE_BUCKET);
-        assert_eq!(normal_messages[0].total_buckets, None);
+        let default_messages = default_write.prepare_commit().await.unwrap();
+        assert_eq!(default_messages.len(), 1);
+        assert_eq!(default_messages[0].bucket, 0);
+        assert_eq!(default_messages[0].total_buckets, Some(1));
 
-        let builder = table
+        let legacy_table = table.copy_with_options(HashMap::from([(
+            "postpone.batch-write-fixed-bucket".to_string(),
+            "false".to_string(),
+        )]));
+        let mut legacy_write = legacy_table.new_write_builder().new_write().unwrap();
+        legacy_write
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .await
+            .unwrap();
+        let legacy_messages = legacy_write.prepare_commit().await.unwrap();
+        assert_eq!(legacy_messages.len(), 1);
+        assert_eq!(legacy_messages[0].bucket, POSTPONE_BUCKET);
+        assert_eq!(legacy_messages[0].total_buckets, None);
+
+        let builder = legacy_table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
             .with_commit_user("explicit-fixed-user")
             .unwrap();
         let mut fixed = builder.new_write().unwrap();
         fixed
-            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .write_arrow_batch(&make_batch(vec![3], vec![30]))
             .await
             .unwrap();
         let fixed_messages = fixed.prepare_commit().await.unwrap();

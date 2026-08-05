@@ -1941,9 +1941,9 @@ async fn test_pk_first_row_insert_overwrite() {
 
 // ======================= Postpone Bucket (bucket = -2) =======================
 
-/// Postpone bucket files are invisible to normal SELECT but visible via scan_all_files.
+/// Batch writes use real fixed buckets by default and are immediately visible.
 #[tokio::test]
-async fn test_postpone_write_invisible_to_select() {
+async fn test_postpone_batch_write_uses_visible_fixed_bucket() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
     sql_context
@@ -1970,7 +1970,7 @@ async fn test_postpone_write_invisible_to_select() {
         .await
         .unwrap();
 
-    // scan_all_files should find the postpone file
+    // The default batch path must write a real bucket rather than bucket -2.
     let table = catalog
         .get_table(&Identifier::new("test_db", "t_postpone"))
         .await
@@ -1983,11 +1983,68 @@ async fn test_postpone_write_invisible_to_select() {
         .await
         .unwrap();
     let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
-    assert_eq!(file_count, 1, "scan_all_files should find 1 postpone file");
+    assert_eq!(
+        file_count, 1,
+        "scan_all_files should find 1 fixed-bucket file"
+    );
+    assert!(plan.splits().iter().all(|split| split.bucket() >= 0));
 
-    // Normal SELECT should return 0 rows (postpone files are invisible)
+    // Real buckets are visible to the normal read path immediately.
     let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t_postpone").await;
-    assert_eq!(count, 0, "SELECT should return 0 rows for postpone table");
+    assert_eq!(count, 3);
+}
+
+/// The compatibility switch retains legacy invisible bucket -2 writes.
+#[tokio::test]
+async fn test_postpone_fixed_bucket_write_can_be_disabled() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA failed");
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_postpone_legacy (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '-2',
+                'postpone.batch-write-fixed-bucket' = 'false'
+            )",
+        )
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_postpone_legacy VALUES (1, 10)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_postpone_legacy"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    assert_eq!(plan.splits().len(), 1);
+    assert_eq!(plan.splits()[0].bucket(), -2);
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.t_postpone_legacy",
+        )
+        .await,
+        0
+    );
 }
 
 /// INSERT OVERWRITE on a postpone table should replace old files with new ones.
@@ -2031,7 +2088,7 @@ async fn test_postpone_insert_overwrite() {
         .await
         .unwrap();
     let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
-    assert_eq!(file_count, 1, "After INSERT: 1 postpone file");
+    assert_eq!(file_count, 1, "After INSERT: 1 fixed-bucket file");
 
     // INSERT OVERWRITE should replace old file
     sql_context

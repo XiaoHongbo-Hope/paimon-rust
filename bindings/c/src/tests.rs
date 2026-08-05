@@ -84,6 +84,18 @@ fn postpone_table_schema() -> TableSchema {
     TableSchema::new(0, &schema)
 }
 
+fn legacy_postpone_table_schema() -> TableSchema {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["id"])
+        .option("bucket", "-2")
+        .option("postpone.batch-write-fixed-bucket", "false")
+        .build()
+        .unwrap();
+    TableSchema::new(0, &schema)
+}
+
 fn partitioned_postpone_table_schema() -> TableSchema {
     let schema = Schema::builder()
         .column("pt", DataType::VarChar(VarCharType::string_type()))
@@ -1007,8 +1019,8 @@ fn test_write_new_builder_and_free() {
 }
 
 #[test]
-fn test_postpone_fixed_bucket_builder_is_explicit() {
-    let path = "memory:/test_explicit_postpone_fixed_bucket_builder";
+fn test_postpone_fixed_bucket_builder_respects_option() {
+    let path = "memory:/test_postpone_fixed_bucket_builder_option";
     let file_io = memory_file_io();
     setup_table_dirs(&file_io, path);
     let table = Table::new(
@@ -1024,7 +1036,27 @@ fn test_postpone_fixed_bucket_builder_is_explicit() {
         let normal = paimon_table_new_write_builder(handle);
         assert!(normal.error.is_null());
         let normal_state = &*((*normal.write_builder).inner as *const WriteBuilderState);
-        assert!(!normal_state.postpone_fixed_bucket);
+        assert!(normal_state.postpone_fixed_bucket);
+
+        let write = paimon_write_builder_new_write(normal.write_builder);
+        assert!(write.error.is_null());
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+        let error = paimon_table_write_write_arrow_batch(
+            write.write,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(error.is_null());
+        let prepared = paimon_table_write_prepare_commit(write.write);
+        assert!(prepared.error.is_null());
+        let messages = &*((*prepared.messages).inner as *const CommitMessagesState);
+        assert!(messages.messages.iter().all(|message| message.bucket >= 0));
+        assert!(messages
+            .messages
+            .iter()
+            .all(|message| message.total_buckets == Some(1)));
+        paimon_commit_messages_free(prepared.messages);
+        paimon_table_write_free(write.write);
         paimon_write_builder_free(normal.write_builder);
 
         let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle);
@@ -1044,6 +1076,32 @@ fn test_postpone_fixed_bucket_builder_is_explicit() {
         assert_eq!(fixed_state.commit_user, "fixed-user");
         paimon_write_builder_free(fixed.write_builder);
         unwrap_table(handle);
+    }
+
+    let legacy_path = "memory:/test_legacy_postpone_builder_option";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, legacy_path);
+    let legacy_table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        legacy_path.to_string(),
+        legacy_postpone_table_schema(),
+        None,
+    );
+    let legacy_handle = unsafe { wrap_table(legacy_table) };
+    unsafe {
+        let normal = paimon_table_new_write_builder(legacy_handle);
+        assert!(normal.error.is_null());
+        let normal_state = &*((*normal.write_builder).inner as *const WriteBuilderState);
+        assert!(!normal_state.postpone_fixed_bucket);
+        paimon_write_builder_free(normal.write_builder);
+
+        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(legacy_handle);
+        assert!(fixed.error.is_null());
+        let fixed_state = &*((*fixed.write_builder).inner as *const WriteBuilderState);
+        assert!(fixed_state.postpone_fixed_bucket);
+        paimon_write_builder_free(fixed.write_builder);
+        unwrap_table(legacy_handle);
     }
 }
 

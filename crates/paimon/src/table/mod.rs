@@ -364,10 +364,8 @@ impl Table {
         WriteBuilder::new(self)
     }
 
-    /// Create an explicit one-shot fixed-bucket writer for a postpone table.
-    ///
-    /// Normal write builders retain postpone-bucket semantics. Callers which
-    /// want immediately visible real buckets must opt in through this builder.
+    /// Create a writer which forces one-shot fixed-bucket writes for a
+    /// postpone table, even when `postpone.batch-write-fixed-bucket=false`.
     pub fn new_postpone_fixed_bucket_write_builder(&self) -> Result<WriteBuilder<'_>> {
         WriteBuilder::new_postpone_fixed_bucket(self)
     }
