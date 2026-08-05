@@ -821,9 +821,7 @@ mod tests {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["100\\%%", "\\"]);
             let pred = dict_to_predicate(&dict, &fields, true).unwrap();
-            // Escaped-wildcard patterns are not rewritten by the core's LIKE
-            // optimization; they stay as a residual Like leaf.
-            expect_leaf_op(&pred, PredicateOperator::Like);
+            expect_leaf_op(&pred, PredicateOperator::StartsWith);
         });
     }
 

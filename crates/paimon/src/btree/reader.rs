@@ -32,12 +32,14 @@ use crate::io::FileRead;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io::{self, Cursor};
+use tokio::sync::OnceCell;
 
 /// BTree index reader with on-demand async data block loading.
 pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
     reader: Box<dyn FileRead>,
     sst_reader: SstFileReader,
-    null_bitmap: RoaringTreemap,
+    null_bitmap_handle: Option<BlockHandle>,
+    null_bitmap: OnceCell<RoaringTreemap>,
     min_key: Option<Vec<u8>>,
     max_key: Option<Vec<u8>>,
     key_comparator: F,
@@ -45,7 +47,8 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
     /// Open a BTree index reader from a FileRead and file metadata.
-    /// Only reads footer, index block, and null bitmap on open.
+    /// Only reads the footer and index block on open. The null bitmap is loaded
+    /// lazily because most predicates never use it.
     /// Data blocks are read on demand during queries.
     pub async fn open(
         reader: Box<dyn FileRead>,
@@ -78,16 +81,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         let index_block = read_block_from_bytes(&index_bytes, idx.size)?;
         let sst_reader = SstFileReader::from_index_block(index_block);
 
-        // 3. Read null bitmap
-        let null_bitmap = match &footer.null_bitmap_handle {
-            Some(h) => read_null_bitmap(reader.as_ref(), h).await?,
-            None => RoaringTreemap::new(),
-        };
-
         Ok(Self {
             reader,
             sst_reader,
-            null_bitmap,
+            null_bitmap_handle: footer.null_bitmap_handle,
+            null_bitmap: OnceCell::new(),
             min_key: meta.first_key.clone(),
             max_key: meta.last_key.clone(),
             key_comparator,
@@ -95,8 +93,15 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
     }
 
     /// Get the null bitmap (row ids of null keys).
-    pub fn null_bitmap(&self) -> &RoaringTreemap {
-        &self.null_bitmap
+    pub async fn null_bitmap(&self) -> io::Result<&RoaringTreemap> {
+        self.null_bitmap
+            .get_or_try_init(|| async {
+                match &self.null_bitmap_handle {
+                    Some(handle) => read_null_bitmap(self.reader.as_ref(), handle).await,
+                    None => Ok(RoaringTreemap::new()),
+                }
+            })
+            .await
     }
 
     /// Collect all non-null row ids into a bitmap.

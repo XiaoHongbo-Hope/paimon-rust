@@ -175,10 +175,116 @@ async fn read_all_manifest_entries(
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
     let shared_cache = SharedSchemaCache::new();
-    let (all_entries, mut counters) = futures::stream::iter(manifest_files)
+
+    // Mirror Java AbstractFileStoreScan#readAndMergeFileEntries: collect only
+    // DELETE identifiers first, then decode and retain live ADD entries. The
+    // previous one-pass implementation retained the complete DataFileMeta for
+    // every ADD and DELETE until all manifests had been read, which makes scan
+    // planning peak memory proportional to the full manifest history rather
+    // than the live file set.
+    let delete_manifest_files = manifest_files
+        .iter()
+        .filter(|meta| meta.num_deleted_files() > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (deleted_entries, delete_counters) = futures::stream::iter(delete_manifest_files)
         .map(|meta| {
             let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
             let cache = shared_cache.clone();
+            async move {
+                let input_file = file_io.new_input(&path)?;
+                let content = input_file.read().await?;
+                let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                let mut counters = ManifestReadCounters::default();
+                let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
+                    &content,
+                    &cache,
+                    &mut |kind, partition_bytes, bucket, total_buckets| {
+                        if kind != FileKind::Delete {
+                            return false;
+                        }
+                        counters.entries_read += 1;
+                        if has_primary_keys && !scan_all_files && bucket < 0 {
+                            counters.pruned_by_bucket += 1;
+                            return false;
+                        }
+                        if let Some(pred) = bucket_predicate {
+                            let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
+                                compute_target_buckets(
+                                    pred,
+                                    bucket_key_fields,
+                                    bucket_function_type,
+                                    total_buckets,
+                                )
+                            });
+                            if targets
+                                .as_ref()
+                                .is_some_and(|targets| !targets.contains(&bucket))
+                            {
+                                counters.pruned_by_bucket += 1;
+                                return false;
+                            }
+                        }
+                        if let Some(pf) = partition_filter {
+                            if matches!(pf.matches_entry(partition_bytes), Ok(false)) {
+                                counters.pruned_by_partition += 1;
+                                return false;
+                            }
+                        }
+                        counters.after_entry_pruning += 1;
+                        true
+                    },
+                )?;
+
+                let mut deleted = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if skip_level_zero && has_primary_keys && entry.file().level == 0 {
+                        counters.pruned_by_level += 1;
+                        continue;
+                    }
+                    if row_range_index.is_some_and(|index| {
+                        !data_file_overlaps_row_range_index(entry.file(), index)
+                    }) {
+                        counters.pruned_by_row_ranges += 1;
+                        continue;
+                    }
+                    if !data_predicates.is_empty()
+                        && !data_file_matches_predicates(
+                            entry.file(),
+                            data_predicates,
+                            current_schema_id,
+                            schema_fields,
+                        )
+                    {
+                        counters.pruned_by_data_stats += 1;
+                        continue;
+                    }
+                    counters.after_manifest_filters += 1;
+                    deleted.push(entry.into_identifier());
+                }
+                Ok::<_, crate::Error>((deleted, counters))
+            }
+        })
+        .buffered(64)
+        .try_fold(
+            (HashSet::new(), ManifestReadCounters::default()),
+            |(mut deleted, mut counters), (identifiers, manifest_counters)| async move {
+                deleted.extend(identifiers);
+                counters.merge(manifest_counters);
+                Ok((deleted, counters))
+            },
+        )
+        .await?;
+
+    let add_manifest_files = manifest_files
+        .into_iter()
+        .filter(|meta| meta.num_added_files() > 0)
+        .collect::<Vec<_>>();
+    let (all_entries, mut counters) = futures::stream::iter(add_manifest_files)
+        .map(|meta| {
+            let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
+            let cache = shared_cache.clone();
+            let deleted_entries = &deleted_entries;
             async move {
                 let input_file = file_io.new_input(&path)?;
                 let content = input_file.read().await?;
@@ -190,7 +296,10 @@ async fn read_all_manifest_entries(
                 let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
                     &content,
                     &cache,
-                    &mut |_kind, partition_bytes, bucket, total_buckets| {
+                    &mut |kind, partition_bytes, bucket, total_buckets| {
+                        if kind != FileKind::Add {
+                            return false;
+                        }
                         counters.entries_read += 1;
                         // Bucket filter (negative bucket = unassigned)
                         if has_primary_keys && !scan_all_files && bucket < 0 {
@@ -226,16 +335,22 @@ async fn read_all_manifest_entries(
                             }
                         }
 
+                        counters.after_entry_pruning += 1;
                         true
                     },
                 )?;
-                counters.after_entry_pruning = entries.len();
 
                 // Post-filter: level-0 and data predicates (need DataFileMeta)
                 let mut filtered = Vec::with_capacity(entries.len());
                 for entry in entries {
                     if skip_level_zero && has_primary_keys && entry.file().level == 0 {
                         counters.pruned_by_level += 1;
+                        continue;
+                    }
+                    if row_range_index.is_some_and(|index| {
+                        !data_file_overlaps_row_range_index(entry.file(), index)
+                    }) {
+                        counters.pruned_by_row_ranges += 1;
                         continue;
                     }
                     if !data_predicates.is_empty()
@@ -249,9 +364,12 @@ async fn read_all_manifest_entries(
                         counters.pruned_by_data_stats += 1;
                         continue;
                     }
+                    counters.after_manifest_filters += 1;
+                    if deleted_entries.contains(&entry.identifier()) {
+                        continue;
+                    }
                     filtered.push(entry);
                 }
-                counters.after_manifest_filters = filtered.len();
                 Ok::<_, crate::Error>((filtered, counters))
             }
         })
@@ -260,7 +378,7 @@ async fn read_all_manifest_entries(
         // accumulator plus at most this bounded set of in-flight reads.
         .buffered(64)
         .try_fold(
-            (Vec::new(), ManifestReadCounters::default()),
+            (Vec::new(), delete_counters),
             |(mut all_entries, mut counters), (entries, manifest_counters)| async move {
                 counters.merge(manifest_counters);
                 all_entries.extend(entries);
@@ -268,12 +386,12 @@ async fn read_all_manifest_entries(
             },
         )
         .await?;
-    let mut all_entries = merge_manifest_entries(all_entries);
+    let mut all_entries = all_entries;
     let manifest_entries_after_merge = all_entries.len();
     if let Some(index) = row_range_index {
         let before = all_entries.len();
         all_entries = retain_manifest_entry_row_ranges(all_entries, index);
-        counters.pruned_by_row_ranges = before - all_entries.len();
+        counters.pruned_by_row_ranges += before - all_entries.len();
     }
     if let Some(trace) = trace {
         trace.manifest_entries_read = counters.entries_read;
@@ -2776,8 +2894,8 @@ mod tests {
         assert_eq!(planned_files, vec!["a-new", "a-old"]);
         assert_eq!(trace.manifest_entries_read, 4);
         assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 2);
-        assert_eq!(trace.manifest_entries_after_manifest_filters, 4);
-        assert_eq!(trace.manifest_entries_after_merge, 4);
+        assert_eq!(trace.manifest_entries_after_manifest_filters, 2);
+        assert_eq!(trace.manifest_entries_after_merge, 2);
         assert_eq!(trace.data_evolution_groups_before_stats, 1);
         assert_eq!(trace.data_evolution_groups_pruned_by_row_ranges, 0);
 
@@ -2836,8 +2954,8 @@ mod tests {
             "retained.parquet"
         );
         assert_eq!(trace.manifest_entries_read, 4);
-        assert_eq!(trace.manifest_entries_after_manifest_filters, 4);
-        assert_eq!(trace.manifest_entries_after_merge, 2);
+        assert_eq!(trace.manifest_entries_after_manifest_filters, 3);
+        assert_eq!(trace.manifest_entries_after_merge, 1);
         assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 1);
     }
 

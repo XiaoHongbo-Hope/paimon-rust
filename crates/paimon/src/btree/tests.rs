@@ -109,7 +109,7 @@ async fn test_null_keys() {
 
     let reader = write_and_open(&buf, &result, int_cmp).await;
 
-    let null_bm = reader.null_bitmap();
+    let null_bm = reader.null_bitmap().await.unwrap();
     assert!(null_bm.contains(10));
     assert!(null_bm.contains(30));
     assert!(!null_bm.contains(20));
@@ -133,7 +133,7 @@ async fn test_only_nulls() {
     assert!(result.meta.has_nulls);
 
     let reader = write_and_open(&buf, &result, int_cmp).await;
-    let null_bm = reader.null_bitmap();
+    let null_bm = reader.null_bitmap().await.unwrap();
     assert_eq!(null_bm.len(), 3);
 }
 
@@ -505,7 +505,7 @@ async fn test_nulls_with_range_query() {
     assert!(!all.contains(0));
     assert!(!all.contains(100));
 
-    let nulls = reader.null_bitmap();
+    let nulls = reader.null_bitmap().await.unwrap();
     assert_eq!(nulls.len(), 2);
     assert!(nulls.contains(0));
     assert!(nulls.contains(100));
@@ -634,7 +634,7 @@ async fn test_java_compat_int_with_nulls() {
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), true);
     let reader = open_testdata("btree_int_100_with_nulls.bin", &meta, le_int_cmp).await;
 
-    let null_bm = reader.null_bitmap();
+    let null_bm = reader.null_bitmap().await.unwrap();
     assert!(!null_bm.is_empty());
 
     let all = reader.all_non_null_rows().await.unwrap();
