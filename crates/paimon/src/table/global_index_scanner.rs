@@ -1642,15 +1642,29 @@ pub async fn stream_global_index_row_ranges(
 
     let search_mode = core_options.global_index_search_mode()?;
     let next_row_id = snapshot.next_row_id();
-    // Until the prepared snapshot supplies exact live ranges, DETAIL uses the
-    // snapshot row-id universe as a conservative superset. Batch file planning
-    // removes holes and deleted files before data is read.
-    let coverage_data_ranges =
+    // DETAIL promises exact live data-file coverage. Callers such as DataFusion
+    // pass ranges from their prepared snapshot metadata; keep the public helper
+    // correct for other callers by resolving those ranges once when omitted.
+    // Falling back to [0, next_row_id) here would turn sparse coverage into a
+    // near-full-table read and erase the streaming path's latency benefit.
+    let detail_data_ranges =
         if search_mode == GlobalIndexSearchMode::Detail && data_ranges.is_empty() {
-            next_row_id
-                .filter(|next| *next > 0)
-                .map(|next| vec![RowRange::new(0, next - 1)])
-                .unwrap_or_default()
+            let entries = table
+                .new_read_builder()
+                .new_scan()
+                .plan_manifest_entries(&snapshot)
+                .await?;
+            super::merge_row_ranges(
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .file()
+                            .row_id_range()
+                            .map(|(from, to)| RowRange::new(from, to))
+                    })
+                    .collect(),
+            )
         } else {
             data_ranges
         };
@@ -1659,7 +1673,7 @@ pub async fn stream_global_index_row_ranges(
         &HashSet::from([field_id]),
         search_mode,
         next_row_id,
-        &coverage_data_ranges,
+        &detail_data_ranges,
         |index_file| {
             matches!(
                 normalize_sorted_global_index_type(&index_file.index_type),
