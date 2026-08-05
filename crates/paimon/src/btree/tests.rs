@@ -108,8 +108,14 @@ async fn test_null_keys() {
     assert!(result.meta.has_nulls);
 
     let reader = write_and_open(&buf, &result, int_cmp).await;
+    assert!(!reader.null_bitmap_loaded());
+
+    let non_null = reader.query_equal(&int_key(1)).await.unwrap();
+    assert!(non_null.contains(20));
+    assert!(!reader.null_bitmap_loaded());
 
     let null_bm = reader.null_bitmap().await.unwrap();
+    assert!(reader.null_bitmap_loaded());
     assert!(null_bm.contains(10));
     assert!(null_bm.contains(30));
     assert!(!null_bm.contains(20));

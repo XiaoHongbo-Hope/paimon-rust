@@ -104,6 +104,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn null_bitmap_loaded(&self) -> bool {
+        self.null_bitmap.get().is_some()
+    }
+
     /// Collect all non-null row ids into a bitmap.
     pub async fn all_non_null_rows(&self) -> io::Result<RoaringTreemap> {
         if self.min_key.is_none() {
