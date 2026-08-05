@@ -186,9 +186,23 @@ where
             PredicateOperator::Like => {
                 ensure_character_string(data_type, op)?;
                 let pattern = string_literal(literals, op)?.to_string();
+                // A residual LIKE may still have a useful literal prefix. Seek
+                // directly to that prefix and stop at its successor, while
+                // retaining the full matcher for exact SQL semantics. This is
+                // especially important for escaped prefixes such as
+                // `clip\_id%`, which must not scan the BTree from its first key.
+                let literal_prefix = like_literal_prefix(&pattern);
+                let (from, to) = if literal_prefix.is_empty() {
+                    (None, None)
+                } else {
+                    let prefix = serialize_datum(&Datum::String(literal_prefix), data_type);
+                    let upper = BTreeIndexReader::<F>::prefix_successor(&prefix)
+                        .map(|upper| (upper, false));
+                    (Some(prefix), upper)
+                };
                 (
-                    None,
-                    None,
+                    from,
+                    to,
                     Arc::new(move |key| {
                         std::str::from_utf8(key).is_ok_and(|value| like_match(value, &pattern))
                     }),
@@ -231,6 +245,20 @@ fn string_literal(literals: &[Datum], op: PredicateOperator) -> io::Result<&str>
             format!("BTree index {op} requires one literal"),
         )),
     }
+}
+
+/// Return the decoded literal portion before the first unescaped LIKE wildcard.
+fn like_literal_prefix(pattern: &str) -> String {
+    let mut prefix = String::new();
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' | '_' => break,
+            '\\' => prefix.push(chars.next().unwrap_or('\\')),
+            literal => prefix.push(literal),
+        }
+    }
+    prefix
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -324,5 +352,19 @@ pub(crate) fn extract_between<'a>(
             (Some(between), remaining)
         }
         _ => (None, predicates.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::like_literal_prefix;
+
+    #[test]
+    fn test_like_literal_prefix_decodes_escapes() {
+        assert_eq!(like_literal_prefix("clip\\_id%"), "clip_id");
+        assert_eq!(like_literal_prefix("lowprec_%"), "lowprec");
+        assert_eq!(like_literal_prefix("%suffix"), "");
+        assert_eq!(like_literal_prefix("literal\\\\"), "literal\\");
+        assert_eq!(like_literal_prefix("café_%"), "café");
     }
 }

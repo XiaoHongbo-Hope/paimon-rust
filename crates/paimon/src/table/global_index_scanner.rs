@@ -148,6 +148,9 @@ pub(crate) struct GlobalIndexScanner {
 struct GlobalIndexEntry {
     file_name: String,
     index_type: GlobalIndexFileKind,
+    partition: Vec<u8>,
+    bucket: i32,
+    extra_field_ids: Vec<i32>,
     file_size: i64,
     row_range_start: i64,
     row_range_end: i64,
@@ -346,6 +349,9 @@ impl GlobalIndexScanner {
                     BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
                     _ => unreachable!("normalized sorted global index type"),
                 },
+                partition: entry.partition.clone(),
+                bucket: entry.bucket,
+                extra_field_ids: global_meta.extra_field_ids.clone().unwrap_or_default(),
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
                 row_range_end: global_meta.row_range_end,
@@ -1529,22 +1535,105 @@ const STREAMING_GLOBAL_INDEX_BATCH_ROWS: usize = 250_000;
 // A corrupt or unusually large hotspot block must not exhaust the executor.
 const STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY: usize = 256 * 1024 * 1024;
 
-fn claim_uncovered_start(
-    row_range_start: i64,
-    row_range_end: i64,
-    covered_end: &mut Option<i64>,
-) -> Option<i64> {
-    let first_uncovered = match *covered_end {
-        Some(i64::MAX) => None,
-        Some(end) => Some(row_range_start.max(end + 1)),
-        None => Some(row_range_start),
-    };
-    *covered_end = Some(
-        covered_end
-            .map(|end| end.max(row_range_end))
-            .unwrap_or(row_range_end),
-    );
-    first_uncovered.filter(|start| *start <= row_range_end)
+fn is_btree_primary_index_for_field(index_file: &IndexFileMeta, field_id: i32) -> bool {
+    index_file
+        .global_index_meta
+        .as_ref()
+        .is_some_and(|meta| meta.index_field_id == field_id)
+        && matches!(
+            normalize_sorted_global_index_type(&index_file.index_type),
+            Some(index_type) if index_type == BTREE_GLOBAL_INDEX_TYPE
+        )
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamingBTreeIdentity {
+    partition: Vec<u8>,
+    bucket: i32,
+    extra_field_ids: Vec<i32>,
+}
+
+impl StreamingBTreeIdentity {
+    fn new(entry: &GlobalIndexEntry) -> Self {
+        Self {
+            partition: entry.partition.clone(),
+            bucket: entry.bucket,
+            extra_field_ids: entry.extra_field_ids.clone(),
+        }
+    }
+
+    fn scope(&self) -> (Vec<u8>, i32) {
+        (self.partition.clone(), self.bucket)
+    }
+}
+
+/// Assign one bounded row-range owner per logical BTree identity and scope.
+///
+/// Multiple files of one identity may deliberately share a row range because
+/// the writer partitions the key space across SST files. All of those files
+/// must be queried. Different identities in the same partition/bucket can also
+/// overlap; only one identity owns each row-id interval so their equivalent
+/// primary-key matches cannot produce duplicate table rows.
+fn streaming_btree_entry_ownership(
+    entries: &[GlobalIndexEntry],
+) -> Vec<(usize, Arc<RowRangeIndex>)> {
+    let mut by_identity: HashMap<StreamingBTreeIdentity, Vec<usize>> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.index_type == GlobalIndexFileKind::BTree {
+            by_identity
+                .entry(StreamingBTreeIdentity::new(entry))
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut identities = by_identity.keys().cloned().collect::<Vec<_>>();
+    identities.sort();
+    let mut claimed_by_scope: HashMap<(Vec<u8>, i32), Vec<RowRange>> = HashMap::new();
+    let mut owned_entries = Vec::new();
+
+    for identity in identities {
+        let indices = by_identity
+            .get_mut(&identity)
+            .expect("streaming BTree identity came from the same map");
+        indices.sort_unstable_by(|left, right| {
+            let left = &entries[*left];
+            let right = &entries[*right];
+            (
+                left.row_range_start,
+                left.row_range_end,
+                &left.meta.first_key,
+                &left.file_name,
+            )
+                .cmp(&(
+                    right.row_range_start,
+                    right.row_range_end,
+                    &right.meta.first_key,
+                    &right.file_name,
+                ))
+        });
+        let coverage = super::merge_row_ranges(
+            indices
+                .iter()
+                .map(|index| {
+                    let entry = &entries[*index];
+                    RowRange::new(entry.row_range_start, entry.row_range_end)
+                })
+                .collect(),
+        );
+        let claimed = claimed_by_scope.entry(identity.scope()).or_default();
+        let owned = super::source::exclude_row_ranges(&coverage, claimed);
+        claimed.extend(coverage);
+        *claimed = super::merge_row_ranges(std::mem::take(claimed));
+        if owned.is_empty() {
+            continue;
+        }
+
+        let owned = Arc::new(RowRangeIndex::create(owned));
+        owned_entries.extend(indices.iter().map(|index| (*index, Arc::clone(&owned))));
+    }
+
+    owned_entries
 }
 
 /// Whether a predicate can use the execution-time BTree row-id stream.
@@ -1643,20 +1732,10 @@ pub async fn stream_global_index_row_ranges(
     };
 
     let entries = &scanner.entries_by_field[field_group_index].1;
-    let mut btree_entries = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            (entry.index_type == GlobalIndexFileKind::BTree).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    if btree_entries.is_empty() {
+    let owned_entries = streaming_btree_entry_ownership(entries);
+    if owned_entries.is_empty() {
         return Ok(None);
     }
-    btree_entries.sort_unstable_by_key(|index| {
-        let entry = &entries[*index];
-        (entry.row_range_start, entry.row_range_end)
-    });
 
     let search_mode = core_options.global_index_search_mode()?;
     let next_row_id = snapshot.next_row_id();
@@ -1692,12 +1771,7 @@ pub async fn stream_global_index_row_ranges(
         search_mode,
         next_row_id,
         &detail_data_ranges,
-        |index_file| {
-            matches!(
-                normalize_sorted_global_index_type(&index_file.index_type),
-                Some(index_type) if index_type == BTREE_GLOBAL_INDEX_TYPE
-            )
-        },
+        |index_file| is_btree_primary_index_for_field(index_file, field_id),
     );
 
     let serialized_literals = literals
@@ -1706,9 +1780,7 @@ pub async fn stream_global_index_row_ranges(
         .collect::<Vec<_>>();
     let comparator = make_key_comparator(&data_type);
     let stream = async_stream::try_stream! {
-        let mut covered_end: Option<i64> = None;
-
-        for index in btree_entries {
+        for (index, owned_ranges) in owned_entries {
             let entry = &scanner.entries_by_field[field_group_index].1[index];
             if entry.row_range_start < 0 || entry.row_range_end < entry.row_range_start {
                 Err(Error::DataInvalid {
@@ -1720,13 +1792,6 @@ pub async fn stream_global_index_row_ranges(
                 })?;
             }
 
-            let Some(first_uncovered) = claim_uncovered_start(
-                entry.row_range_start,
-                entry.row_range_end,
-                &mut covered_end,
-            ) else {
-                continue;
-            };
             if !entry.meta.may_match(op, &serialized_literals, &comparator) {
                 continue;
             }
@@ -1789,7 +1854,7 @@ pub async fn stream_global_index_row_ranges(
                             source: None,
                         })?;
                     }
-                    if absolute >= first_uncovered {
+                    if owned_ranges.intersects(absolute, absolute) {
                         absolute_row_ids.push(absolute as u64);
                     }
                 }
@@ -1885,13 +1950,51 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_shards_claim_disjoint_overlap_ranges() {
-        let mut covered_end = None;
-        assert_eq!(claim_uncovered_start(0, 99, &mut covered_end), Some(0));
-        assert_eq!(claim_uncovered_start(0, 99, &mut covered_end), None);
-        assert_eq!(claim_uncovered_start(50, 149, &mut covered_end), Some(100));
-        assert_eq!(claim_uncovered_start(150, 199, &mut covered_end), Some(150));
-        assert_eq!(covered_end, Some(199));
+    fn test_streaming_btree_ownership_keeps_key_shards_and_scopes_disjoint_identities() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let mut first_key_shard = make_global_index_entry("a", 1, 0, 99, &meta);
+        first_key_shard.partition = vec![1];
+        let mut second_key_shard = make_global_index_entry("b", 1, 0, 99, &meta);
+        second_key_shard.partition = vec![1];
+        let mut other_partition = make_global_index_entry("c", 1, 0, 99, &meta);
+        other_partition.partition = vec![2];
+        let mut overlapping_identity = make_global_index_entry("d", 1, 0, 149, &meta);
+        overlapping_identity.partition = vec![1];
+        overlapping_identity
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .extra_field_ids = Some(vec![2]);
+        let manifest_entries = vec![
+            first_key_shard,
+            second_key_shard,
+            other_partition,
+            overlapping_identity,
+        ];
+        let scanner = GlobalIndexScanner::create(
+            &file_io,
+            "memory:/t",
+            1,
+            i64::MAX,
+            i64::MAX,
+            &manifest_entries,
+            &two_field_schema_fields(),
+        )
+        .unwrap()
+        .unwrap();
+        let entries = scanner.entries_for_field(1).unwrap();
+
+        let owned = streaming_btree_entry_ownership(entries)
+            .into_iter()
+            .map(|(index, ranges)| (entries[index].file_name.as_str(), ranges.ranges().to_vec()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(owned["a"], vec![RowRange::new(0, 99)]);
+        assert_eq!(owned["b"], vec![RowRange::new(0, 99)]);
+        assert_eq!(owned["c"], vec![RowRange::new(0, 99)]);
+        assert_eq!(owned["d"], vec![RowRange::new(100, 149)]);
     }
 
     #[test]
@@ -2479,6 +2582,29 @@ mod tests {
             )
             .unwrap();
         assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_unindexed_ranges_ignore_extra_only_coverage() {
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let mut extra_only = make_global_index_entry("idx_id_value", 1, 0, 99, &meta);
+        extra_only
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .extra_field_ids = Some(vec![2]);
+
+        let ranges = unindexed_ranges_for_global_index_entries(
+            &[extra_only],
+            &HashSet::from([2]),
+            GlobalIndexSearchMode::Full,
+            Some(100),
+            &[],
+            |index_file| is_btree_primary_index_for_field(index_file, 2),
+        );
+
+        assert_eq!(ranges, vec![RowRange::new(0, 99)]);
     }
 
     #[tokio::test]
