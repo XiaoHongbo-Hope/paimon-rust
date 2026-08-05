@@ -162,6 +162,15 @@ where
     where
         F: 'static,
     {
+        if literals.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BTree row-id streaming requires one literal, got {}",
+                    literals.len()
+                ),
+            ));
+        }
         let (from, to, matches): BTreeRowIdQueryBounds = match op {
             PredicateOperator::Eq => {
                 let key = serialize_datum(&literals[0], data_type);
@@ -170,7 +179,8 @@ where
             PredicateOperator::StartsWith => {
                 ensure_character_string(data_type, op)?;
                 let prefix = serialize_datum(&literals[0], data_type);
-                let upper = prefix_successor(&prefix).map(|upper| (upper, false));
+                let upper =
+                    BTreeIndexReader::<F>::prefix_successor(&prefix).map(|upper| (upper, false));
                 (Some(prefix), upper, Arc::new(|_| true))
             }
             PredicateOperator::Like => {
@@ -191,21 +201,13 @@ where
                 ));
             }
         };
-        Ok(self.into_row_id_stream(from, to, matches, batch_size.max(1), max_memory))
+        let batch_size = batch_size
+            .max(1)
+            .min((max_memory / std::mem::size_of::<u64>()).max(1));
+        Ok(self.into_row_id_stream(from, to, matches, batch_size, max_memory))
     }
 }
 
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut bound = prefix.to_vec();
-    while let Some(&last) = bound.last() {
-        if last != u8::MAX {
-            *bound.last_mut().expect("bound is non-empty") = last + 1;
-            return Some(bound);
-        }
-        bound.pop();
-    }
-    None
-}
 fn ensure_character_string(data_type: &DataType, op: PredicateOperator) -> io::Result<()> {
     if matches!(data_type, DataType::Char(_) | DataType::VarChar(_)) {
         Ok(())

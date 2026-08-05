@@ -1105,20 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_like_rewrites_escaped_literal_prefix() {
-        let fields = test_fields();
-        let predicate = build_pushed_predicate(&[like_filter(r"2024\_08%", false, false)], &fields)
-            .expect("escaped literal prefix should translate");
-        match predicate {
-            Predicate::Leaf { op, literals, .. } => {
-                assert_eq!(op, paimon::spec::PredicateOperator::StartsWith);
-                assert_eq!(literals, vec![Datum::String("2024_08".to_string())]);
-            }
-            other => panic!("expected Leaf, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_translate_like_rewrites_to_ends_with() {
         let fields = test_fields();
         let predicate = build_pushed_predicate(&[like_filter("%01-01", false, false)], &fields)

@@ -78,14 +78,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
                 "BTree memory limit must be greater than zero",
             ));
         }
-        Self::open_impl(
-            reader,
-            file_size,
-            meta,
-            key_comparator,
-            Some(max_memory),
-        )
-        .await
+        Self::open_impl(reader, file_size, meta, key_comparator, Some(max_memory)).await
     }
 
     async fn open_impl(
@@ -112,6 +105,12 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
         // 2. Read index block
         let idx = &footer.index_block_handle;
+        if max_memory.is_some_and(|limit| idx.size as usize > limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("Index block size {} exceeds memory limit", idx.size),
+            ));
+        }
         let idx_end = idx
             .offset
             .checked_add(idx.full_block_size() as u64)
@@ -304,6 +303,12 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         handle: &BlockHandle,
         max_memory: usize,
     ) -> io::Result<BlockReader> {
+        if handle.size as usize > max_memory {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("Data block size {} exceeds memory limit", handle.size),
+            ));
+        }
         let end = handle
             .offset
             .checked_add(handle.full_block_size() as u64)
@@ -445,7 +450,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         }
     }
 
-    fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         let mut bound = prefix.to_vec();
         while let Some(&last) = bound.last() {
             if last != 0xFF {
@@ -582,11 +587,24 @@ async fn read_null_bitmap(
             format!("Null bitmap size {size} exceeds memory limit"),
         ));
     }
+    let end = offset
+        .checked_add(size)
+        .and_then(|end| end.checked_add(4))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Null bitmap overflow"))?;
     // Read bitmap bytes + CRC (4 bytes)
     let bytes = reader
-        .read(offset..offset + size + 4)
+        .read(offset..end)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
+    let required = (size as usize)
+        .checked_add(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Null bitmap size overflow"))?;
+    if bytes.len() < required {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("Null bitmap requires {required} bytes, got {}", bytes.len()),
+        ));
+    }
     let bitmap_bytes = &bytes[..size as usize];
     let crc_bytes = &bytes[size as usize..];
 
@@ -597,6 +615,12 @@ async fn read_null_bitmap(
 }
 
 fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<()> {
+    if crc_bytes.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Null bitmap CRC is truncated",
+        ));
+    }
     let expected_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(bitmap_bytes);

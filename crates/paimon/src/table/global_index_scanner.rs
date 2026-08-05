@@ -1526,8 +1526,26 @@ pub type GlobalIndexRowRangeStream = BoxStream<'static, Result<Vec<RowRange>>>;
 
 // Large enough to amortize file planning while keeping row-id vectors bounded.
 const STREAMING_GLOBAL_INDEX_BATCH_ROWS: usize = 250_000;
-// A corrupt or unusually large hotspot block must not exhaust an 8 GiB worker.
+// A corrupt or unusually large hotspot block must not exhaust the executor.
 const STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY: usize = 256 * 1024 * 1024;
+
+fn claim_uncovered_start(
+    row_range_start: i64,
+    row_range_end: i64,
+    covered_end: &mut Option<i64>,
+) -> Option<i64> {
+    let first_uncovered = match *covered_end {
+        Some(i64::MAX) => None,
+        Some(end) => Some(row_range_start.max(end + 1)),
+        None => Some(row_range_start),
+    };
+    *covered_end = Some(
+        covered_end
+            .map(|end| end.max(row_range_end))
+            .unwrap_or(row_range_end),
+    );
+    first_uncovered.filter(|start| *start <= row_range_end)
+}
 
 /// Whether a predicate can use the execution-time BTree row-id stream.
 ///
@@ -1702,20 +1720,11 @@ pub async fn stream_global_index_row_ranges(
                 })?;
             }
 
-            let first_uncovered = match covered_end {
-                Some(i64::MAX) => None,
-                Some(end) => Some(entry.row_range_start.max(end + 1)),
-                None => Some(entry.row_range_start),
-            };
-            covered_end = Some(
-                covered_end
-                    .map(|end| end.max(entry.row_range_end))
-                    .unwrap_or(entry.row_range_end),
-            );
-
-            let Some(first_uncovered) =
-                first_uncovered.filter(|start| *start <= entry.row_range_end)
-            else {
+            let Some(first_uncovered) = claim_uncovered_start(
+                entry.row_range_start,
+                entry.row_range_end,
+                &mut covered_end,
+            ) else {
                 continue;
             };
             if !entry.meta.may_match(op, &serialized_literals, &comparator) {
@@ -1873,6 +1882,16 @@ mod tests {
                 RowRange::new(10, 10),
             ]
         );
+    }
+
+    #[test]
+    fn test_streaming_shards_claim_disjoint_overlap_ranges() {
+        let mut covered_end = None;
+        assert_eq!(claim_uncovered_start(0, 99, &mut covered_end), Some(0));
+        assert_eq!(claim_uncovered_start(0, 99, &mut covered_end), None);
+        assert_eq!(claim_uncovered_start(50, 149, &mut covered_end), Some(100));
+        assert_eq!(claim_uncovered_start(150, 199, &mut covered_end), Some(150));
+        assert_eq!(covered_end, Some(199));
     }
 
     #[test]

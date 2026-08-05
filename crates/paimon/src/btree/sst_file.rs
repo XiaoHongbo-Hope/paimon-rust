@@ -267,9 +267,7 @@ fn decompress_block(
             if max_memory.is_some_and(|limit| uncompressed_size > limit) {
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
-                    format!(
-                        "Decompressed block size {uncompressed_size} exceeds memory limit"
-                    ),
+                    format!("Decompressed block size {uncompressed_size} exceeds memory limit"),
                 ));
             }
             let compressed_start = cursor.position() as usize;
@@ -318,6 +316,34 @@ impl SstFileReader {
 mod tests {
     use super::*;
     use crate::btree::test_util::VecFileWrite;
+
+    #[test]
+    fn test_read_block_rejects_large_decompressed_size_before_allocating() {
+        let source = vec![b'x'; 4096];
+        let mut encoded = vec![0u8; 5 + zstd::zstd_safe::compress_bound(source.len())];
+        let prefix_len = encode_var_int_to_slice(&mut encoded, 0, source.len() as i32);
+        let compressed_len =
+            zstd::bulk::compress_to_buffer(&source, &mut encoded[prefix_len..], 3).unwrap();
+        encoded.truncate(prefix_len + compressed_len);
+        assert!(
+            encoded.len() < 1024,
+            "test data should have a small encoding"
+        );
+
+        let trailer = BlockTrailer {
+            compression_type: BlockCompressionType::Zstd,
+            crc32c: compute_crc32(&encoded, BlockCompressionType::Zstd),
+        };
+        let encoded_size = encoded.len() as u32;
+        encoded.extend_from_slice(&trailer.to_bytes());
+
+        let error = match read_block_from_bytes_with_memory_limit(&encoded, encoded_size, 1024) {
+            Ok(_) => panic!("decompressed block must be rejected before allocation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(error.to_string().contains("Decompressed block size 4096"));
+    }
 
     #[tokio::test]
     async fn test_sst_file_roundtrip() {

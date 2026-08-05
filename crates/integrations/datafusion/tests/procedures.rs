@@ -266,7 +266,9 @@ async fn test_global_index_order_by_limit_streams_all_shards_before_topk() {
         &sql_context,
         "INSERT INTO paimon.test_db.btree_streaming_topk (id, name) VALUES
          (1, 'alpha'), (2, 'alpine'), (3, 'amber'),
-         (4, 'azure'), (5, 'apple'), (6, 'apricot')",
+         (4, 'azure'), (5, 'apple'), (6, 'apricot'),
+         (7, 'hot'), (8, 'hot'), (9, 'hot'),
+         (10, 'hot'), (11, 'hot'), (12, 'hot')",
     )
     .await;
     exec(
@@ -277,6 +279,38 @@ async fn test_global_index_order_by_limit_streams_all_shards_before_topk() {
             index_type => 'btree')",
     )
     .await;
+
+    for sql in [
+        "SELECT id, name
+         FROM paimon.test_db.btree_streaming_topk
+         WHERE name = 'hot'
+         LIMIT 3",
+        "SELECT id, name
+         FROM paimon.test_db.btree_streaming_topk
+         WHERE name LIKE 'a%'
+         LIMIT 3",
+    ] {
+        let physical_plan = sql_context
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let explain = displayable(physical_plan.as_ref()).indent(true).to_string();
+        assert!(
+            explain.contains("global_index=streaming"),
+            "expected execution-time global-index scan, got:\n{explain}"
+        );
+
+        let rows = collect_id_name_in_batch_order(&sql_context, sql).await;
+        assert_eq!(rows.len(), 3);
+        if sql.contains("= 'hot'") {
+            assert!(rows.iter().all(|(_, name)| name == "hot"));
+        } else {
+            assert!(rows.iter().all(|(_, name)| name.starts_with('a')));
+        }
+    }
 
     let sql = "SELECT id, name
          FROM paimon.test_db.btree_streaming_topk
