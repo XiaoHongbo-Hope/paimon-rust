@@ -50,7 +50,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::arrow::ParquetReadBudget;
-use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
+use paimon::spec::{
+    DataField, Datum, GlobalIndexSearchMode, MergeEngine, Predicate, PredicateBuilder,
+    PredicateOperator,
+};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
@@ -1113,12 +1116,17 @@ impl ExecutionPlan for PaimonTableScan {
                 if let Some((index_predicate, snapshot_id)) = streaming_global_index {
                     let indexed_schema = Arc::clone(&schema);
                     Box::pin(async_stream::try_stream! {
+                        let combined_paimon_predicate = if paimon_predicates.is_empty() {
+                            None
+                        } else {
+                            Some(Predicate::and(paimon_predicates.clone()))
+                        };
                         let build_read_builder = || {
                             let mut read_builder = table.new_read_builder();
                             read_builder.with_case_sensitive(case_sensitive);
                             read_builder.with_read_type(read_type.clone());
-                            if !paimon_predicates.is_empty() {
-                                read_builder.with_filter(Predicate::and(paimon_predicates.clone()));
+                            if let Some(predicate) = combined_paimon_predicate.as_ref() {
+                                read_builder.with_filter(predicate.clone());
                             }
                             read_builder.with_parquet_read_budget(Arc::clone(&parquet_read_budget));
                             read_builder
@@ -1136,11 +1144,32 @@ impl ExecutionPlan for PaimonTableScan {
                             Ok(read)
                         };
 
+                        // Snapshot and manifest-list metadata are immutable for this
+                        // execution. Resolve them once; each row-id batch will only
+                        // open the individual manifests overlapping that batch.
+                        let prepared_snapshot = build_read_builder()
+                            .new_scan()
+                            .prepare_snapshot_id(snapshot_id)
+                            .await?;
+                        let data_ranges = if table
+                            .schema()
+                            .core_options()
+                            .global_index_search_mode()?
+                            == GlobalIndexSearchMode::Detail
+                        {
+                            build_read_builder()
+                                .new_scan()
+                                .prepared_detail_data_ranges(&prepared_snapshot)
+                                .await?
+                        } else {
+                            Vec::new()
+                        };
+
                         let range_stream = paimon::table::stream_global_index_row_ranges(
                             table.clone(),
                             snapshot_id,
                             index_predicate,
-                            Vec::new(),
+                            data_ranges,
                         )
                         .await?;
 
@@ -1150,7 +1179,7 @@ impl ExecutionPlan for PaimonTableScan {
                                     let batch_splits = build_read_builder()
                                         .new_scan()
                                         .with_row_ranges(row_ranges)
-                                        .plan_snapshot_id(snapshot_id)
+                                        .plan_prepared_snapshot(&prepared_snapshot)
                                         .await?
                                         .into_splits();
                                     if batch_splits.is_empty() {
@@ -1169,7 +1198,7 @@ impl ExecutionPlan for PaimonTableScan {
                                 // indexed queries never materialize a query-wide file plan.
                                 let batch_splits = build_read_builder()
                                     .new_scan()
-                                    .plan_snapshot_id(snapshot_id)
+                                    .plan_prepared_snapshot(&prepared_snapshot)
                                     .await?
                                     .into_splits();
                                 let read = build_read()?;

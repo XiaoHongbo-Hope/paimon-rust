@@ -2050,16 +2050,29 @@ pub async fn stream_global_index_row_ranges(
 
     let search_mode = core_options.global_index_search_mode()?;
     let next_row_id = snapshot.next_row_id();
-    // DETAIL normally uses live data-file ranges. Execution-time streaming
-    // intentionally avoids an eager full-table manifest plan, so use the
-    // snapshot row-id universe as a conservative superset when those ranges
-    // are unavailable. Per-batch manifest planning removes holes and deletes.
-    let conservative_data_ranges =
+    // DETAIL promises exact live data-file coverage. Callers such as DataFusion
+    // pass ranges from their prepared snapshot metadata; keep the public helper
+    // correct for other callers by resolving those ranges once when omitted.
+    // Falling back to [0, next_row_id) here would turn sparse coverage into a
+    // near-full-table read and erase the streaming path's latency benefit.
+    let detail_data_ranges =
         if search_mode == GlobalIndexSearchMode::Detail && data_ranges.is_empty() {
-            next_row_id
-                .filter(|next| *next > 0)
-                .map(|next| vec![RowRange::new(0, next - 1)])
-                .unwrap_or_default()
+            let entries = table
+                .new_read_builder()
+                .new_scan()
+                .plan_manifest_entries(&snapshot)
+                .await?;
+            super::merge_row_ranges(
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .file()
+                            .row_id_range()
+                            .map(|(from, to)| RowRange::new(from, to))
+                    })
+                    .collect(),
+            )
         } else {
             data_ranges
         };
@@ -2067,7 +2080,7 @@ pub async fn stream_global_index_row_ranges(
         &HashSet::from([field_id]),
         search_mode,
         next_row_id,
-        &conservative_data_ranges,
+        &detail_data_ranges,
     );
     let query_max_memory = scanner.query_max_memory;
     let stream = async_stream::try_stream! {

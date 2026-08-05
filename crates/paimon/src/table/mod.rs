@@ -134,7 +134,7 @@ pub use source::{
 };
 pub use table_commit::TableCommit;
 pub use table_read::TableRead;
-pub use table_scan::TableScan;
+pub use table_scan::{PreparedSnapshotScan, TableScan};
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
