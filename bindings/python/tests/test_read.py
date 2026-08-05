@@ -95,6 +95,20 @@ def test_with_row_ranges():
             table.new_read_builder().with_row_ranges([(2, 1)])
 
 
+def test_format_table_rejects_row_ranges():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.ft (id INT) WITH (
+            'type' = 'format-table',
+            'file.format' = 'parquet')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.ft")
+
+        with pytest.raises(NotImplementedError, match="not supported for format tables"):
+            table.new_read_builder().with_row_ranges([]).new_scan().plan()
+
+
 def test_plan_len():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)

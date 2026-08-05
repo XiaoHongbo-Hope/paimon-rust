@@ -796,6 +796,7 @@ impl<'a> TableScan<'a> {
                 table,
                 partition_filter,
                 limit,
+                row_ranges,
             )))
         } else {
             Self(TableScanKind::Paimon(PaimonTableScan::new(
@@ -821,7 +822,9 @@ impl<'a> TableScan<'a> {
             TableScanKind::Paimon(scan) => {
                 Self(TableScanKind::Paimon(scan.with_row_ranges(ranges)))
             }
-            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+            TableScanKind::Format(scan) => {
+                Self(TableScanKind::Format(scan.with_row_ranges(ranges)))
+            }
         }
     }
 
