@@ -193,7 +193,6 @@ impl TableProvider for FullTextSearchTableProvider {
             target_partitions: target,
             filter_exact: false, // FTS scan does not support exact filter pushdown
             case_sensitive: true,
-            streaming_global_index: None,
         }
         .build()
     }

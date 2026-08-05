@@ -4607,7 +4607,6 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
- "async-stream",
  "async-trait",
  "bytes",
  "chrono",

@@ -26,18 +26,12 @@
 use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::footer::{BTreeFileFooter, BTREE_FOOTER_ENCODED_LENGTH};
 use crate::btree::meta::BTreeIndexMeta;
-use crate::btree::sst_file::{
-    read_block_from_bytes, read_block_from_bytes_with_memory_limit, SstFileReader,
-};
+use crate::btree::sst_file::{read_block_from_bytes, SstFileReader};
 use crate::btree::var_len::{decode_var_int, decode_var_long};
 use crate::io::FileRead;
-use futures::stream::BoxStream;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io::{self, Cursor};
-use std::sync::Arc;
-
-pub(crate) type BTreeKeyPredicate = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 /// BTree index reader with on-demand async data block loading.
 pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
@@ -59,35 +53,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         meta: &BTreeIndexMeta,
         key_comparator: F,
     ) -> io::Result<Self> {
-        Self::open_impl(reader, file_size, meta, key_comparator, None).await
-    }
-
-    /// Open a reader while bounding the index block and null bitmap loaded
-    /// eagerly. Data blocks use the same limit when the row-id stream reads
-    /// them on demand.
-    pub(crate) async fn open_with_memory_limit(
-        reader: Box<dyn FileRead>,
-        file_size: u64,
-        meta: &BTreeIndexMeta,
-        key_comparator: F,
-        max_memory: usize,
-    ) -> io::Result<Self> {
-        if max_memory == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BTree memory limit must be greater than zero",
-            ));
-        }
-        Self::open_impl(reader, file_size, meta, key_comparator, Some(max_memory)).await
-    }
-
-    async fn open_impl(
-        reader: Box<dyn FileRead>,
-        file_size: u64,
-        meta: &BTreeIndexMeta,
-        key_comparator: F,
-        max_memory: Option<usize>,
-    ) -> io::Result<Self> {
         if file_size < BTREE_FOOTER_ENCODED_LENGTH as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -105,29 +70,17 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
         // 2. Read index block
         let idx = &footer.index_block_handle;
-        if max_memory.is_some_and(|limit| idx.size as usize > limit) {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("Index block size {} exceeds memory limit", idx.size),
-            ));
-        }
-        let idx_end = idx
-            .offset
-            .checked_add(idx.full_block_size() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Index block overflow"))?;
+        let idx_end = idx.offset + idx.full_block_size() as u64;
         let index_bytes = reader
             .read(idx.offset..idx_end)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let index_block = match max_memory {
-            Some(limit) => read_block_from_bytes_with_memory_limit(&index_bytes, idx.size, limit)?,
-            None => read_block_from_bytes(&index_bytes, idx.size)?,
-        };
+        let index_block = read_block_from_bytes(&index_bytes, idx.size)?;
         let sst_reader = SstFileReader::from_index_block(index_block);
 
         // 3. Read null bitmap
         let null_bitmap = match &footer.null_bitmap_handle {
-            Some(h) => read_null_bitmap(reader.as_ref(), h, max_memory).await?,
+            Some(h) => read_null_bitmap(reader.as_ref(), h).await?,
             None => RoaringTreemap::new(),
         };
 
@@ -286,124 +239,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
     /// Read a data block from the file on demand.
     async fn read_data_block(&self, handle: &BlockHandle) -> io::Result<BlockReader> {
-        let end = handle
-            .offset
-            .checked_add(handle.full_block_size() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Data block overflow"))?;
+        let end = handle.offset + handle.full_block_size() as u64;
         let bytes = self
             .reader
             .read(handle.offset..end)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
         read_block_from_bytes(&bytes, handle.size)
-    }
-
-    async fn read_data_block_with_memory_limit(
-        &self,
-        handle: &BlockHandle,
-        max_memory: usize,
-    ) -> io::Result<BlockReader> {
-        if handle.size as usize > max_memory {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("Data block size {} exceeds memory limit", handle.size),
-            ));
-        }
-        let end = handle
-            .offset
-            .checked_add(handle.full_block_size() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Data block overflow"))?;
-        let bytes = self
-            .reader
-            .read(handle.offset..end)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        read_block_from_bytes_with_memory_limit(&bytes, handle.size, max_memory)
-    }
-
-    /// Consume this reader and stream matching row IDs without first building
-    /// a query-wide `RoaringTreemap`.
-    pub(crate) fn into_row_id_stream(
-        self,
-        from: Option<Vec<u8>>,
-        to: Option<(Vec<u8>, bool)>,
-        matches: BTreeKeyPredicate,
-        batch_size: usize,
-        max_memory: usize,
-    ) -> BoxStream<'static, io::Result<Vec<u64>>>
-    where
-        F: Send + Sync + 'static,
-    {
-        let stream = async_stream::try_stream! {
-            let Some(from) = from.or_else(|| self.min_key.clone()) else {
-                return;
-            };
-            let cmp = &self.key_comparator;
-            let index_block = self.sst_reader.index_block();
-            let (_, mut index_iter) = index_block.seek_and_iter(&from, cmp);
-            let mut row_ids = Vec::with_capacity(batch_size);
-            let mut done = false;
-
-            while !done {
-                let Some((_key, handle_bytes)) = index_iter.next() else {
-                    break;
-                };
-                let handle = BlockHandle::decode(handle_bytes)?;
-                let block = self
-                    .read_data_block_with_memory_limit(&handle, max_memory)
-                    .await?;
-                let mut offset = 0;
-                while offset < block.data.len() {
-                    let (key, value, next_offset) = block.read_entry_at(offset);
-                    offset = next_offset;
-
-                    if cmp(key, &from) == Ordering::Less {
-                        continue;
-                    }
-                    if to.as_ref().is_some_and(|(to, inclusive)| {
-                        let ordering = cmp(key, to);
-                        ordering == Ordering::Greater
-                            || (!*inclusive && ordering == Ordering::Equal)
-                    }) {
-                        done = true;
-                        break;
-                    }
-                    if !matches(key) {
-                        continue;
-                    }
-
-                    let mut cursor = Cursor::new(value);
-                    let count = decode_var_int(&mut cursor)?;
-                    if count < 0 {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Invalid row id count: {count}"),
-                        ))?;
-                    }
-                    for _ in 0..count {
-                        let row_id = decode_var_long(&mut cursor)?;
-                        if row_id < 0 {
-                            Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("Invalid negative BTree row id: {row_id}"),
-                            ))?;
-                        }
-                        row_ids.push(row_id as u64);
-                        if row_ids.len() == batch_size {
-                            yield std::mem::replace(
-                                &mut row_ids,
-                                Vec::with_capacity(batch_size),
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !row_ids.is_empty() {
-                yield row_ids;
-            }
-        };
-        Box::pin(stream)
     }
 
     /// Equal query: returns row ids for the given key.
@@ -450,7 +292,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         }
     }
 
-    pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         let mut bound = prefix.to_vec();
         while let Some(&last) = bound.last() {
             if last != 0xFF {
@@ -577,34 +419,14 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 async fn read_null_bitmap(
     reader: &dyn FileRead,
     handle: &BlockHandle,
-    max_memory: Option<usize>,
 ) -> io::Result<RoaringTreemap> {
     let offset = handle.offset;
     let size = handle.size as u64;
-    if max_memory.is_some_and(|limit| size > limit as u64) {
-        return Err(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            format!("Null bitmap size {size} exceeds memory limit"),
-        ));
-    }
-    let end = offset
-        .checked_add(size)
-        .and_then(|end| end.checked_add(4))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Null bitmap overflow"))?;
     // Read bitmap bytes + CRC (4 bytes)
     let bytes = reader
-        .read(offset..end)
+        .read(offset..offset + size + 4)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
-    let required = (size as usize)
-        .checked_add(4)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Null bitmap size overflow"))?;
-    if bytes.len() < required {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("Null bitmap requires {required} bytes, got {}", bytes.len()),
-        ));
-    }
     let bitmap_bytes = &bytes[..size as usize];
     let crc_bytes = &bytes[size as usize..];
 
@@ -615,12 +437,6 @@ async fn read_null_bitmap(
 }
 
 fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<()> {
-    if crc_bytes.len() < 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Null bitmap CRC is truncated",
-        ));
-    }
     let expected_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(bitmap_bytes);

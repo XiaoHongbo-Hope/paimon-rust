@@ -50,10 +50,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::arrow::ParquetReadBudget;
-use paimon::spec::{
-    DataField, Datum, GlobalIndexSearchMode, MergeEngine, Predicate, PredicateBuilder,
-    PredicateOperator,
-};
+use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
@@ -781,9 +778,6 @@ pub struct PaimonTableScan {
     decoder_filters: Vec<Arc<dyn PhysicalExpr>>,
     /// Query-wide budget shared by every DataFusion scan partition.
     parquet_read_budget: Arc<ParquetReadBudget>,
-    /// Exact single-leaf predicate evaluated by the global index during
-    /// execution. Its row IDs are materialized one shard group at a time.
-    streaming_global_index: Option<(Predicate, i64)>,
 }
 
 impl PaimonTableScan {
@@ -890,17 +884,7 @@ impl PaimonTableScan {
             runtime_filters: Vec::new(),
             decoder_filters: Vec::new(),
             parquet_read_budget,
-            streaming_global_index: None,
         }
-    }
-
-    pub(crate) fn with_streaming_global_index(
-        mut self,
-        predicate: Predicate,
-        snapshot_id: i64,
-    ) -> Self {
-        self.streaming_global_index = Some((predicate, snapshot_id));
-        self
     }
 
     pub fn table(&self) -> &Table {
@@ -1088,9 +1072,9 @@ impl ExecutionPlan for PaimonTableScan {
         let runtime_filters = self.runtime_filters.clone();
         let decoder_filters = self.decoder_filters.clone();
         let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
-        let streaming_global_index = self.streaming_global_index.clone();
 
         let fut = async move {
+            let mut read_builder = table.new_read_builder();
             let runtime_filter_plan = partition_runtime_decoder_filters(
                 &decoder_filters,
                 table.schema().fields(),
@@ -1098,125 +1082,23 @@ impl ExecutionPlan for PaimonTableScan {
             );
             let mut paimon_predicates = pushed_predicate.into_iter().collect::<Vec<_>>();
             paimon_predicates.extend(runtime_filter_plan.paimon_predicates);
-            let decoder_predicate = if runtime_filter_plan.datafusion_filters.is_empty() {
-                None
-            } else {
-                Some(conjunction(runtime_filter_plan.datafusion_filters))
-            };
 
-            let stream: paimon::table::ArrowRecordBatchStream =
-                if let Some((index_predicate, snapshot_id)) = streaming_global_index {
-                    let indexed_schema = Arc::clone(&schema);
-                    Box::pin(async_stream::try_stream! {
-                        let combined_paimon_predicate = if paimon_predicates.is_empty() {
-                            None
-                        } else {
-                            Some(Predicate::and(paimon_predicates.clone()))
-                        };
-                        let build_read_builder = || {
-                            let mut read_builder = table.new_read_builder();
-                            read_builder.with_case_sensitive(case_sensitive);
-                            read_builder.with_read_type(read_type.clone());
-                            if let Some(predicate) = combined_paimon_predicate.as_ref() {
-                                read_builder.with_filter(predicate.clone());
-                            }
-                            read_builder.with_parquet_read_budget(Arc::clone(&parquet_read_budget));
-                            read_builder
-                        };
-                        let build_read = || -> paimon::Result<_> {
-                            let mut read = build_read_builder().new_read()?;
-                            if let Some(predicate) = decoder_predicate.as_ref() {
-                                read = read.with_row_filter_factory(Arc::new(
-                                    DataFusionRowFilterFactory::new(
-                                        Arc::clone(predicate),
-                                        Arc::clone(&indexed_schema),
-                                    ),
-                                ));
-                            }
-                            Ok(read)
-                        };
+            read_builder.with_case_sensitive(case_sensitive);
+            read_builder.with_read_type(read_type);
+            if !paimon_predicates.is_empty() {
+                read_builder.with_filter(Predicate::and(paimon_predicates));
+            }
+            read_builder.with_parquet_read_budget(parquet_read_budget);
 
-                        // Snapshot and manifest-list metadata are immutable for this
-                        // execution. Resolve them once; each row-id batch will only
-                        // open the individual manifests overlapping that batch.
-                        let prepared_snapshot = build_read_builder()
-                            .new_scan()
-                            .prepare_snapshot_id(snapshot_id)
-                            .await?;
-                        let data_ranges = if table
-                            .schema()
-                            .core_options()
-                            .global_index_search_mode()?
-                            == GlobalIndexSearchMode::Detail
-                        {
-                            build_read_builder()
-                                .new_scan()
-                                .prepared_detail_data_ranges(&prepared_snapshot)
-                                .await?
-                        } else {
-                            Vec::new()
-                        };
-
-                        let range_stream = paimon::table::stream_global_index_row_ranges(
-                            table.clone(),
-                            snapshot_id,
-                            index_predicate,
-                            data_ranges,
-                        )
-                        .await?;
-
-                        match range_stream {
-                            Some(mut range_stream) => {
-                                while let Some(row_ranges) = range_stream.try_next().await? {
-                                    let batch_splits = build_read_builder()
-                                        .new_scan()
-                                        .with_row_ranges(row_ranges)
-                                        .plan_prepared_snapshot(&prepared_snapshot)
-                                        .await?
-                                        .into_splits();
-                                    if batch_splits.is_empty() {
-                                        continue;
-                                    }
-                                    let read = build_read()?;
-                                    let mut batches = read.to_arrow(&batch_splits)?;
-                                    while let Some(batch) = batches.try_next().await? {
-                                        yield batch;
-                                    }
-                                }
-                            }
-                            None => {
-                                // Preserve correctness if the selected snapshot has no
-                                // compatible index. This fallback is planned lazily so
-                                // indexed queries never materialize a query-wide file plan.
-                                let batch_splits = build_read_builder()
-                                    .new_scan()
-                                    .plan_prepared_snapshot(&prepared_snapshot)
-                                    .await?
-                                    .into_splits();
-                                let read = build_read()?;
-                                let mut batches = read.to_arrow(&batch_splits)?;
-                                while let Some(batch) = batches.try_next().await? {
-                                    yield batch;
-                                }
-                            }
-                        }
-                    })
-                } else {
-                    let mut read_builder = table.new_read_builder();
-                    read_builder.with_case_sensitive(case_sensitive);
-                    read_builder.with_read_type(read_type);
-                    if !paimon_predicates.is_empty() {
-                        read_builder.with_filter(Predicate::and(paimon_predicates));
-                    }
-                    read_builder.with_parquet_read_budget(parquet_read_budget);
-                    let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
-                    if let Some(predicate) = decoder_predicate {
-                        read = read.with_row_filter_factory(Arc::new(
-                            DataFusionRowFilterFactory::new(predicate, Arc::clone(&schema)),
-                        ));
-                    }
-                    read.to_arrow(&splits).map_err(to_datafusion_error)?
-                };
+            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
+            if !runtime_filter_plan.datafusion_filters.is_empty() {
+                let predicate = conjunction(runtime_filter_plan.datafusion_filters);
+                read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
+                    predicate,
+                    Arc::clone(&schema),
+                )));
+            }
+            let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
                 let mut batch = result
@@ -1255,9 +1137,6 @@ impl ExecutionPlan for PaimonTableScan {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
-        if self.streaming_global_index.is_some() {
-            return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
-        }
         let partitions: &[Arc<[DataSplit]>] = match partition {
             Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
             None => &self.planned_partitions,
@@ -1327,9 +1206,6 @@ impl DisplayAs for PaimonTableScan {
         write!(f, ", projection=[{}]", columns.join(", "))?;
         if let Some(ref predicate) = self.pushed_predicate {
             write!(f, ", predicate={predicate}")?;
-        }
-        if self.streaming_global_index.is_some() {
-            write!(f, ", global_index=streaming")?;
         }
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;

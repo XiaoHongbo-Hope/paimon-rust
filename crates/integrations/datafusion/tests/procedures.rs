@@ -17,11 +17,7 @@
 
 mod common;
 
-use common::{
-    assert_sql_error, collect_id_name, collect_id_name_in_batch_order, exec, row_count,
-    setup_sql_context,
-};
-use datafusion::physical_plan::displayable;
+use common::{assert_sql_error, collect_id_name, exec, row_count, setup_sql_context};
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -242,99 +238,6 @@ async fn test_create_global_index_btree_string_fallback_scan_reads() {
     )
     .await;
     assert_eq!(rows, vec![(1, "alice".to_string())]);
-}
-
-#[tokio::test]
-async fn test_global_index_order_by_limit_streams_all_shards_before_topk() {
-    let (_tmp, sql_context) = setup_sql_context().await;
-    exec(
-        &sql_context,
-        "CREATE TABLE paimon.test_db.btree_streaming_topk (
-            id INT,
-            name VARCHAR(100)
-        ) WITH (
-            'row-tracking.enabled' = 'true',
-            'data-evolution.enabled' = 'true',
-            'global-index.enabled' = 'true',
-            'global-index.row-count-per-shard' = '2',
-            'global-index.search-mode' = 'full',
-            'sorted-index.records-per-range' = '2'
-        )",
-    )
-    .await;
-    exec(
-        &sql_context,
-        "INSERT INTO paimon.test_db.btree_streaming_topk (id, name) VALUES
-         (1, 'alpha'), (2, 'alpine'), (3, 'amber'),
-         (4, 'azure'), (5, 'apple'), (6, 'apricot'),
-         (7, 'hot'), (8, 'hot'), (9, 'hot'),
-         (10, 'hot'), (11, 'hot'), (12, 'hot')",
-    )
-    .await;
-    exec(
-        &sql_context,
-        "CALL sys.create_global_index(
-            table => 'test_db.btree_streaming_topk',
-            index_column => 'name',
-            index_type => 'btree')",
-    )
-    .await;
-
-    for sql in [
-        "SELECT id, name
-         FROM paimon.test_db.btree_streaming_topk
-         WHERE name = 'hot'
-         LIMIT 3",
-        "SELECT id, name
-         FROM paimon.test_db.btree_streaming_topk
-         WHERE name LIKE 'a%'
-         LIMIT 3",
-    ] {
-        let physical_plan = sql_context
-            .sql(sql)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let explain = displayable(physical_plan.as_ref()).indent(true).to_string();
-        assert!(
-            explain.contains("global_index=streaming"),
-            "expected execution-time global-index scan, got:\n{explain}"
-        );
-
-        let rows = collect_id_name_in_batch_order(&sql_context, sql).await;
-        assert_eq!(rows.len(), 3);
-        if sql.contains("= 'hot'") {
-            assert!(rows.iter().all(|(_, name)| name == "hot"));
-        } else {
-            assert!(rows.iter().all(|(_, name)| name.starts_with('a')));
-        }
-    }
-
-    let sql = "SELECT id, name
-         FROM paimon.test_db.btree_streaming_topk
-         WHERE name LIKE 'a%'
-         ORDER BY id DESC
-         LIMIT 2";
-    let physical_plan = sql_context
-        .sql(sql)
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-    let explain = displayable(physical_plan.as_ref()).indent(true).to_string();
-    assert!(
-        explain.contains("global_index=streaming"),
-        "expected execution-time global-index scan, got:\n{explain}"
-    );
-
-    let rows = collect_id_name_in_batch_order(&sql_context, sql).await;
-    assert_eq!(
-        rows,
-        vec![(6, "apricot".to_string()), (5, "apple".to_string())]
-    );
 }
 
 #[tokio::test]

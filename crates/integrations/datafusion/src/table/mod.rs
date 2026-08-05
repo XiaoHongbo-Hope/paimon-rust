@@ -333,9 +333,6 @@ pub(crate) struct PaimonScanBuilder<'a> {
     /// Column-name case sensitivity, carried into the physical scan so execute()
     /// resolves names the same way planning did.
     pub(crate) case_sensitive: bool,
-    /// Exact single-leaf predicate whose global-index row IDs are consumed in
-    /// bounded batches during execution rather than materialized in planning.
-    pub(crate) streaming_global_index: Option<(paimon::spec::Predicate, i64)>,
 }
 
 impl PaimonScanBuilder<'_> {
@@ -375,7 +372,7 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        let scan = PaimonTableScan::try_new(
+        Ok(Arc::new(PaimonTableScan::try_new(
             projected_schema,
             self.table.clone(),
             read_type,
@@ -386,13 +383,7 @@ impl PaimonScanBuilder<'_> {
             self.scan_trace,
             None,
             self.case_sensitive,
-        )?;
-        Ok(Arc::new(match self.streaming_global_index {
-            Some((predicate, snapshot_id)) => {
-                scan.with_streaming_global_index(predicate, snapshot_id)
-            }
-            None => scan,
-        }))
+        )?))
     }
 }
 
@@ -429,8 +420,7 @@ impl TableProvider for PaimonTableProvider {
         // Case-insensitive column matching is therefore offered only through the
         // direct ReadBuilder API (core / C / Python), not via SQL.
         let case_sensitive = true;
-        // Normal scans plan splits eagerly. Eligible global-index scans defer
-        // both row-id lookup and file planning to bounded execution batches.
+        // Plan splits eagerly so we know partition count upfront.
         let filter_analysis =
             analyze_filters(filters, self.table.schema().fields(), case_sensitive);
         let mut read_builder = self.table.new_read_builder();
@@ -450,52 +440,16 @@ impl TableProvider for PaimonTableProvider {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let streaming_table_eligible = core_options.data_evolution_enabled()
-            && core_options.global_index_enabled()
-            && self.table.schema().primary_keys().is_empty()
-            && !core_options.deletion_vectors_enabled();
-        let streaming_global_index_predicate = filter_analysis
-            .pushed_predicate
-            .as_ref()
-            .filter(|predicate| {
-                pushed_limit.is_none()
-                    && streaming_table_eligible
-                    && paimon::table::is_streaming_global_index_predicate(predicate)
-            })
-            .cloned();
         let scan = read_builder.new_scan();
-        // Resolve only the snapshot here. Indexed execution plans each bounded
-        // row-id batch against that snapshot, avoiding an eager full-table file
-        // plan during EXPLAIN / physical planning.
-        let (plan, scan_trace, streaming_global_index) =
-            if let Some(predicate) = streaming_global_index_predicate {
-                match await_with_runtime(scan.resolve_snapshot_id())
-                    .await
-                    .map_err(to_datafusion_error)?
-                {
-                    Some(snapshot_id) => (
-                        paimon::table::Plan::new(Vec::new()),
-                        None,
-                        Some((predicate, snapshot_id)),
-                    ),
-                    None => (paimon::table::Plan::new(Vec::new()), None, None),
-                }
-            } else {
-                let (plan, trace) = await_with_runtime(scan.plan_with_trace())
-                    .await
-                    .map_err(to_datafusion_error)?;
-                (plan, Some(trace), None)
-            };
+        // DataFusion's Python FFI may poll `TableProvider::scan()` without an active
+        // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
+        // reading Paimon metadata, so we must provide a runtime here instead of
+        // assuming the caller already entered one.
+        let (plan, scan_trace) = await_with_runtime(scan.plan_with_trace())
+            .await
+            .map_err(to_datafusion_error)?;
 
-        // A streaming index scan owns one ordered sequence of disjoint shard
-        // groups. One execution partition prevents duplicate index work; the
-        // file reader still parallelizes row groups within its configured budget.
-        let target = if streaming_global_index.is_some() {
-            1
-        } else {
-            state.config_options().execution.target_partitions
-        };
+        let target = state.config_options().execution.target_partitions;
         let filter_exact = !filter_analysis.requires_residual
             && filter_analysis
                 .pushed_predicate
@@ -505,14 +459,13 @@ impl TableProvider for PaimonTableProvider {
             table: &self.table,
             schema: &self.schema,
             plan,
-            scan_trace,
+            scan_trace: Some(scan_trace),
             projection,
             pushed_predicate: filter_analysis.pushed_predicate,
             limit: pushed_limit,
             target_partitions: target,
             filter_exact,
             case_sensitive,
-            streaming_global_index,
         }
         .build()
     }

@@ -51,55 +51,14 @@ use crate::table::source::{
 };
 use crate::table::ScanTrace;
 use futures::{StreamExt, TryStreamExt};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
 const INDEX_DIR: &str = "index";
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
-const PREPARED_MANIFEST_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Debug, Default)]
-struct PreparedManifestCacheState {
-    entries: HashMap<String, bytes::Bytes>,
-    order: VecDeque<String>,
-    total_bytes: usize,
-}
-
-#[derive(Debug, Default)]
-struct PreparedManifestCache {
-    state: Mutex<PreparedManifestCacheState>,
-}
-
-impl PreparedManifestCache {
-    fn get(&self, path: &str) -> Option<bytes::Bytes> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.entries.get(path).cloned()
-    }
-
-    fn insert(&self, path: String, bytes: bytes::Bytes) {
-        if bytes.len() > PREPARED_MANIFEST_CACHE_MAX_BYTES {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.entries.contains_key(&path) {
-            return;
-        }
-        while state.total_bytes.saturating_add(bytes.len()) > PREPARED_MANIFEST_CACHE_MAX_BYTES {
-            let Some(oldest) = state.order.pop_front() else {
-                break;
-            };
-            if let Some(evicted) = state.entries.remove(&oldest) {
-                state.total_bytes = state.total_bytes.saturating_sub(evicted.len());
-            }
-        }
-        state.total_bytes = state.total_bytes.saturating_add(bytes.len());
-        state.order.push_back(path.clone());
-        state.entries.insert(path, bytes);
-    }
-}
 
 #[derive(Debug, Default)]
 struct ManifestReadCounters {
@@ -181,95 +140,37 @@ async fn read_all_manifest_entries(
     }
     manifest_files.extend(delta);
 
-    read_manifest_entries_from_files(
-        file_io,
-        table_path,
-        &manifest_files,
-        skip_level_zero,
-        scan_all_files,
-        has_primary_keys,
-        partition_filter,
-        partition_fields,
-        data_predicates,
-        current_schema_id,
-        schema_fields,
-        bucket_predicate,
-        bucket_key_fields,
-        bucket_function_type,
-        row_range_index,
-        None,
-        trace,
-    )
-    .await
-}
-
-/// Reads and filters entries from an already-resolved snapshot manifest list.
-///
-/// Execution-time streaming scans reuse the immutable manifest-file metadata
-/// across row-id batches. This avoids fetching and decoding the snapshot and
-/// both manifest-list Avro files for every batch while preserving row-range
-/// pruning before individual manifest files are opened.
-#[allow(clippy::too_many_arguments)]
-async fn read_manifest_entries_from_files(
-    file_io: &FileIO,
-    table_path: &str,
-    manifest_files: &[crate::spec::ManifestFileMeta],
-    skip_level_zero: bool,
-    scan_all_files: bool,
-    has_primary_keys: bool,
-    partition_filter: Option<&PartitionFilter>,
-    partition_fields: &[DataField],
-    data_predicates: &[Predicate],
-    current_schema_id: i64,
-    schema_fields: &[DataField],
-    bucket_predicate: Option<&Predicate>,
-    bucket_key_fields: &[DataField],
-    bucket_function_type: BucketFunctionType,
-    row_range_index: Option<&RowRangeIndex>,
-    manifest_cache: Option<Arc<PreparedManifestCache>>,
-    trace: Option<&mut ScanTrace>,
-) -> crate::Result<Vec<ManifestEntry>> {
-    let mut trace = trace;
-
     // Manifest-file-level partition stats pruning: skip entire manifest files
     // whose partition range doesn't overlap the partition predicate.
     let manifest_files_before_partition_pruning = manifest_files.len();
-    let manifest_files = manifest_files
-        .iter()
-        .filter(|meta| {
-            if let Some(pf) = partition_filter {
-                if !partition_fields.is_empty() {
-                    let stats = meta.partition_stats();
-                    let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
-                    let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
-                    let null_counts = stats.null_counts().clone();
-                    let file_stats = FileStatsRows::for_manifest_partition(
-                        meta.num_added_files() + meta.num_deleted_files(),
-                        min_values,
-                        max_values,
-                        null_counts,
-                    );
-                    if !pf.matches_manifest(&file_stats, partition_fields) {
-                        return false;
-                    }
-                }
-            }
-            true
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let manifest_files_after_partition_pruning = manifest_files.len();
-    let manifest_files = manifest_files
-        .into_iter()
-        .filter(|meta| {
-            row_range_index.is_none_or(|index| manifest_file_overlaps_row_range_index(meta, index))
-        })
-        .collect::<Vec<_>>();
+    if let Some(pf) = partition_filter {
+        if !partition_fields.is_empty() {
+            manifest_files.retain(|meta| {
+                let stats = meta.partition_stats();
+                let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
+                let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
+                let null_counts = stats.null_counts().clone();
+                let file_stats = FileStatsRows::for_manifest_partition(
+                    meta.num_added_files() + meta.num_deleted_files(),
+                    min_values,
+                    max_values,
+                    null_counts,
+                );
+                pf.matches_manifest(&file_stats, partition_fields)
+            });
+        }
+    }
     if let Some(trace) = trace.as_deref_mut() {
         trace.manifest_files_before_partition_pruning = manifest_files_before_partition_pruning;
-        trace.manifest_files_after_partition_pruning = manifest_files_after_partition_pruning;
-        trace.manifest_files_pruned_by_row_ranges =
-            manifest_files_after_partition_pruning.saturating_sub(manifest_files.len());
+        trace.manifest_files_after_partition_pruning = manifest_files.len();
+    }
+
+    if let Some(index) = row_range_index {
+        let before = manifest_files.len();
+        retain_manifest_row_ranges(&mut manifest_files, index);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.manifest_files_pruned_by_row_ranges = before - manifest_files.len();
+        }
     }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
@@ -278,21 +179,9 @@ async fn read_manifest_entries_from_files(
         .map(|meta| {
             let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
             let cache = shared_cache.clone();
-            let manifest_cache = manifest_cache.clone();
             async move {
-                let content = if let Some(content) = manifest_cache
-                    .as_ref()
-                    .and_then(|manifest_cache| manifest_cache.get(&path))
-                {
-                    content
-                } else {
-                    let input_file = file_io.new_input(&path)?;
-                    let content = input_file.read().await?;
-                    if let Some(manifest_cache) = manifest_cache.as_ref() {
-                        manifest_cache.insert(path.clone(), content.clone());
-                    }
-                    content
-                };
+                let input_file = file_io.new_input(&path)?;
+                let content = input_file.read().await?;
 
                 // Per-task bucket cache (few distinct total_buckets values per manifest).
                 let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
@@ -886,21 +775,6 @@ async fn prune_data_evolution_group_by_read_fields(
 #[derive(Debug, Clone)]
 pub struct TableScan<'a>(TableScanKind<'a>);
 
-/// Immutable snapshot metadata reused by execution-time row-range scans.
-///
-/// The snapshot and its base/delta manifest lists are fixed for the lifetime of
-/// a query. Keeping them here prevents every streamed row-id batch from reading
-/// and decoding the same metadata files again. Individual manifest files remain
-/// lazy and are pruned by the batch row ranges before they are opened.
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct PreparedSnapshotScan {
-    table_location: Arc<str>,
-    snapshot: Snapshot,
-    manifest_files: Arc<[crate::spec::ManifestFileMeta]>,
-    manifest_cache: Arc<PreparedManifestCache>,
-}
-
 #[derive(Debug, Clone)]
 enum TableScanKind<'a> {
     Paimon(PaimonTableScan<'a>),
@@ -976,74 +850,6 @@ impl<'a> TableScan<'a> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.plan_with_trace().await,
             TableScanKind::Format(scan) => scan.plan_with_trace().await,
-        }
-    }
-
-    /// Resolve the snapshot selected by this scan without materializing its
-    /// manifests or data-file splits.
-    #[doc(hidden)]
-    pub async fn resolve_snapshot_id(&self) -> crate::Result<Option<i64>> {
-        match &self.0 {
-            TableScanKind::Paimon(scan) => scan.resolve_snapshot_id().await,
-            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not expose a Paimon snapshot id".to_string(),
-            }),
-        }
-    }
-
-    /// Plan this scan against one already-resolved snapshot.
-    ///
-    /// Execution-time global-index scans use this after attaching a bounded
-    /// row-range batch, so they never need an eager query-wide file plan.
-    #[doc(hidden)]
-    pub async fn plan_snapshot_id(&self, snapshot_id: i64) -> crate::Result<Plan> {
-        match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_snapshot_id(snapshot_id).await,
-            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support snapshot-id planning".to_string(),
-            }),
-        }
-    }
-
-    /// Resolve one snapshot and cache its immutable manifest-list metadata.
-    #[doc(hidden)]
-    pub async fn prepare_snapshot_id(
-        &self,
-        snapshot_id: i64,
-    ) -> crate::Result<PreparedSnapshotScan> {
-        match &self.0 {
-            TableScanKind::Paimon(scan) => scan.prepare_snapshot_id(snapshot_id).await,
-            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support prepared snapshot planning".to_string(),
-            }),
-        }
-    }
-
-    /// Plan one row-range batch using previously resolved snapshot metadata.
-    #[doc(hidden)]
-    pub async fn plan_prepared_snapshot(
-        &self,
-        prepared: &PreparedSnapshotScan,
-    ) -> crate::Result<Plan> {
-        match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_prepared_snapshot(prepared).await,
-            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support prepared snapshot planning".to_string(),
-            }),
-        }
-    }
-
-    /// Resolve the exact live data-file row ranges for DETAIL index mode.
-    #[doc(hidden)]
-    pub async fn prepared_detail_data_ranges(
-        &self,
-        prepared: &PreparedSnapshotScan,
-    ) -> crate::Result<Vec<RowRange>> {
-        match &self.0 {
-            TableScanKind::Paimon(scan) => scan.prepared_detail_data_ranges(prepared).await,
-            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not expose Paimon data row ranges".to_string(),
-            }),
         }
     }
 
@@ -1206,99 +1012,6 @@ impl<'a> PaimonTableScan<'a> {
             .await
     }
 
-    async fn resolve_snapshot_id(&self) -> crate::Result<Option<i64>> {
-        self.ensure_query_auth_allowed()?;
-        Ok(super::time_travel::resolve_snapshot(self.table)
-            .await?
-            .map(|snapshot| snapshot.id()))
-    }
-
-    async fn plan_snapshot_id(&self, snapshot_id: i64) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let snapshot = self
-            .table
-            .snapshot_manager()
-            .get_snapshot(snapshot_id)
-            .await?;
-        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
-            .await
-    }
-
-    async fn prepare_snapshot_id(&self, snapshot_id: i64) -> crate::Result<PreparedSnapshotScan> {
-        self.ensure_query_auth_allowed()?;
-        let snapshot = self
-            .table
-            .snapshot_manager()
-            .get_snapshot(snapshot_id)
-            .await?;
-        let table_path = self.table.location();
-        let (mut manifest_files, delta) = futures::try_join!(
-            read_manifest_list(
-                self.table.file_io(),
-                table_path,
-                snapshot.base_manifest_list(),
-            ),
-            read_manifest_list(
-                self.table.file_io(),
-                table_path,
-                snapshot.delta_manifest_list(),
-            ),
-        )?;
-        manifest_files.extend(delta);
-        Ok(PreparedSnapshotScan {
-            table_location: Arc::from(table_path),
-            snapshot,
-            manifest_files: manifest_files.into(),
-            manifest_cache: Arc::new(PreparedManifestCache::default()),
-        })
-    }
-
-    fn validate_prepared_snapshot(&self, prepared: &PreparedSnapshotScan) -> crate::Result<()> {
-        if prepared.table_location.as_ref() != self.table.location() {
-            return Err(crate::Error::ConfigInvalid {
-                message: format!(
-                    "Prepared snapshot belongs to table '{}', not '{}'",
-                    prepared.table_location,
-                    self.table.location()
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    async fn plan_prepared_snapshot(&self, prepared: &PreparedSnapshotScan) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
-        self.validate_prepared_snapshot(prepared)?;
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        self.plan_snapshot_with_manifest_files(
-            prepared.snapshot.clone(),
-            data_evolution_read_field_ids.as_ref(),
-            None,
-            Some(prepared.manifest_files.as_ref()),
-            Some(Arc::clone(&prepared.manifest_cache)),
-        )
-        .await
-    }
-
-    async fn prepared_detail_data_ranges(
-        &self,
-        prepared: &PreparedSnapshotScan,
-    ) -> crate::Result<Vec<RowRange>> {
-        self.ensure_query_auth_allowed()?;
-        self.validate_prepared_snapshot(prepared)?;
-        let entries = self
-            .plan_manifest_entries_from_files_with_trace(
-                &prepared.snapshot,
-                prepared.manifest_files.as_ref(),
-                Some(Arc::clone(&prepared.manifest_cache)),
-                None,
-                None,
-            )
-            .await?;
-        Ok(global_index_detail_data_ranges(&entries))
-    }
-
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         self.ensure_query_auth_allowed()?;
@@ -1378,36 +1091,6 @@ impl<'a> PaimonTableScan<'a> {
         row_range_index: Option<&RowRangeIndex>,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Vec<ManifestEntry>> {
-        self.plan_manifest_entries_with_optional_files(snapshot, None, None, row_range_index, trace)
-            .await
-    }
-
-    async fn plan_manifest_entries_from_files_with_trace(
-        &self,
-        snapshot: &Snapshot,
-        manifest_files: &[crate::spec::ManifestFileMeta],
-        manifest_cache: Option<Arc<PreparedManifestCache>>,
-        row_range_index: Option<&RowRangeIndex>,
-        trace: Option<&mut ScanTrace>,
-    ) -> crate::Result<Vec<ManifestEntry>> {
-        self.plan_manifest_entries_with_optional_files(
-            snapshot,
-            Some(manifest_files),
-            manifest_cache,
-            row_range_index,
-            trace,
-        )
-        .await
-    }
-
-    async fn plan_manifest_entries_with_optional_files(
-        &self,
-        snapshot: &Snapshot,
-        manifest_files: Option<&[crate::spec::ManifestFileMeta]>,
-        manifest_cache: Option<Arc<PreparedManifestCache>>,
-        row_range_index: Option<&RowRangeIndex>,
-        trace: Option<&mut ScanTrace>,
-    ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -1464,48 +1147,25 @@ impl<'a> PaimonTableScan<'a> {
         };
         let bucket_function_type = core_options.bucket_function_type()?;
 
-        let entries = if let Some(manifest_files) = manifest_files {
-            read_manifest_entries_from_files(
-                file_io,
-                table_path,
-                manifest_files,
-                skip_level_zero,
-                self.scan_all_files,
-                has_primary_keys,
-                self.partition_filter.as_ref(),
-                &partition_fields,
-                &pushdown_data_predicates,
-                self.table.schema().id(),
-                self.table.schema().fields(),
-                self.bucket_predicate.as_ref(),
-                &bucket_key_fields,
-                bucket_function_type,
-                row_range_index,
-                manifest_cache,
-                trace,
-            )
-            .await?
-        } else {
-            read_all_manifest_entries(
-                file_io,
-                table_path,
-                snapshot,
-                skip_level_zero,
-                self.scan_all_files,
-                has_primary_keys,
-                self.partition_filter.as_ref(),
-                &partition_fields,
-                &pushdown_data_predicates,
-                self.table.schema().id(),
-                self.table.schema().fields(),
-                self.bucket_predicate.as_ref(),
-                &bucket_key_fields,
-                bucket_function_type,
-                row_range_index,
-                trace,
-            )
-            .await?
-        };
+        let entries = read_all_manifest_entries(
+            file_io,
+            table_path,
+            snapshot,
+            skip_level_zero,
+            self.scan_all_files,
+            has_primary_keys,
+            self.partition_filter.as_ref(),
+            &partition_fields,
+            &pushdown_data_predicates,
+            self.table.schema().id(),
+            self.table.schema().fields(),
+            self.bucket_predicate.as_ref(),
+            &bucket_key_fields,
+            bucket_function_type,
+            row_range_index,
+            trace,
+        )
+        .await?;
         Ok(entries)
     }
 
@@ -1518,14 +1178,12 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if self.row_ranges.is_none()
-            && should_use_global_index_row_range_optimization(
-                self.row_range_optimization_disabled,
-                data_evolution_enabled,
-                core_options.global_index_enabled(),
-                !self.data_predicates.is_empty(),
-            )
-        {
+        if should_use_global_index_row_range_optimization(
+            self.row_range_optimization_disabled,
+            data_evolution_enabled,
+            core_options.global_index_enabled(),
+            !self.data_predicates.is_empty(),
+        ) {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.global_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
@@ -1948,25 +1606,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: Snapshot,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
-        trace: Option<&mut ScanTrace>,
-    ) -> crate::Result<Plan> {
-        self.plan_snapshot_with_manifest_files(
-            snapshot,
-            data_evolution_read_field_ids,
-            trace,
-            None,
-            None,
-        )
-        .await
-    }
-
-    async fn plan_snapshot_with_manifest_files(
-        &self,
-        snapshot: Snapshot,
-        data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
-        manifest_files: Option<&[crate::spec::ManifestFileMeta]>,
-        manifest_cache: Option<Arc<PreparedManifestCache>>,
     ) -> crate::Result<Plan> {
         if matches!(self.limit, Some(0)) {
             if let Some(trace) = trace {
@@ -1999,23 +1639,13 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             None
         };
-        let entries = if let Some(manifest_files) = manifest_files {
-            self.plan_manifest_entries_from_files_with_trace(
-                &snapshot,
-                manifest_files,
-                manifest_cache,
-                row_range_index.as_ref(),
-                trace.as_deref_mut(),
-            )
-            .await?
-        } else {
-            self.plan_manifest_entries_with_trace(
+        let entries = self
+            .plan_manifest_entries_with_trace(
                 &snapshot,
                 row_range_index.as_ref(),
                 trace.as_deref_mut(),
             )
-            .await?
-        };
+            .await?;
         let effective_row_ranges = self
             .effective_row_ranges(
                 &snapshot,
@@ -3169,92 +2799,6 @@ mod tests {
             .map(|file| file.file_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(delta_files, vec!["a-new", "a-old"]);
-    }
-
-    #[tokio::test]
-    async fn test_prepared_snapshot_reuses_manifest_lists_and_detail_ranges() {
-        let table_path = "memory:/prepared_snapshot_manifest_reuse";
-        let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "name"));
-        setup_scan_trace_dirs(&table).await;
-
-        TableCommit::new(table.clone(), "prepared-snapshot-test".to_string())
-            .commit(vec![CommitMessage::new(
-                BinaryRowBuilder::new(0).build_serialized(),
-                0,
-                vec![
-                    make_evo_file("left.parquet", 10, 100, 1, Some(0)),
-                    make_evo_file("right.parquet", 10, 100, 2, Some(400)),
-                ],
-            )])
-            .await
-            .unwrap();
-
-        let snapshot = table
-            .snapshot_manager()
-            .get_latest_snapshot()
-            .await
-            .unwrap()
-            .unwrap();
-        let mut read_builder = table.new_read_builder();
-        let prepared = read_builder
-            .new_scan()
-            .prepare_snapshot_id(snapshot.id())
-            .await
-            .unwrap();
-
-        // Removing the snapshot and manifest-list files proves subsequent batch
-        // planning uses the prepared immutable metadata rather than reopening it.
-        let snapshot_manager = table.snapshot_manager();
-        table
-            .file_io()
-            .delete_file(&snapshot_manager.snapshot_path(snapshot.id()))
-            .await
-            .unwrap();
-        for list_name in [
-            snapshot.base_manifest_list(),
-            snapshot.delta_manifest_list(),
-        ] {
-            if !list_name.is_empty() {
-                table
-                    .file_io()
-                    .delete_file(&snapshot_manager.manifest_path(list_name))
-                    .await
-                    .unwrap();
-            }
-        }
-
-        let detail_ranges = read_builder
-            .new_scan()
-            .prepared_detail_data_ranges(&prepared)
-            .await
-            .unwrap();
-        assert_eq!(
-            detail_ranges,
-            vec![RowRange::new(0, 99), RowRange::new(400, 499)],
-            "DETAIL coverage must preserve the hole between live data files"
-        );
-        for manifest in prepared.manifest_files.iter() {
-            table
-                .file_io()
-                .delete_file(&snapshot_manager.manifest_path(manifest.file_name()))
-                .await
-                .unwrap();
-        }
-
-        read_builder.with_row_ranges(vec![RowRange::new(450, 450)]);
-        let plan = read_builder
-            .new_scan()
-            .plan_prepared_snapshot(&prepared)
-            .await
-            .unwrap();
-        assert_eq!(
-            plan.splits()
-                .iter()
-                .flat_map(|split| split.data_files())
-                .map(|file| file.file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["right.parquet"]
-        );
     }
 
     #[tokio::test]

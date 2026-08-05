@@ -37,7 +37,6 @@ use crate::spec::{
 };
 use crate::table::{DeletionFile, RowRange, Table};
 use crate::{Error, Result};
-use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
@@ -148,12 +147,8 @@ pub(crate) struct GlobalIndexScanner {
 struct GlobalIndexEntry {
     file_name: String,
     index_type: GlobalIndexFileKind,
-    partition: Vec<u8>,
-    bucket: i32,
-    extra_field_ids: Vec<i32>,
     file_size: i64,
     row_range_start: i64,
-    row_range_end: i64,
     meta: BTreeIndexMeta,
 }
 
@@ -349,12 +344,8 @@ impl GlobalIndexScanner {
                     BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
                     _ => unreachable!("normalized sorted global index type"),
                 },
-                partition: entry.partition.clone(),
-                bucket: entry.bucket,
-                extra_field_ids: global_meta.extra_field_ids.clone().unwrap_or_default(),
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
-                row_range_end: global_meta.row_range_end,
                 meta: sorted_meta,
             };
 
@@ -888,31 +879,6 @@ impl GlobalIndexScanner {
         }
     }
 
-    /// Open a BTree reader for the execution-time row-id stream without adding
-    /// it to the scan-wide cache. The stream visits each shard once, so caching
-    /// would retain every shard's index metadata until the query completes.
-    async fn open_streaming_btree_reader(
-        &self,
-        entry: &GlobalIndexEntry,
-        data_type: &DataType,
-        max_memory: usize,
-    ) -> Result<BTreeIndexReader<BoxedCmp>> {
-        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
-        let input = self.file_io.new_input(&path)?;
-        let file_size = input.metadata().await?.size;
-        let file_reader = input.reader().await?;
-        let cmp = make_key_comparator(data_type);
-        BTreeIndexReader::open_with_memory_limit(
-            Box::new(file_reader),
-            file_size,
-            &entry.meta,
-            cmp,
-            max_memory,
-        )
-        .await
-        .map_err(|error| Self::query_error(entry, error))
-    }
-
     async fn open_bitmap_reader(
         &self,
         file_name: &str,
@@ -1120,14 +1086,12 @@ fn add_file_size(total: &mut i64, file_size: i64) -> bool {
 
 /// Convert a RoaringTreemap to merged RowRanges (already sorted and deduplicated).
 fn bitmap_to_ranges(bitmap: &RoaringTreemap) -> Vec<RowRange> {
-    row_ids_to_ranges(bitmap.iter())
-}
-
-fn row_ids_to_ranges(mut iter: impl Iterator<Item = u64>) -> Vec<RowRange> {
-    let Some(first) = iter.next() else {
+    if bitmap.is_empty() {
         return Vec::new();
-    };
+    }
     let mut ranges = Vec::new();
+    let mut iter = bitmap.iter();
+    let first = iter.next().unwrap();
     let mut start = first as i64;
     let mut end = start;
 
@@ -1527,365 +1491,6 @@ pub(crate) async fn evaluate_global_index(
     Ok(Some(super::merge_row_ranges(row_ranges)))
 }
 
-/// A bounded stream of exact global row-id ranges.
-pub type GlobalIndexRowRangeStream = BoxStream<'static, Result<Vec<RowRange>>>;
-
-// Large enough to amortize file planning while keeping row-id vectors bounded.
-const STREAMING_GLOBAL_INDEX_BATCH_ROWS: usize = 250_000;
-// A corrupt or unusually large hotspot block must not exhaust the executor.
-const STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY: usize = 256 * 1024 * 1024;
-
-fn is_btree_primary_index_for_field(index_file: &IndexFileMeta, field_id: i32) -> bool {
-    index_file
-        .global_index_meta
-        .as_ref()
-        .is_some_and(|meta| meta.index_field_id == field_id)
-        && matches!(
-            normalize_sorted_global_index_type(&index_file.index_type),
-            Some(index_type) if index_type == BTREE_GLOBAL_INDEX_TYPE
-        )
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-struct StreamingBTreeIdentity {
-    partition: Vec<u8>,
-    bucket: i32,
-    extra_field_ids: Vec<i32>,
-}
-
-impl StreamingBTreeIdentity {
-    fn new(entry: &GlobalIndexEntry) -> Self {
-        Self {
-            partition: entry.partition.clone(),
-            bucket: entry.bucket,
-            extra_field_ids: entry.extra_field_ids.clone(),
-        }
-    }
-
-    fn scope(&self) -> (Vec<u8>, i32) {
-        (self.partition.clone(), self.bucket)
-    }
-}
-
-/// Assign one bounded row-range owner per logical BTree identity and scope.
-///
-/// Multiple files of one identity may deliberately share a row range because
-/// the writer partitions the key space across SST files. All of those files
-/// must be queried. Different identities in the same partition/bucket can also
-/// overlap; only one identity owns each row-id interval so their equivalent
-/// primary-key matches cannot produce duplicate table rows.
-fn streaming_btree_entry_ownership(
-    entries: &[GlobalIndexEntry],
-) -> Vec<(usize, Arc<RowRangeIndex>)> {
-    let mut by_identity: HashMap<StreamingBTreeIdentity, Vec<usize>> = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.index_type == GlobalIndexFileKind::BTree {
-            by_identity
-                .entry(StreamingBTreeIdentity::new(entry))
-                .or_default()
-                .push(index);
-        }
-    }
-
-    let mut identities = by_identity.keys().cloned().collect::<Vec<_>>();
-    identities.sort();
-    let mut claimed_by_scope: HashMap<(Vec<u8>, i32), Vec<RowRange>> = HashMap::new();
-    let mut owned_entries = Vec::new();
-
-    for identity in identities {
-        let indices = by_identity
-            .get_mut(&identity)
-            .expect("streaming BTree identity came from the same map");
-        indices.sort_unstable_by(|left, right| {
-            let left = &entries[*left];
-            let right = &entries[*right];
-            (
-                left.row_range_start,
-                left.row_range_end,
-                &left.meta.first_key,
-                &left.file_name,
-            )
-                .cmp(&(
-                    right.row_range_start,
-                    right.row_range_end,
-                    &right.meta.first_key,
-                    &right.file_name,
-                ))
-        });
-        let coverage = super::merge_row_ranges(
-            indices
-                .iter()
-                .map(|index| {
-                    let entry = &entries[*index];
-                    RowRange::new(entry.row_range_start, entry.row_range_end)
-                })
-                .collect(),
-        );
-        let claimed = claimed_by_scope.entry(identity.scope()).or_default();
-        let owned = super::source::exclude_row_ranges(&coverage, claimed);
-        claimed.extend(coverage);
-        *claimed = super::merge_row_ranges(std::mem::take(claimed));
-        if owned.is_empty() {
-            continue;
-        }
-
-        let owned = Arc::new(RowRangeIndex::create(owned));
-        owned_entries.extend(indices.iter().map(|index| (*index, Arc::clone(&owned))));
-    }
-
-    owned_entries
-}
-
-/// Whether a predicate can use the execution-time BTree row-id stream.
-///
-/// Keep this deliberately narrow. Compound predicates still use the regular
-/// planner because their shard-local results require global set operations.
-pub fn is_streaming_global_index_predicate(predicate: &Predicate) -> bool {
-    let predicate = match predicate {
-        Predicate::And(children) if children.len() == 1 => &children[0],
-        predicate => predicate,
-    };
-    matches!(
-        predicate,
-        Predicate::Leaf {
-            op: PredicateOperator::Eq | PredicateOperator::StartsWith | PredicateOperator::Like,
-            literals,
-            ..
-        } if literals.len() == 1
-    )
-}
-
-/// Build an execution-time BTree row-id stream for one equality or LIKE leaf.
-///
-/// The stream visits shards in coverage order and emits fixed-size row-id
-/// batches. Overlapping shards are assigned disjoint row-id intervals (the
-/// earliest shard owns the overlap), so no query-wide de-duplication bitmap is
-/// required. The normal data reader retains and evaluates the exact residual.
-///
-/// Returns `None` when no compatible BTree index is available; callers should
-/// then execute a normal scan.
-pub async fn stream_global_index_row_ranges(
-    table: Table,
-    snapshot_id: i64,
-    predicate: Predicate,
-    data_ranges: Vec<RowRange>,
-) -> Result<Option<GlobalIndexRowRangeStream>> {
-    if !is_streaming_global_index_predicate(&predicate) {
-        return Ok(None);
-    }
-
-    let core_options = table.schema().core_options();
-    if !core_options.data_evolution_enabled()
-        || !core_options.global_index_enabled()
-        || !table.schema().primary_keys().is_empty()
-        || core_options.deletion_vectors_enabled()
-    {
-        return Ok(None);
-    }
-
-    let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await?;
-    let Some(index_manifest_name) = snapshot.index_manifest() else {
-        return Ok(None);
-    };
-    let index_manifest_path = format!(
-        "{}/manifest/{index_manifest_name}",
-        table.location().trim_end_matches('/')
-    );
-    let index_entries =
-        crate::spec::IndexManifest::read(table.file_io(), &index_manifest_path).await?;
-    let scanner = match GlobalIndexScanner::create(
-        table.file_io(),
-        table.location().trim_end_matches('/'),
-        core_options.global_index_thread_num()?,
-        core_options.btree_index_fallback_scan_max_size()?,
-        core_options.bitmap_index_fallback_scan_max_size()?,
-        &index_entries,
-        table.schema().fields(),
-    )? {
-        Some(scanner) => Arc::new(scanner),
-        None => return Ok(None),
-    };
-
-    let predicate = match predicate {
-        Predicate::And(mut children) if children.len() == 1 => children.remove(0),
-        predicate => predicate,
-    };
-    let Predicate::Leaf {
-        column,
-        op,
-        literals,
-        data_type,
-        ..
-    } = predicate
-    else {
-        return Ok(None);
-    };
-    let Some(field_id) = scanner.find_field_id_by_name(&column)? else {
-        return Ok(None);
-    };
-    let Some(field_group_index) = scanner
-        .entries_by_field
-        .iter()
-        .position(|(candidate, _)| *candidate == field_id)
-    else {
-        return Ok(None);
-    };
-
-    let entries = &scanner.entries_by_field[field_group_index].1;
-    let owned_entries = streaming_btree_entry_ownership(entries);
-    if owned_entries.is_empty() {
-        return Ok(None);
-    }
-
-    let search_mode = core_options.global_index_search_mode()?;
-    let next_row_id = snapshot.next_row_id();
-    // DETAIL promises exact live data-file coverage. Callers such as DataFusion
-    // pass ranges from their prepared snapshot metadata; keep the public helper
-    // correct for other callers by resolving those ranges once when omitted.
-    // Falling back to [0, next_row_id) here would turn sparse coverage into a
-    // near-full-table read and erase the streaming path's latency benefit.
-    let detail_data_ranges =
-        if search_mode == GlobalIndexSearchMode::Detail && data_ranges.is_empty() {
-            let entries = table
-                .new_read_builder()
-                .new_scan()
-                .plan_manifest_entries(&snapshot)
-                .await?;
-            super::merge_row_ranges(
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        entry
-                            .file()
-                            .row_id_range()
-                            .map(|(from, to)| RowRange::new(from, to))
-                    })
-                    .collect(),
-            )
-        } else {
-            data_ranges
-        };
-    let unindexed_ranges = unindexed_ranges_for_global_index_entries(
-        &index_entries,
-        &HashSet::from([field_id]),
-        search_mode,
-        next_row_id,
-        &detail_data_ranges,
-        |index_file| is_btree_primary_index_for_field(index_file, field_id),
-    );
-
-    let serialized_literals = literals
-        .iter()
-        .map(|literal| serialize_datum(literal, &data_type))
-        .collect::<Vec<_>>();
-    let comparator = make_key_comparator(&data_type);
-    let stream = async_stream::try_stream! {
-        for (index, owned_ranges) in owned_entries {
-            let entry = &scanner.entries_by_field[field_group_index].1[index];
-            if entry.row_range_start < 0 || entry.row_range_end < entry.row_range_start {
-                Err(Error::DataInvalid {
-                    message: format!(
-                        "Global-index shard '{}' has invalid row range [{}, {}]",
-                        entry.file_name, entry.row_range_start, entry.row_range_end
-                    ),
-                    source: None,
-                })?;
-            }
-
-            if !entry.meta.may_match(op, &serialized_literals, &comparator) {
-                continue;
-            }
-
-            let entry_start = u64::try_from(entry.row_range_start).map_err(|_| {
-                Error::DataInvalid {
-                    message: format!(
-                        "Global-index shard '{}' has negative row_range_start {}",
-                        entry.file_name, entry.row_range_start
-                    ),
-                    source: None,
-                }
-            })?;
-            let reader = scanner
-                .open_streaming_btree_reader(
-                    entry,
-                    &data_type,
-                    STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY,
-                )
-                .await?;
-            let mut row_id_stream = reader
-                .into_query_row_id_stream(
-                    op,
-                    &literals,
-                    &data_type,
-                    STREAMING_GLOBAL_INDEX_BATCH_ROWS,
-                    STREAMING_GLOBAL_INDEX_MAX_BLOCK_MEMORY,
-                )
-                .map_err(|error| GlobalIndexScanner::query_error(entry, error))?;
-
-            while let Some(row_ids) = row_id_stream
-                .try_next()
-                .await
-                .map_err(|error| GlobalIndexScanner::query_error(entry, error))?
-            {
-                let mut absolute_row_ids = Vec::with_capacity(row_ids.len());
-                for row_id in row_ids {
-                    let absolute = row_id.checked_add(entry_start).ok_or_else(|| {
-                        Error::DataInvalid {
-                            message: format!(
-                                "Global-index shard '{}' row id overflow: {row_id} + {entry_start}",
-                                entry.file_name
-                            ),
-                            source: None,
-                        }
-                    })?;
-                    let absolute = i64::try_from(absolute).map_err(|_| Error::DataInvalid {
-                        message: format!(
-                            "Global-index shard '{}' produced a row id beyond i64::MAX",
-                            entry.file_name
-                        ),
-                        source: None,
-                    })?;
-                    if absolute > entry.row_range_end {
-                        Err(Error::DataInvalid {
-                            message: format!(
-                                "Global-index shard '{}' produced row id {absolute} outside [{}, {}]",
-                                entry.file_name, entry.row_range_start, entry.row_range_end
-                            ),
-                            source: None,
-                        })?;
-                    }
-                    if owned_ranges.intersects(absolute, absolute) {
-                        absolute_row_ids.push(absolute as u64);
-                    }
-                }
-
-                absolute_row_ids.sort_unstable();
-                absolute_row_ids.dedup();
-                let ranges = row_ids_to_ranges(absolute_row_ids.into_iter());
-                if !ranges.is_empty() {
-                    yield ranges;
-                }
-            }
-        }
-
-        // FULL and DETAIL include data not covered by a BTree index. Keep that
-        // tail bounded too; upstream Limit/TopK can stop polling when complete.
-        for range in unindexed_ranges {
-            let mut start = range.from();
-            while start <= range.to() {
-                let end = start
-                    .saturating_add(STREAMING_GLOBAL_INDEX_BATCH_ROWS as i64 - 1)
-                    .min(range.to());
-                yield vec![RowRange::new(start, end)];
-                if end == i64::MAX {
-                    break;
-                }
-                start = end + 1;
-            }
-        }
-    };
-    Ok(Some(Box::pin(stream)))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,54 +1552,6 @@ mod tests {
                 RowRange::new(10, 10),
             ]
         );
-    }
-
-    #[test]
-    fn test_streaming_btree_ownership_keeps_key_shards_and_scopes_disjoint_identities() {
-        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
-        let meta = BTreeIndexMeta::new(None, None, false);
-        let mut first_key_shard = make_global_index_entry("a", 1, 0, 99, &meta);
-        first_key_shard.partition = vec![1];
-        let mut second_key_shard = make_global_index_entry("b", 1, 0, 99, &meta);
-        second_key_shard.partition = vec![1];
-        let mut other_partition = make_global_index_entry("c", 1, 0, 99, &meta);
-        other_partition.partition = vec![2];
-        let mut overlapping_identity = make_global_index_entry("d", 1, 0, 149, &meta);
-        overlapping_identity.partition = vec![1];
-        overlapping_identity
-            .index_file
-            .global_index_meta
-            .as_mut()
-            .unwrap()
-            .extra_field_ids = Some(vec![2]);
-        let manifest_entries = vec![
-            first_key_shard,
-            second_key_shard,
-            other_partition,
-            overlapping_identity,
-        ];
-        let scanner = GlobalIndexScanner::create(
-            &file_io,
-            "memory:/t",
-            1,
-            i64::MAX,
-            i64::MAX,
-            &manifest_entries,
-            &two_field_schema_fields(),
-        )
-        .unwrap()
-        .unwrap();
-        let entries = scanner.entries_for_field(1).unwrap();
-
-        let owned = streaming_btree_entry_ownership(entries)
-            .into_iter()
-            .map(|(index, ranges)| (entries[index].file_name.as_str(), ranges.ranges().to_vec()))
-            .collect::<HashMap<_, _>>();
-
-        assert_eq!(owned["a"], vec![RowRange::new(0, 99)]);
-        assert_eq!(owned["b"], vec![RowRange::new(0, 99)]);
-        assert_eq!(owned["c"], vec![RowRange::new(0, 99)]);
-        assert_eq!(owned["d"], vec![RowRange::new(100, 149)]);
     }
 
     #[test]
@@ -2582,29 +2139,6 @@ mod tests {
             )
             .unwrap();
         assert!(ranges.is_empty());
-    }
-
-    #[test]
-    fn test_streaming_unindexed_ranges_ignore_extra_only_coverage() {
-        let meta = BTreeIndexMeta::new(None, None, false);
-        let mut extra_only = make_global_index_entry("idx_id_value", 1, 0, 99, &meta);
-        extra_only
-            .index_file
-            .global_index_meta
-            .as_mut()
-            .unwrap()
-            .extra_field_ids = Some(vec![2]);
-
-        let ranges = unindexed_ranges_for_global_index_entries(
-            &[extra_only],
-            &HashSet::from([2]),
-            GlobalIndexSearchMode::Full,
-            Some(100),
-            &[],
-            |index_file| is_btree_primary_index_for_field(index_file, 2),
-        );
-
-        assert_eq!(ranges, vec![RowRange::new(0, 99)]);
     }
 
     #[tokio::test]
