@@ -17,7 +17,7 @@
 
 //! Helpers shared by fixed-bucket postpone batch planning.
 
-use crate::spec::{BinaryRow, DataField, DataType, IntType};
+use crate::spec::{BinaryRow, DataField, DataType, IntType, VALUE_KIND_FIELD_NAME};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
     MapArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -28,16 +28,20 @@ use arrow_array::{
 /// Arrow allocation size is not a stable planning metric: offsets, views, and
 /// slicing can make the same logical rows occupy different Arrow memory. This
 /// estimator follows Paimon's internal BinaryRow/BinaryArray layouts without
-/// materializing a second copy of the batch.
+/// materializing a second copy of the batch. The trailing internal
+/// `_VALUE_KIND` column is not part of the user row and is excluded.
 pub(crate) fn binary_row_batch_size(
     batch: &RecordBatch,
     fields: &[DataField],
 ) -> crate::Result<i64> {
-    if batch.num_columns() != fields.len() {
+    let field_count = fields.len();
+    let has_value_kind = batch.num_columns() == field_count + 1
+        && batch.schema().field(field_count).name() == VALUE_KIND_FIELD_NAME
+        && batch.schema().field(field_count).data_type() == &arrow_schema::DataType::Int8;
+    if batch.num_columns() != field_count && !has_value_kind {
         return Err(crate::Error::DataInvalid {
             message: format!(
-                "BinaryRow size planning expected {} columns, got {}",
-                fields.len(),
+                "BinaryRow size planning expected {field_count} user columns with an optional trailing {VALUE_KIND_FIELD_NAME}, got {}",
                 batch.num_columns()
             ),
             source: None,
@@ -46,7 +50,7 @@ pub(crate) fn binary_row_batch_size(
 
     let mut total = 0_u128;
     for row in 0..batch.num_rows() {
-        total = total.saturating_add(row_size(batch.columns(), row, fields)?);
+        total = total.saturating_add(row_size(&batch.columns()[..field_count], row, fields)?);
     }
     Ok(total.min(i64::MAX as u128) as i64)
 }
@@ -332,7 +336,7 @@ mod tests {
     use super::*;
     use crate::spec::{ArrayType, IntType, LocalZonedTimestampType, TimestampType, VarCharType};
     use arrow_array::types::Int32Type;
-    use arrow_array::{Int32Array, ListArray, TimestampMicrosecondArray};
+    use arrow_array::{Int32Array, Int8Array, ListArray, TimestampMicrosecondArray};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
 
@@ -369,6 +373,30 @@ mod tests {
 
         assert_eq!(binary_row_batch_size(&batch, &fields).unwrap(), 32_000);
         assert_ne!(batch.get_array_memory_size() as i64, 32_000);
+    }
+
+    #[test]
+    fn test_internal_value_kind_is_excluded() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("value", ArrowDataType::Int32, false),
+            Field::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int8Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        assert_eq!(binary_row_batch_size(&batch, &fields).unwrap(), 24);
     }
 
     #[test]

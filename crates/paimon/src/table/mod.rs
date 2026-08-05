@@ -72,6 +72,7 @@ mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
 mod pk_vector_position_read;
 mod pk_vector_scan;
+mod postpone_batch_table_write;
 mod postpone_bucket;
 mod postpone_file_writer;
 mod prepared_files;

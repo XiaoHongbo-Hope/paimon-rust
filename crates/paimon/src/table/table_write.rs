@@ -21,24 +21,24 @@
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
 use crate::arrow::build_target_arrow_schema;
-use crate::spec::{batch_to_serialized_bytes, PartitionComputer};
+use crate::spec::PartitionComputer;
 use crate::spec::{
-    first_row_supports_changelog_producer, BinaryRow, BucketFunctionType, ChangelogProducer,
-    CoreOptions, DataField, DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW,
-    POSTPONE_BUCKET, VALUE_KIND_FIELD_NAME,
+    first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
+    DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
 use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
-use crate::table::bucket_function::{batch_bucket_ids, validate_bucket_function};
+use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
-use crate::table::postpone_bucket::binary_row_batch_size;
+use crate::table::postpone_batch_table_write::PostponeFixedBucketWriter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
@@ -54,28 +54,6 @@ enum FileWriter {
     AppendDedicated(Box<AppendDedicatedFormatFileWriter>),
     KeyValue(KeyValueFileWriter),
     Postpone(PostponeFileWriter),
-}
-
-/// Planning state for batch writes to postpone-bucket tables. Partitions with
-/// an existing real-bucket count are written incrementally, while only new
-/// partitions are buffered until their bucket count can be inferred.
-struct PostponeFixedBucketState {
-    partition_field_indices: Vec<usize>,
-    bucket_key_indices: Vec<usize>,
-    bucket_function_type: BucketFunctionType,
-    max_parallelism: i32,
-    target_rows_per_bucket: Option<i64>,
-    target_size_per_bucket: i64,
-    metadata_loaded: bool,
-    known_bucket_counts: HashMap<Vec<u8>, i32>,
-    postpone_row_counts: HashMap<Vec<u8>, i64>,
-    buffered_batches: HashMap<Vec<u8>, Vec<RecordBatch>>,
-    /// Bucket counts used by the current prepare-commit round.
-    bucket_counts: HashMap<Vec<u8>, i32>,
-    /// Fixed-bucket planning covers one complete batch. Reusing the writer
-    /// before its prepared messages are committed could re-plan new partitions
-    /// against a stale snapshot, so this mode is deliberately one-shot.
-    prepare_started: bool,
 }
 
 impl FileWriter {
@@ -149,7 +127,7 @@ pub struct TableWrite {
     has_dedicated_vector_fields: bool,
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
-    postpone_fixed_bucket: Option<PostponeFixedBucketState>,
+    postpone_fixed_bucket: Option<PostponeFixedBucketWriter>,
 }
 
 impl TableWrite {
@@ -334,48 +312,16 @@ impl TableWrite {
         let target_bucket_row_number = core_options.dynamic_bucket_target_row_num();
         let bucket_function_type = core_options.bucket_function_type()?;
 
-        let postpone_fixed_bucket = if use_postpone_fixed_bucket {
-            if total_buckets != POSTPONE_BUCKET || !has_primary_keys {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "Postpone fixed-bucket writes require a primary-key table with bucket=-2, but table '{}' has bucket={total_buckets}",
-                        table.identifier().full_name()
-                    ),
-                });
-            }
-            if core_options.deletion_vectors_enabled() {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "Table '{}' cannot use postpone fixed-bucket writes with deletion-vectors.enabled=true because deletion-vector scans skip the level-0 files produced by batch writers; use the normal postpone writer or disable deletion vectors",
-                        table.identifier().full_name()
-                    ),
-                });
-            }
-            let bucket_key_fields: Vec<DataField> = bucket_key_indices
-                .iter()
-                .map(|&idx| fields[idx].clone())
-                .collect();
-            if !bucket_key_fields.is_empty() {
-                validate_bucket_function(bucket_function_type, &bucket_key_fields)?;
-            }
-            Some(PostponeFixedBucketState {
-                partition_field_indices: partition_field_indices.clone(),
-                bucket_key_indices: bucket_key_indices.clone(),
-                bucket_function_type,
-                max_parallelism: core_options
-                    .postpone_batch_write_fixed_bucket_max_parallelism()?,
-                target_rows_per_bucket: core_options.postpone_target_row_num_per_bucket()?,
-                target_size_per_bucket: core_options.postpone_target_size_per_bucket()?,
-                metadata_loaded: false,
-                known_bucket_counts: HashMap::new(),
-                postpone_row_counts: HashMap::new(),
-                buffered_batches: HashMap::new(),
-                bucket_counts: HashMap::new(),
-                prepare_started: false,
+        let postpone_fixed_bucket = use_postpone_fixed_bucket
+            .then(|| {
+                PostponeFixedBucketWriter::new(
+                    table,
+                    partition_field_indices.clone(),
+                    bucket_key_indices.clone(),
+                    bucket_function_type,
+                )
             })
-        } else {
-            None
-        };
+            .transpose()?;
 
         let bucket_assigner = if is_dynamic_cross_partition {
             BucketAssignerEnum::CrossPartition(Box::new(CrossPartitionAssigner::new(
@@ -520,12 +466,8 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        if self
-            .postpone_fixed_bucket
-            .as_ref()
-            .is_some_and(|state| state.prepare_started)
-        {
-            return Err(Self::postpone_fixed_bucket_one_shot_error());
+        if let Some(writer) = self.postpone_fixed_bucket.as_ref() {
+            writer.ensure_writable()?;
         }
         self.validate_write_batch_schema(batch)?;
 
@@ -539,7 +481,20 @@ impl TableWrite {
         }
 
         if self.postpone_fixed_bucket.is_some() {
-            self.write_postpone_fixed_batch(&batch).await?;
+            let routed = self
+                .postpone_fixed_bucket
+                .as_mut()
+                .unwrap()
+                .write_batch(&self.table, &batch)
+                .await?;
+            for routed_batch in routed {
+                self.write_bucket(
+                    routed_batch.partition,
+                    routed_batch.bucket,
+                    routed_batch.batch,
+                )
+                .await?;
+            }
             return Ok(());
         }
 
@@ -853,256 +808,6 @@ impl TableWrite {
         })
     }
 
-    async fn ensure_postpone_bucket_metadata(&mut self) -> Result<()> {
-        let should_load = self
-            .postpone_fixed_bucket
-            .as_ref()
-            .is_some_and(|state| !state.metadata_loaded);
-        if !should_load {
-            return Ok(());
-        }
-
-        let (known_bucket_counts, postpone_row_counts) =
-            self.load_postpone_bucket_metadata().await?;
-        let state = self.postpone_fixed_bucket.as_mut().unwrap();
-        state.known_bucket_counts = known_bucket_counts;
-        state.postpone_row_counts = postpone_row_counts;
-        state.metadata_loaded = true;
-        Ok(())
-    }
-
-    async fn write_postpone_fixed_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.ensure_postpone_bucket_metadata().await?;
-
-        let (partition_field_indices, bucket_key_indices, bucket_function_type) = {
-            let state = self.postpone_fixed_bucket.as_ref().unwrap();
-            (
-                state.partition_field_indices.clone(),
-                state.bucket_key_indices.clone(),
-                state.bucket_function_type,
-            )
-        };
-        let partitions = if partition_field_indices.is_empty() {
-            vec![EMPTY_SERIALIZED_ROW.clone(); batch.num_rows()]
-        } else {
-            batch_to_serialized_bytes(
-                batch,
-                &partition_field_indices,
-                self.table.schema().fields(),
-            )?
-        };
-
-        let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-        for (row, partition) in partitions.into_iter().enumerate() {
-            groups.entry(partition).or_default().push(row);
-        }
-        for (partition, rows) in groups {
-            let sub_batch = Self::take_rows(batch, &rows)?;
-            let known_bucket_count = self
-                .postpone_fixed_bucket
-                .as_ref()
-                .unwrap()
-                .known_bucket_counts
-                .get(&partition)
-                .copied();
-            if let Some(total_buckets) = known_bucket_count {
-                self.postpone_fixed_bucket
-                    .as_mut()
-                    .unwrap()
-                    .bucket_counts
-                    .insert(partition.clone(), total_buckets);
-                self.route_postpone_fixed_batch(
-                    partition,
-                    sub_batch,
-                    total_buckets,
-                    &bucket_key_indices,
-                    bucket_function_type,
-                )
-                .await?;
-            } else {
-                self.postpone_fixed_bucket
-                    .as_mut()
-                    .unwrap()
-                    .buffered_batches
-                    .entry(partition)
-                    .or_default()
-                    .push(sub_batch);
-            }
-        }
-        Ok(())
-    }
-
-    async fn load_postpone_bucket_metadata(
-        &mut self,
-    ) -> Result<(HashMap<Vec<u8>, i32>, HashMap<Vec<u8>, i64>)> {
-        let mut known_bucket_counts = HashMap::new();
-        let mut postpone_row_counts = HashMap::new();
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-        let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
-            return Ok((known_bucket_counts, postpone_row_counts));
-        };
-
-        let scan =
-            TableScan::new(&self.table, None, vec![], None, None, None).with_scan_all_files();
-        for entry in scan.plan_manifest_entries(&snapshot).await? {
-            let partition = entry.partition().to_vec();
-            if entry.bucket() == POSTPONE_BUCKET {
-                let rows = postpone_row_counts.entry(partition).or_insert(0_i64);
-                *rows = rows.saturating_add(entry.file().row_count);
-            } else if entry.bucket() >= 0 && entry.total_buckets() > 0 {
-                if let Some(previous) =
-                    known_bucket_counts.insert(partition.clone(), entry.total_buckets())
-                {
-                    if previous != entry.total_buckets() {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "Partition has inconsistent total bucket counts: {previous} and {}",
-                                entry.total_buckets()
-                            ),
-                            source: None,
-                        });
-                    }
-                }
-            }
-        }
-        Ok((known_bucket_counts, postpone_row_counts))
-    }
-
-    fn infer_postpone_bucket_count(
-        input_rows: i64,
-        input_size: i64,
-        postpone_rows: i64,
-        target_rows_per_bucket: Option<i64>,
-        target_size_per_bucket: i64,
-        max_parallelism: i32,
-    ) -> i32 {
-        let buckets = if let Some(target_rows) = target_rows_per_bucket {
-            let total_rows = input_rows.saturating_add(postpone_rows);
-            total_rows.saturating_add(target_rows - 1) / target_rows
-        } else {
-            let estimated_size = if postpone_rows > 0 && input_rows > 0 {
-                let numerator = i128::from(input_size)
-                    .saturating_mul(i128::from(input_rows.saturating_add(postpone_rows)));
-                let estimate = (numerator + i128::from(input_rows - 1)) / i128::from(input_rows);
-                estimate.min(i128::from(i64::MAX)) as i64
-            } else {
-                input_size
-            };
-            estimated_size.saturating_add(target_size_per_bucket - 1) / target_size_per_bucket
-        };
-        buckets.max(1).min(i64::from(max_parallelism)) as i32
-    }
-
-    async fn flush_postpone_fixed_batches(&mut self) -> Result<()> {
-        let Some(state) = self.postpone_fixed_bucket.as_ref() else {
-            return Ok(());
-        };
-        if state.buffered_batches.is_empty() {
-            return Ok(());
-        }
-
-        let (
-            buffered_batches,
-            bucket_key_indices,
-            bucket_function_type,
-            target_rows_per_bucket,
-            target_size_per_bucket,
-            max_parallelism,
-            postpone_row_counts,
-        ) = {
-            let state = self.postpone_fixed_bucket.as_mut().unwrap();
-            (
-                std::mem::take(&mut state.buffered_batches),
-                state.bucket_key_indices.clone(),
-                state.bucket_function_type,
-                state.target_rows_per_bucket,
-                state.target_size_per_bucket,
-                state.max_parallelism,
-                state.postpone_row_counts.clone(),
-            )
-        };
-
-        for (partition, batches) in buffered_batches {
-            let input_rows = batches.iter().fold(0_i64, |rows, batch| {
-                rows.saturating_add(batch.num_rows() as i64)
-            });
-            let input_size =
-                batches.iter().try_fold(0_i64, |size, batch| {
-                    Ok::<_, crate::Error>(size.saturating_add(binary_row_batch_size(
-                        batch,
-                        self.table.schema().fields(),
-                    )?))
-                })?;
-            let postpone_rows = if self.is_overwrite {
-                0
-            } else {
-                postpone_row_counts.get(&partition).copied().unwrap_or(0)
-            };
-            let total_buckets = Self::infer_postpone_bucket_count(
-                input_rows,
-                input_size,
-                postpone_rows,
-                target_rows_per_bucket,
-                target_size_per_bucket,
-                max_parallelism,
-            );
-            {
-                let state = self.postpone_fixed_bucket.as_mut().unwrap();
-                state
-                    .known_bucket_counts
-                    .insert(partition.clone(), total_buckets);
-                state.bucket_counts.insert(partition.clone(), total_buckets);
-            }
-
-            for batch in batches {
-                self.route_postpone_fixed_batch(
-                    partition.clone(),
-                    batch,
-                    total_buckets,
-                    &bucket_key_indices,
-                    bucket_function_type,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn route_postpone_fixed_batch(
-        &mut self,
-        partition: Vec<u8>,
-        batch: RecordBatch,
-        total_buckets: i32,
-        bucket_key_indices: &[usize],
-        bucket_function_type: BucketFunctionType,
-    ) -> Result<()> {
-        let buckets = if total_buckets <= 1 || bucket_key_indices.is_empty() {
-            vec![0; batch.num_rows()]
-        } else {
-            batch_bucket_ids(
-                &batch,
-                bucket_key_indices,
-                self.table.schema().fields(),
-                bucket_function_type,
-                total_buckets,
-            )?
-        };
-        let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
-        for (row, bucket) in buckets.into_iter().enumerate() {
-            groups.entry(bucket).or_default().push(row);
-        }
-        for (bucket, rows) in groups {
-            let sub_batch = Self::take_rows(&batch, &rows)?;
-            self.write_bucket(partition.clone(), bucket, sub_batch)
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Write a batch directly to the writer for the given (partition, bucket).
     async fn write_bucket(
         &mut self,
         partition_bytes: Vec<u8>,
@@ -1129,16 +834,18 @@ impl TableWrite {
     /// Writers are cleared after this call, allowing the TableWrite to be reused,
     /// except for fixed-bucket postpone batch writes, which are one-shot.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        if let Some(state) = self.postpone_fixed_bucket.as_mut() {
-            if state.prepare_started {
-                return Err(Self::postpone_fixed_bucket_one_shot_error());
+        if let Some(writer) = self.postpone_fixed_bucket.as_mut() {
+            writer.start_prepare()?;
+            let routed = writer.prepare_batch(&self.table, self.is_overwrite).await?;
+            for routed_batch in routed {
+                self.write_bucket(
+                    routed_batch.partition,
+                    routed_batch.bucket,
+                    routed_batch.batch,
+                )
+                .await?;
             }
-            // Mark the one-shot operation before flushing. A failed prepare may
-            // already have consumed buffered batches or closed file writers and
-            // therefore cannot be retried safely on the same writer.
-            state.prepare_started = true;
         }
-        self.flush_postpone_fixed_batches().await?;
 
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
@@ -1173,7 +880,7 @@ impl TableWrite {
                 msg.total_buckets = self
                     .postpone_fixed_bucket
                     .as_ref()
-                    .and_then(|state| state.bucket_counts.get(&msg.partition).copied());
+                    .and_then(|writer| writer.total_buckets(&msg.partition));
                 msg.new_changelog_files = files.changelog_files;
                 msg.new_index_files = index_files;
                 messages.push(msg);
@@ -1188,20 +895,10 @@ impl TableWrite {
                 messages.push(msg);
             }
         }
-        if let Some(state) = self.postpone_fixed_bucket.as_mut() {
-            state.metadata_loaded = false;
-            state.known_bucket_counts.clear();
-            state.postpone_row_counts.clear();
-            state.bucket_counts.clear();
+        if let Some(writer) = self.postpone_fixed_bucket.as_mut() {
+            writer.finish();
         }
         Ok(messages)
-    }
-
-    fn postpone_fixed_bucket_one_shot_error() -> crate::Error {
-        crate::Error::DataInvalid {
-            message: "Fixed-bucket postpone TableWrite only supports one prepare_commit call; create a new writer for the next batch".to_string(),
-            source: None,
-        }
     }
 
     async fn create_writer(&mut self, partition_bytes: Vec<u8>, bucket: i32) -> Result<()> {
@@ -4143,7 +3840,7 @@ mod tests {
             .await
             .unwrap();
         let state = write.postpone_fixed_bucket.as_ref().unwrap();
-        assert_eq!(state.buffered_batches.len(), 1);
+        assert_eq!(state.buffered_partition_count(), 1);
         assert!(write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert!(!messages.is_empty());
@@ -4172,7 +3869,7 @@ mod tests {
         // partitions stream into file writers instead of retaining Arrow
         // batches until prepare_commit.
         let state = write.postpone_fixed_bucket.as_ref().unwrap();
-        assert!(state.buffered_batches.is_empty());
+        assert_eq!(state.buffered_partition_count(), 0);
         assert!(!write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert!(messages
@@ -4186,6 +3883,52 @@ mod tests {
             read_id_value_rows(&table).await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
         );
+    }
+
+    #[tokio::test]
+    async fn test_postpone_fixed_bucket_write_with_rowkind_field() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_fixed_bucket_rowkind";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "-2")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_postpone_fixed_bucket_rowkind"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["+I"])),
+            ],
+        )
+        .unwrap();
+
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(&table, "fixed-rowkind".to_string()).unwrap();
+        write.write_arrow_batch(&batch).await.unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, 0);
+        assert_eq!(messages[0].total_buckets, Some(1));
+        assert_eq!(messages[0].new_files[0].row_count, 1);
     }
 
     #[tokio::test]
