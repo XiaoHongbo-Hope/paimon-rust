@@ -121,7 +121,6 @@ const DEFAULT_PARQUET_ROW_GROUP_PARALLELISM: usize = 8;
 const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
-const POSTPONE_BATCH_WRITE_FIXED_BUCKET_OPTION: &str = "postpone.batch-write-fixed-bucket";
 const POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM_OPTION: &str =
     "postpone.batch-write-fixed-bucket.max-parallelism";
 const POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION: &str = "postpone.target-row-num-per-bucket";
@@ -1153,16 +1152,6 @@ impl<'a> CoreOptions<'a> {
             .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
-    }
-
-    /// Whether high-level batch integrations should select the explicit
-    /// postpone fixed-bucket writer. Direct `new_write_builder` calls retain
-    /// normal postpone semantics regardless of this option.
-    pub fn postpone_batch_write_fixed_bucket(&self) -> bool {
-        self.options
-            .get(POSTPONE_BATCH_WRITE_FIXED_BUCKET_OPTION)
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(true)
     }
 
     pub fn postpone_batch_write_fixed_bucket_max_parallelism(&self) -> crate::Result<i32> {
