@@ -75,6 +75,7 @@ mod pk_vector_scan;
 mod postpone_batch_table_write;
 mod postpone_bucket;
 mod postpone_file_writer;
+mod postpone_fixed_bucket_write_builder;
 mod prepared_files;
 mod read_builder;
 pub mod referenced_files;
@@ -125,6 +126,7 @@ pub use partition_stat::PartitionStat;
 pub use postpone_batch_table_write::{
     PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD,
 };
+pub use postpone_fixed_bucket_write_builder::PostponeFixedBucketWriteBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
@@ -364,10 +366,15 @@ impl Table {
         WriteBuilder::new(self)
     }
 
-    /// Create a writer which forces one-shot fixed-bucket writes for a
-    /// postpone table, even when `postpone.batch-write-fixed-bucket=false`.
-    pub fn new_postpone_fixed_bucket_write_builder(&self) -> Result<WriteBuilder<'_>> {
-        WriteBuilder::new_postpone_fixed_bucket(self)
+    /// Create an explicit one-shot fixed-bucket builder for a postpone table.
+    ///
+    /// Normal write builders retain `bucket = -2` postpone semantics. Batch
+    /// integrations which need immediately visible real buckets must opt in
+    /// here and should provide a global bucket plan for distributed writes.
+    pub fn new_postpone_fixed_bucket_write_builder(
+        &self,
+    ) -> Result<PostponeFixedBucketWriteBuilder<'_>> {
+        PostponeFixedBucketWriteBuilder::new(self)
     }
 
     /// Create a copy of this table with extra options merged into the schema.

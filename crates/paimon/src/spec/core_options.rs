@@ -1155,9 +1155,9 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
     }
 
-    /// Whether batch writes to postpone-bucket primary-key tables use real
-    /// fixed buckets. This is enabled by default; set it to false to retain
-    /// legacy bucket -2 writes.
+    /// Whether high-level batch integrations should select the explicit
+    /// postpone fixed-bucket writer. Direct `new_write_builder` calls retain
+    /// normal postpone semantics regardless of this option.
     pub fn postpone_batch_write_fixed_bucket(&self) -> bool {
         self.options
             .get(POSTPONE_BATCH_WRITE_FIXED_BUCKET_OPTION)

@@ -37,7 +37,7 @@ use crate::types::*;
 unsafe fn new_write_builder(
     table: *const paimon_table,
     commit_user: Option<String>,
-    force_postpone_fixed_bucket: bool,
+    postpone_fixed_bucket: bool,
 ) -> paimon_result_write_builder {
     if let Err(e) = check_non_null(table, "table") {
         return paimon_result_write_builder {
@@ -46,8 +46,8 @@ unsafe fn new_write_builder(
         };
     }
     let table_ref = &*((*table).inner as *const Table);
-    let builder = if force_postpone_fixed_bucket {
-        match table_ref.new_postpone_fixed_bucket_write_builder() {
+    let commit_user = if postpone_fixed_bucket {
+        let builder = match table_ref.new_postpone_fixed_bucket_write_builder() {
             Ok(builder) => builder,
             Err(e) => {
                 return paimon_result_write_builder {
@@ -55,22 +55,33 @@ unsafe fn new_write_builder(
                     error: paimon_error::from_paimon(e),
                 }
             }
+        };
+        match commit_user {
+            Some(commit_user) => match builder.with_commit_user(commit_user) {
+                Ok(builder) => builder.commit_user().to_string(),
+                Err(e) => {
+                    return paimon_result_write_builder {
+                        write_builder: ptr::null_mut(),
+                        error: paimon_error::from_paimon(e),
+                    }
+                }
+            },
+            None => builder.commit_user().to_string(),
         }
     } else {
-        table_ref.new_write_builder()
-    };
-    let postpone_fixed_bucket = builder.uses_postpone_fixed_bucket();
-    let commit_user = match commit_user {
-        Some(commit_user) => match builder.with_commit_user(commit_user) {
-            Ok(builder) => builder.commit_user().to_string(),
-            Err(e) => {
-                return paimon_result_write_builder {
-                    write_builder: ptr::null_mut(),
-                    error: paimon_error::from_paimon(e),
+        let builder = table_ref.new_write_builder();
+        match commit_user {
+            Some(commit_user) => match builder.with_commit_user(commit_user) {
+                Ok(builder) => builder.commit_user().to_string(),
+                Err(e) => {
+                    return paimon_result_write_builder {
+                        write_builder: ptr::null_mut(),
+                        error: paimon_error::from_paimon(e),
+                    }
                 }
-            }
-        },
-        None => builder.commit_user().to_string(),
+            },
+            None => builder.commit_user().to_string(),
+        }
     };
     let state = WriteBuilderState {
         table: table_ref.clone(),
@@ -101,8 +112,11 @@ pub unsafe extern "C" fn paimon_table_new_write_builder(
     new_write_builder(table, None, false)
 }
 
-/// Create a WriteBuilder which forces one-shot fixed-bucket writes for a
-/// postpone table, even when `postpone.batch-write-fixed-bucket=false`.
+/// Create an explicit one-shot fixed-bucket WriteBuilder for a postpone table.
+///
+/// Normal write builders retain `bucket = -2` postpone semantics. Use this
+/// entry point when the batch must be routed to immediately visible real
+/// buckets.
 ///
 /// # Safety
 /// `table` must be a valid table pointer, or null (returns error).
@@ -204,9 +218,8 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
 /// plan, and the plan must contain every partition written by those writers.
 ///
 /// # Safety
-/// `wb` must select postpone fixed-bucket mode through table configuration or
-/// an explicit fixed-bucket constructor. `array` and `schema` must point to
-/// initialized Arrow C Data structs.
+/// `wb` must be an explicit postpone fixed-bucket builder. `array` and
+/// `schema` must point to initialized Arrow C Data structs.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
     wb: *mut paimon_write_builder,
@@ -225,7 +238,7 @@ pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
     let state = &mut *((*wb).inner as *mut WriteBuilderState);
     if !state.postpone_fixed_bucket {
         return invalid_input(
-            "a postpone bucket plan requires a postpone fixed-bucket write builder",
+            "a postpone bucket plan requires an explicit postpone fixed-bucket write builder",
         );
     }
 
@@ -344,31 +357,48 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
     }
     let state = &*((*wb).inner as *const WriteBuilderState);
 
-    let builder = if state.postpone_fixed_bucket {
-        state.table.new_postpone_fixed_bucket_write_builder()
-    } else {
-        Ok(state.table.new_write_builder())
-    };
-    let mut builder = match builder
-        .and_then(|builder| builder.with_commit_user(state.commit_user.clone()))
-        .and_then(|builder| match state.postpone_bucket_plan.clone() {
-            Some(plan) => builder.with_postpone_bucket_plan(plan),
-            None => Ok(builder),
-        }) {
-        Ok(b) => b,
-        Err(e) => {
-            return paimon_result_table_write {
-                write: ptr::null_mut(),
-                error: paimon_error::from_paimon(e),
+    let tw = if state.postpone_fixed_bucket {
+        let mut builder = match state
+            .table
+            .new_postpone_fixed_bucket_write_builder()
+            .and_then(|builder| builder.with_commit_user(state.commit_user.clone()))
+        {
+            Ok(builder) => builder,
+            Err(e) => {
+                return paimon_result_table_write {
+                    write: ptr::null_mut(),
+                    error: paimon_error::from_paimon(e),
+                }
             }
+        };
+        if let Some(plan) = state.postpone_bucket_plan.clone() {
+            builder = builder.with_bucket_plan(plan);
         }
+        if state.overwrite {
+            builder = builder.with_overwrite();
+        }
+        builder.new_write()
+    } else {
+        let mut builder = match state
+            .table
+            .new_write_builder()
+            .with_commit_user(state.commit_user.clone())
+        {
+            Ok(builder) => builder,
+            Err(e) => {
+                return paimon_result_table_write {
+                    write: ptr::null_mut(),
+                    error: paimon_error::from_paimon(e),
+                }
+            }
+        };
+        if state.overwrite {
+            builder = builder.with_overwrite();
+        }
+        builder.new_write()
     };
 
-    if state.overwrite {
-        builder = builder.with_overwrite();
-    }
-
-    let tw = match builder.new_write() {
+    let tw = match tw {
         Ok(w) => w,
         Err(e) => {
             return paimon_result_table_write {

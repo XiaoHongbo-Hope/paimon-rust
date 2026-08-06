@@ -20,10 +20,7 @@
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
 use super::format_write_builder::FormatWriteBuilder;
-use crate::spec::{CoreOptions, POSTPONE_BUCKET};
-use crate::table::{
-    DataEvolutionDeleteWriter, PostponeBucketPlan, Table, TableCommit, TableUpdate, TableWrite,
-};
+use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -46,34 +43,11 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
-    /// Create a builder which forces one-shot fixed-bucket writes for a
-    /// postpone table, even when `postpone.batch-write-fixed-bucket=false`.
-    pub fn new_postpone_fixed_bucket(table: &'a Table) -> crate::Result<Self> {
-        if table.is_format_table() {
-            return Err(crate::Error::Unsupported {
-                message: "Postpone fixed-bucket writes are only supported for Paimon tables"
-                    .to_string(),
-            });
-        }
-        Ok(Self(WriteBuilderKind::Paimon(
-            PaimonWriteBuilder::new(table).with_postpone_fixed_bucket(),
-        )))
-    }
-
     /// Get the commit user shared by writers and committers created by this builder.
     pub fn commit_user(&self) -> &str {
         match &self.0 {
             WriteBuilderKind::Paimon(builder) => builder.commit_user(),
             WriteBuilderKind::Format(builder) => builder.commit_user(),
-        }
-    }
-
-    /// Whether writers created by this builder use the postpone fixed-bucket
-    /// batch path.
-    pub fn uses_postpone_fixed_bucket(&self) -> bool {
-        match &self.0 {
-            WriteBuilderKind::Paimon(builder) => builder.postpone_fixed_bucket,
-            WriteBuilderKind::Format(_) => false,
         }
     }
 
@@ -98,19 +72,6 @@ impl<'a> WriteBuilder<'a> {
             WriteBuilderKind::Format(builder) => {
                 Self(WriteBuilderKind::Format(builder.with_overwrite()))
             }
-        }
-    }
-
-    /// Supply a bucket plan shared by all distributed postpone writers in one
-    /// logical batch. The plan must cover every input partition.
-    pub fn with_postpone_bucket_plan(self, bucket_plan: PostponeBucketPlan) -> crate::Result<Self> {
-        match self.0 {
-            WriteBuilderKind::Paimon(builder) => Ok(Self(WriteBuilderKind::Paimon(
-                builder.with_postpone_bucket_plan(bucket_plan)?,
-            ))),
-            WriteBuilderKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Postpone bucket plans are only supported for Paimon tables".to_string(),
-            }),
         }
     }
 
@@ -159,40 +120,15 @@ struct PaimonWriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
     overwrite: bool,
-    postpone_fixed_bucket: bool,
-    postpone_bucket_plan: Option<PostponeBucketPlan>,
 }
 
 impl<'a> PaimonWriteBuilder<'a> {
     pub fn new(table: &'a Table) -> Self {
-        let schema = table.schema();
-        let options = CoreOptions::new(schema.options());
-        let postpone_fixed_bucket = options.bucket() == POSTPONE_BUCKET
-            && !schema.primary_keys().is_empty()
-            && options.postpone_batch_write_fixed_bucket();
         Self {
             table,
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
-            postpone_fixed_bucket,
-            postpone_bucket_plan: None,
         }
-    }
-
-    fn with_postpone_fixed_bucket(mut self) -> Self {
-        self.postpone_fixed_bucket = true;
-        self
-    }
-
-    fn with_postpone_bucket_plan(mut self, bucket_plan: PostponeBucketPlan) -> crate::Result<Self> {
-        if !self.postpone_fixed_bucket {
-            return Err(crate::Error::Unsupported {
-                message: "A postpone bucket plan requires an explicit postpone fixed-bucket write builder"
-                    .to_string(),
-            });
-        }
-        self.postpone_bucket_plan = Some(bucket_plan);
-        Ok(self)
     }
 
     /// Get the commit user shared by writers and committers created by this builder.
@@ -243,39 +179,8 @@ impl<'a> PaimonWriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
-        self.ensure_main_branch_write()?;
-        // A table with a time-travel selector reads a pinned snapshot (and may
-        // carry that snapshot's historical schema), so writing through the
-        // same copy would be inconsistent with what its reads observe — even
-        // when the pinned snapshot happens to share the current schema id.
-        // Java avoids this structurally (write paths use copyWithoutTimeTravel);
-        // here the same table copy can serve both reads and writes, so reject
-        // explicitly. Conflicting selectors (`Err`) cannot be valid for writes
-        // either. Commit-only flows (new_commit) stay untouched.
-        let selector =
-            crate::spec::CoreOptions::new(self.table.schema().options()).try_time_travel_selector();
-        if !matches!(selector, Ok(None)) {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "Cannot write to a table with a time-travel option set \
-                          (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
-                        .to_string(),
-            });
-        }
-        let write = if self.postpone_fixed_bucket {
-            match self.postpone_bucket_plan.clone() {
-                Some(bucket_plan) => TableWrite::new_postpone_fixed_bucket_with_plan(
-                    self.table,
-                    self.commit_user.clone(),
-                    bucket_plan,
-                )?,
-                None => {
-                    TableWrite::new_postpone_fixed_bucket(self.table, self.commit_user.clone())?
-                }
-            }
-        } else {
-            TableWrite::new(self.table, self.commit_user.clone())?
-        };
+        ensure_table_write_allowed(self.table)?;
+        let write = TableWrite::new(self.table, self.commit_user.clone())?;
         Ok(if self.overwrite {
             write.with_overwrite()
         } else {
@@ -298,6 +203,24 @@ impl<'a> PaimonWriteBuilder<'a> {
     fn ensure_main_branch_write(&self) -> crate::Result<()> {
         self.table.ensure_not_branch_reference_for_write()
     }
+}
+
+pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
+    table.ensure_not_branch_reference_for_write()?;
+    // A table with a time-travel selector reads a pinned snapshot (and may
+    // carry that snapshot's historical schema), so writing through the same
+    // copy would be inconsistent with what its reads observe. Commit-only
+    // flows stay untouched.
+    let selector =
+        crate::spec::CoreOptions::new(table.schema().options()).try_time_travel_selector();
+    if !matches!(selector, Ok(None)) {
+        return Err(crate::Error::Unsupported {
+            message: "Cannot write to a table with a time-travel option set \
+                  (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
@@ -328,7 +251,6 @@ mod tests {
     };
     use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn test_file_io() -> FileIO {
@@ -473,13 +395,7 @@ mod tests {
         let table_path = "memory:/test_write_builder_commit_user";
         setup_dirs(&file_io, table_path).await;
 
-        // Keep this test on the legacy postpone writer because its file-name
-        // contract embeds commit_user; fixed-bucket files use regular names.
-        let table =
-            test_postpone_pk_table(&file_io, table_path).copy_with_options(HashMap::from([(
-                "postpone.batch-write-fixed-bucket".to_string(),
-                "false".to_string(),
-            )]));
+        let table = test_postpone_pk_table(&file_io, table_path);
         let wb = table
             .new_write_builder()
             .with_commit_user("my-commit-user")
@@ -516,44 +432,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_postpone_fixed_bucket_builder_respects_option() {
+    async fn test_postpone_fixed_bucket_builder_is_explicit() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_fixed_bucket_builder_option";
+        let table_path = "memory:/test_explicit_postpone_fixed_bucket_builder";
         setup_dirs(&file_io, table_path).await;
         let table = test_postpone_pk_table(&file_io, table_path);
 
-        let mut default_write = table.new_write_builder().new_write().unwrap();
-        default_write
+        let mut normal_write = table.new_write_builder().new_write().unwrap();
+        normal_write
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await
             .unwrap();
-        let default_messages = default_write.prepare_commit().await.unwrap();
-        assert_eq!(default_messages.len(), 1);
-        assert_eq!(default_messages[0].bucket, 0);
-        assert_eq!(default_messages[0].total_buckets, Some(1));
+        let normal_messages = normal_write.prepare_commit().await.unwrap();
+        assert_eq!(normal_messages.len(), 1);
+        assert_eq!(normal_messages[0].bucket, POSTPONE_BUCKET);
+        assert_eq!(normal_messages[0].total_buckets, None);
 
-        let legacy_table = table.copy_with_options(HashMap::from([(
-            "postpone.batch-write-fixed-bucket".to_string(),
-            "false".to_string(),
-        )]));
-        let mut legacy_write = legacy_table.new_write_builder().new_write().unwrap();
-        legacy_write
-            .write_arrow_batch(&make_batch(vec![2], vec![20]))
-            .await
-            .unwrap();
-        let legacy_messages = legacy_write.prepare_commit().await.unwrap();
-        assert_eq!(legacy_messages.len(), 1);
-        assert_eq!(legacy_messages[0].bucket, POSTPONE_BUCKET);
-        assert_eq!(legacy_messages[0].total_buckets, None);
-
-        let builder = legacy_table
+        let builder = table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
             .with_commit_user("explicit-fixed-user")
             .unwrap();
         let mut fixed = builder.new_write().unwrap();
         fixed
-            .write_arrow_batch(&make_batch(vec![3], vec![30]))
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
             .await
             .unwrap();
         let fixed_messages = fixed.prepare_commit().await.unwrap();

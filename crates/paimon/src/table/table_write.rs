@@ -3948,8 +3948,7 @@ mod tests {
             .unwrap()
             .with_commit_user("shared-plan-user")
             .unwrap()
-            .with_postpone_bucket_plan(plan)
-            .unwrap();
+            .with_bucket_plan(plan);
         let mut first = builder.new_write().unwrap();
         let mut second = builder.new_write().unwrap();
         first
@@ -3984,8 +3983,7 @@ mod tests {
         let mut write = table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
-            .with_postpone_bucket_plan(plan)
-            .unwrap()
+            .with_bucket_plan(plan)
             .new_write()
             .unwrap();
 
@@ -4014,8 +4012,7 @@ mod tests {
             .unwrap()
             .with_commit_user("initial-layout")
             .unwrap()
-            .with_postpone_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]))
-            .unwrap();
+            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]));
         let mut initial_write = initial_builder.new_write().unwrap();
         initial_write
             .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
@@ -4032,8 +4029,7 @@ mod tests {
             .unwrap()
             .with_commit_user("replacement-layout")
             .unwrap()
-            .with_postpone_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![3]))
-            .unwrap()
+            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![3]))
             .with_overwrite();
         let mut overwrite_write = overwrite_builder.new_write().unwrap();
         overwrite_write
