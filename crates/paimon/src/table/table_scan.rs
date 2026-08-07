@@ -543,17 +543,27 @@ impl LimitPushdownAccumulator {
     }
 }
 
-type BucketDataFileGroups = IndexMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
+type PartitionDataFileGroups = IndexMap<Vec<u8>, IndexMap<i32, (i32, Vec<DataFileMeta>)>>;
+type BucketDataFileGroup = ((Vec<u8>, i32), (i32, Vec<DataFileMeta>));
 
-fn group_data_files_by_partition_bucket(entries: Vec<ManifestEntry>) -> BucketDataFileGroups {
-    let mut groups = BucketDataFileGroups::with_capacity(entries.len());
+fn group_data_files_by_partition_bucket(entries: Vec<ManifestEntry>) -> Vec<BucketDataFileGroup> {
+    let mut partitions = PartitionDataFileGroups::new();
     for entry in entries {
         let (partition, bucket, total_buckets, file) = entry.into_parts();
-        groups
-            .entry((partition, bucket))
+        partitions
+            .entry(partition)
+            .or_default()
+            .entry(bucket)
             .or_insert_with(|| (total_buckets, Vec::new()))
             .1
             .push(file);
+    }
+
+    let mut groups = Vec::new();
+    for (partition, buckets) in partitions {
+        for (bucket, files) in buckets {
+            groups.push(((partition.clone(), bucket), files));
+        }
     }
     groups
 }
@@ -2311,33 +2321,35 @@ mod tests {
 
     #[test]
     fn test_partition_bucket_groups_preserve_manifest_order() {
-        let entry = |partition: &[u8], name: &str| {
+        let entry = |partition: &[u8], bucket: i32, name: &str| {
             ManifestEntry::new(
                 FileKind::Add,
                 partition.to_vec(),
-                0,
-                1,
+                bucket,
+                2,
                 make_evo_file(name, 1, 1, 1, None),
                 2,
             )
         };
         let groups = group_data_files_by_partition_bucket(vec![
-            entry(b"b", "b-1.parquet"),
-            entry(b"a", "a.parquet"),
-            entry(b"b", "b-2.parquet"),
+            entry(b"b", 1, "b-1.parquet"),
+            entry(b"a", 0, "a.parquet"),
+            entry(b"b", 0, "b-0.parquet"),
+            entry(b"b", 1, "b-1-next.parquet"),
         ]);
 
         let ordered = groups
             .iter()
-            .map(|((partition, _), (_, files))| {
-                (partition.as_slice(), file_names_from_files(files))
+            .map(|((partition, bucket), (_, files))| {
+                (partition.as_slice(), *bucket, file_names_from_files(files))
             })
             .collect::<Vec<_>>();
         assert_eq!(
             ordered,
             vec![
-                (b"b".as_slice(), vec!["b-1.parquet", "b-2.parquet"]),
-                (b"a".as_slice(), vec!["a.parquet"]),
+                (b"b".as_slice(), 1, vec!["b-1.parquet", "b-1-next.parquet"]),
+                (b"b".as_slice(), 0, vec!["b-0.parquet"]),
+                (b"a".as_slice(), 0, vec!["a.parquet"]),
             ]
         );
     }
