@@ -841,8 +841,7 @@ impl TableWrite {
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
-    /// Writers are cleared after this call, allowing the TableWrite to be reused,
-    /// except for fixed-bucket postpone batch writes, which are one-shot.
+    /// Writers are cleared after this call; fixed-bucket postpone writes are one-shot.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         if let Some(writer) = self.postpone_fixed_bucket.as_mut() {
             writer.start_prepare()?;
@@ -3907,17 +3906,12 @@ mod tests {
             vec![(1, 10), (2, 20), (3, 30), (4, 40)]
         );
 
-        // A later small append reuses the partition's existing bucket count
-        // instead of inferring a new count from its own input size.
         let mut write =
             TableWrite::new_postpone_fixed_bucket(&table, "fixed-user-2".to_string()).unwrap();
         write
             .write_arrow_batch(&make_batch(vec![5], vec![50]))
             .await
             .unwrap();
-        // The real-bucket count is loaded on the first write, so existing
-        // partitions stream into file writers instead of retaining Arrow
-        // batches until prepare_commit.
         let state = write.postpone_fixed_bucket.as_ref().unwrap();
         assert_eq!(state.buffered_partition_count(), 0);
         assert!(!write.partition_writers.is_empty());
@@ -4182,8 +4176,6 @@ mod tests {
         write.write_arrow_batch(&batch).await.unwrap();
         let messages = write.prepare_commit().await.unwrap();
 
-        // Java BinaryRows are 32,000 bytes, so a 20 KiB target plans two
-        // buckets. Arrow buffer sizing would incorrectly plan one.
         assert!(!messages.is_empty());
         assert!(messages
             .iter()
@@ -4260,8 +4252,6 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let table = test_fixed_postpone_pk_table(&file_io, table_path);
 
-        // Both writers plan against the empty table. Their differently sized
-        // inputs produce different bucket counts for the same partition.
         let mut first =
             TableWrite::new_postpone_fixed_bucket(&table, "fixed-conflict-1".to_string()).unwrap();
         first

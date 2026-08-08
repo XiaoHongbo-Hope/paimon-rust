@@ -15,12 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One-shot fixed-bucket planning for batch writes to postpone tables.
-//!
-//! This mirrors pypaimon's `PostponeFixedBucketBatchTableWrite`: partitions
-//! with an existing real-bucket count stream directly to their writers, while
-//! new partitions are buffered until `prepare_commit` can infer one bucket
-//! count from the complete batch.
+//! Fixed-bucket planning for postpone batch writes.
 
 use crate::spec::{
     batch_to_serialized_bytes, BucketFunctionType, CoreOptions, DataField, EMPTY_SERIALIZED_ROW,
@@ -36,20 +31,14 @@ use std::collections::HashMap;
 /// Column name used by [`PostponeBucketPlan::from_arrow`] for bucket counts.
 pub const POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD: &str = "total_buckets";
 
-/// A shared fixed-bucket plan for distributed writers.
-///
-/// The plan must be computed from global partition statistics and supplied to
-/// every writer participating in one logical batch commit.
+/// A shared bucket plan for distributed writers.
 #[derive(Debug, Clone)]
 pub struct PostponeBucketPlan {
     bucket_counts: HashMap<Vec<u8>, i32>,
 }
 
 impl PostponeBucketPlan {
-    /// Build a plan from an Arrow batch containing the table's partition
-    /// columns, in partition-key order, followed by a non-null Int32
-    /// `total_buckets` column. For an unpartitioned table, the batch contains
-    /// only `total_buckets` and normally has one row.
+    /// Build a plan from partition columns followed by an Int32 `total_buckets`.
     pub fn from_arrow(table: &Table, batch: &RecordBatch) -> Result<Self> {
         let partition_fields = table.schema().partition_fields();
         let partition_count = partition_fields.len();
@@ -156,7 +145,6 @@ pub(super) struct PostponeBucketBatch {
     pub(super) batch: RecordBatch,
 }
 
-/// Planning state for a single fixed-bucket batch write to a postpone table.
 pub(super) struct PostponeFixedBucketWriter {
     partition_field_indices: Vec<usize>,
     bucket_key_indices: Vec<usize>,
@@ -169,7 +157,6 @@ pub(super) struct PostponeFixedBucketWriter {
     known_bucket_counts: HashMap<Vec<u8>, i32>,
     postpone_row_counts: HashMap<Vec<u8>, i64>,
     buffered_batches: HashMap<Vec<u8>, Vec<RecordBatch>>,
-    /// Bucket counts used by this prepare-commit round.
     bucket_counts: HashMap<Vec<u8>, i32>,
     prepare_started: bool,
 }
@@ -247,8 +234,7 @@ impl PostponeFixedBucketWriter {
 
     pub(super) fn start_prepare(&mut self) -> Result<()> {
         self.ensure_writable()?;
-        // A failed prepare may already have consumed buffered batches or
-        // closed file writers, so the same writer cannot be retried safely.
+        // Failed preparation is not safely retryable.
         self.prepare_started = true;
         Ok(())
     }
@@ -317,9 +303,7 @@ impl PostponeFixedBucketWriter {
             let input_rows = batches.iter().fold(0_i64, |rows, batch| {
                 rows.saturating_add(batch.num_rows() as i64)
             });
-            // Match pypaimon: row-count planning does not inspect row sizes.
-            // Size planning ignores the trailing internal `_VALUE_KIND` field
-            // appended by TableWrite after row-kind generation.
+            // Row-count planning does not inspect row sizes.
             let input_size = if self.target_rows_per_bucket.is_none() {
                 batches.iter().try_fold(0_i64, |size, batch| {
                     Ok::<_, crate::Error>(

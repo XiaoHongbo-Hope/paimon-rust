@@ -23,12 +23,6 @@ use crate::spec::{CoreOptions, POSTPONE_BUCKET};
 use uuid::Uuid;
 
 /// Builder for one-shot fixed-bucket writes to a postpone table.
-///
-/// This builder is intentionally separate from [`super::WriteBuilder`]. A
-/// normal write builder retains `bucket = -2` postpone semantics, while this
-/// builder buffers rows for new partitions until it can assign real buckets.
-/// Distributed writers should use [`Self::with_bucket_plan`] so each writer
-/// receives the same plan computed from global partition statistics.
 pub struct PostponeFixedBucketWriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
@@ -58,12 +52,12 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         })
     }
 
-    /// Get the commit user shared by writers and committers from this builder.
+    /// Return the shared commit user.
     pub fn commit_user(&self) -> &str {
         &self.commit_user
     }
 
-    /// Set the stable identity shared by all writers and the committer.
+    /// Set the shared commit user.
     pub fn with_commit_user(mut self, commit_user: impl Into<String>) -> crate::Result<Self> {
         let commit_user = commit_user.into();
         validate_commit_user(&commit_user)?;
@@ -71,33 +65,30 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         Ok(self)
     }
 
-    /// Mark the writer as overwrite-aware.
+    /// Enable overwrite mode.
     pub fn with_overwrite(mut self) -> Self {
         self.overwrite = true;
         self
     }
 
-    /// Supply a bucket plan shared by every writer in one distributed batch.
-    ///
-    /// The plan must be computed from global partition statistics and cover
-    /// every partition written by this builder.
+    /// Set the shared bucket plan for a distributed batch.
     pub fn with_bucket_plan(mut self, bucket_plan: PostponeBucketPlan) -> Self {
         self.bucket_plan = Some(bucket_plan);
         self
     }
 
-    /// Create a committer sharing this builder's commit user.
+    /// Create a committer.
     pub fn new_commit(&self) -> TableCommit {
         TableCommit::new(self.table.clone(), self.commit_user.clone())
     }
 
-    /// Try to create a committer sharing this builder's commit user.
+    /// Try to create a committer.
     pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
         self.table.ensure_not_branch_reference_for_write()?;
         Ok(self.new_commit())
     }
 
-    /// Create a one-shot fixed-bucket table writer.
+    /// Create a table writer.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
         ensure_table_write_allowed(self.table)?;
         let write = match self.bucket_plan.clone() {

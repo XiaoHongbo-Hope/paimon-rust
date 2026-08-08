@@ -23,13 +23,7 @@ use arrow_array::{
     MapArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
 
-/// Sum the Java `BinaryRow.getSizeInBytes()` value for every row in a batch.
-///
-/// Arrow allocation size is not a stable planning metric: offsets, views, and
-/// slicing can make the same logical rows occupy different Arrow memory. This
-/// estimator follows Paimon's internal BinaryRow/BinaryArray layouts without
-/// materializing a second copy of the batch. The trailing internal
-/// `_VALUE_KIND` column is not part of the user row and is excluded.
+/// Return the Java-compatible BinaryRow size, excluding `_VALUE_KIND`.
 pub(crate) fn binary_row_batch_size(
     batch: &RecordBatch,
     fields: &[DataField],
@@ -437,7 +431,6 @@ mod tests {
             ),
         ];
 
-        // 32-byte row fixed part + 16-byte BinaryArray + 8-byte non-compact timestamp.
         assert_eq!(binary_row_batch_size(&batch, &fields).unwrap(), 56);
     }
 

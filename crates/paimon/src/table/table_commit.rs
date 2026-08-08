@@ -1858,15 +1858,10 @@ impl TableCommit {
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
 
-        // Validate every file produced by this commit before merging entries.
-        // This catches inconsistent duplicate ADDs even when they describe the
-        // same file and would otherwise collapse during merge_active_entries.
+        // Validate delta entries before duplicate files are merged.
         self.check_total_bucket_conflicts(delta_entries)?;
 
-        // Check the final active layout rather than raw base + delta entries.
-        // In an overwrite, DELETE-old followed by ADD-new is a valid bucket
-        // rescale; concurrent APPENDs with incompatible counts remain active
-        // together and are still rejected.
+        // Check the final layout so overwrite rescaling remains valid.
         let mut all_entries = base_entries.to_vec();
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
@@ -2594,9 +2589,7 @@ impl TableCommit {
             stats.file_size_in_bytes += sign * file.file_size;
             stats.file_count += sign;
             stats.last_file_creation_time = stats.last_file_creation_time.max(file_creation_time);
-            // Overwrite entries are ordered DELETE-old then ADD-new. Match
-            // Java PartitionEntry.merge by retaining the replacement entry's
-            // bucket count instead of the first value seen for the partition.
+            // Overwrite entries place replacement ADDs last.
             stats.total_buckets = entry.total_buckets();
         }
 

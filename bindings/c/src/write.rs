@@ -112,11 +112,7 @@ pub unsafe extern "C" fn paimon_table_new_write_builder(
     new_write_builder(table, None, false)
 }
 
-/// Create an explicit one-shot fixed-bucket WriteBuilder for a postpone table.
-///
-/// Normal write builders retain `bucket = -2` postpone semantics. Use this
-/// entry point when the batch must be routed to immediately visible real
-/// buckets.
+/// Create a one-shot fixed-bucket WriteBuilder for a postpone table.
 ///
 /// # Safety
 /// `table` must be a valid table pointer, or null (returns error).
@@ -152,7 +148,7 @@ pub unsafe extern "C" fn paimon_table_new_write_builder_with_commit_user(
     new_write_builder(table, Some(commit_user), false)
 }
 
-/// Create an explicit postpone fixed-bucket WriteBuilder with a stable commit identity.
+/// Create a fixed-bucket WriteBuilder with a stable commit identity.
 ///
 /// # Safety
 /// `table` must be a valid table pointer. `commit_user` must be a valid UTF-8
@@ -207,15 +203,10 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
     ptr::null_mut()
 }
 
-/// Supply a shared bucket plan for distributed postpone fixed-bucket writers.
+/// Set a shared bucket plan for distributed fixed-bucket writers.
 ///
-/// The Arrow batch must contain the table's partition columns in partition-key
-/// order followed by a non-null Int32 column named `total_buckets`. For an
-/// unpartitioned table, only the `total_buckets` column is present. Ownership
-/// of the Arrow C Data structs is transferred to this function.
-///
-/// Every writer whose commit messages will be merged must receive the same
-/// plan, and the plan must contain every partition written by those writers.
+/// The Arrow batch contains partition columns followed by a non-null Int32
+/// `total_buckets`. Ownership of the Arrow C Data structs is transferred.
 ///
 /// # Safety
 /// `wb` must be an explicit postpone fixed-bucket builder. `array` and
