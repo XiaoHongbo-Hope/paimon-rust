@@ -4167,17 +4167,8 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 300 - 100 (delete a) + 50 (add a2) = 250
         assert_eq!(snapshot.total_record_count(), Some(250));
-    }
 
-    #[test]
-    fn test_partition_statistics_keep_replacement_bucket_count() {
-        let file_io = test_file_io();
-        let commit = setup_partitioned_commit(
-            &file_io,
-            "memory:/test_partition_statistics_replacement_bucket_count",
-        );
         let partition = partition_bytes("a");
-
         for (old_buckets, new_buckets) in [(-2, 4), (4, 8)] {
             let entries = vec![
                 ManifestEntry::new(

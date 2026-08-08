@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_custom_commit_user_is_shared_by_write_and_commit() {
+    async fn test_postpone_write_builder_modes() {
         let file_io = test_file_io();
         let table_path = "memory:/test_write_builder_commit_user";
         setup_dirs(&file_io, table_path).await;
@@ -426,24 +426,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.commit_user(), "my-commit-user");
-    }
-
-    #[tokio::test]
-    async fn test_postpone_fixed_bucket_builder_is_explicit() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_explicit_postpone_fixed_bucket_builder";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_postpone_pk_table(&file_io, table_path);
-
-        let mut normal_write = table.new_write_builder().new_write().unwrap();
-        normal_write
-            .write_arrow_batch(&make_batch(vec![1], vec![10]))
-            .await
-            .unwrap();
-        let normal_messages = normal_write.prepare_commit().await.unwrap();
-        assert_eq!(normal_messages.len(), 1);
-        assert_eq!(normal_messages[0].bucket, POSTPONE_BUCKET);
-        assert_eq!(normal_messages[0].total_buckets, None);
 
         let builder = table
             .new_postpone_fixed_bucket_write_builder()
@@ -452,13 +434,27 @@ mod tests {
             .unwrap();
         let mut fixed = builder.new_write().unwrap();
         fixed
-            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .write_arrow_batch(&make_batch(vec![4], vec![40]))
             .await
             .unwrap();
         let fixed_messages = fixed.prepare_commit().await.unwrap();
         assert_eq!(fixed_messages.len(), 1);
         assert_eq!(fixed_messages[0].bucket, 0);
         assert_eq!(fixed_messages[0].total_buckets, Some(1));
+
+        let dv_table = table.copy_with_options(std::collections::HashMap::from([(
+            "deletion-vectors.enabled".to_string(),
+            "true".to_string(),
+        )]));
+        let error = dv_table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .new_write()
+            .err()
+            .unwrap();
+        assert!(matches!(error, crate::Error::Unsupported { ref message }
+                if message.contains("postpone fixed-bucket writes")
+                    && message.contains("deletion-vectors.enabled=true")));
     }
 
     #[tokio::test]

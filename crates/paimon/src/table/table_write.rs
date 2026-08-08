@@ -3847,15 +3847,12 @@ mod tests {
             .all(|message| message.total_buckets == Some(total_buckets)));
     }
 
-    #[test]
-    fn test_postpone_bucket_plan_rejects_non_positive_counts() {
-        let file_io = test_file_io();
-        let table =
-            test_postpone_partitioned_table(&file_io, "memory:/test_postpone_invalid_bucket_plan");
-        let batch = make_partition_bucket_plan_batch(vec!["p"], vec![0]);
-
-        let error = PostponeBucketPlan::from_arrow(&table, &batch).unwrap_err();
-        assert!(error.to_string().contains("must be positive"));
+    fn assert_one_shot_error(error: crate::Error) {
+        assert!(
+            matches!(error, crate::Error::DataInvalid { ref message, .. }
+            if message.contains("only supports one prepare_commit call")
+                && message.contains("create a new writer"))
+        );
     }
 
     #[tokio::test]
@@ -3903,10 +3900,19 @@ mod tests {
         let messages = write.prepare_commit().await.unwrap();
         assert!(messages.iter().all(|message| message.bucket >= 0));
         assert_total_buckets(&messages, 2);
+
+        let stale_messages =
+            write_fixed_batch(&table, "stale-user", &make_batch(vec![9], vec![90])).await;
+        assert_total_buckets(&stale_messages, 1);
         TableCommit::new(table.clone(), "fixed-user-1".to_string())
             .commit(messages)
             .await
             .unwrap();
+        let error = TableCommit::new(table.clone(), "stale-user".to_string())
+            .commit(stale_messages)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Postpone fixed-bucket conflict"));
         assert_eq!(
             read_id_value_rows(&table).await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40)]
@@ -3921,6 +3927,13 @@ mod tests {
         assert!(!write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert_total_buckets(&messages, 2);
+        assert_one_shot_error(
+            write
+                .write_arrow_batch(&make_batch(vec![6], vec![60]))
+                .await
+                .unwrap_err(),
+        );
+        assert_one_shot_error(write.prepare_commit().await.unwrap_err());
         TableCommit::new(table.clone(), "fixed-user-2".to_string())
             .commit(messages)
             .await
@@ -3972,6 +3985,14 @@ mod tests {
         let table_path = "memory:/test_postpone_incomplete_bucket_plan";
         setup_dirs(&file_io, table_path).await;
         let table = test_postpone_partitioned_table(&file_io, table_path);
+
+        let error = PostponeBucketPlan::from_arrow(
+            &table,
+            &make_partition_bucket_plan_batch(vec!["p"], vec![0]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be positive"));
+
         let plan = make_partition_bucket_plan(&table, vec!["p"], vec![2]);
         let mut write = table
             .new_postpone_fixed_bucket_write_builder()
@@ -4151,83 +4172,6 @@ mod tests {
 
         let messages = write_fixed_batch(&table, "fixed-size-user", &batch).await;
         assert_total_buckets(&messages, 2);
-    }
-
-    #[tokio::test]
-    async fn test_postpone_fixed_bucket_batch_write_is_one_shot() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_fixed_bucket_one_shot";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_fixed_postpone_pk_table(&file_io, table_path);
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-one-shot".to_string()).unwrap();
-
-        write
-            .write_arrow_batch(&make_batch(vec![1], vec![10]))
-            .await
-            .unwrap();
-        let messages = write.prepare_commit().await.unwrap();
-        assert_total_buckets(&messages, 1);
-
-        let write_error = write
-            .write_arrow_batch(&make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(write_error, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("only supports one prepare_commit call")
-                    && message.contains("create a new writer"))
-        );
-
-        let prepare_error = write.prepare_commit().await.unwrap_err();
-        assert!(
-            matches!(prepare_error, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("only supports one prepare_commit call")
-                    && message.contains("create a new writer"))
-        );
-    }
-
-    #[test]
-    fn test_postpone_fixed_bucket_rejects_deletion_vectors() {
-        let file_io = test_file_io();
-        let table = test_postpone_pk_table(&file_io, "memory:/test_postpone_dv")
-            .copy_with_options(options(&[("deletion-vectors.enabled", "true")]));
-
-        let error = TableWrite::new_postpone_fixed_bucket(&table, "test-user".to_string())
-            .err()
-            .expect("fixed-bucket postpone writes must reject deletion vectors");
-        assert!(matches!(error, crate::Error::Unsupported { ref message }
-                if message.contains("postpone fixed-bucket writes")
-                    && message.contains("deletion-vectors.enabled=true")));
-    }
-
-    #[tokio::test]
-    async fn test_postpone_batch_write_rejects_conflicting_bucket_counts() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_fixed_bucket_conflict";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_fixed_postpone_pk_table(&file_io, table_path);
-
-        let first_messages =
-            write_fixed_batch(&table, "fixed-conflict-1", &make_batch(vec![1], vec![10])).await;
-        assert_total_buckets(&first_messages, 1);
-        let second_messages = write_fixed_batch(
-            &table,
-            "fixed-conflict-2",
-            &make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]),
-        )
-        .await;
-        assert_total_buckets(&second_messages, 2);
-
-        TableCommit::new(table.clone(), "fixed-conflict-1".to_string())
-            .commit(first_messages)
-            .await
-            .unwrap();
-        let error = TableCommit::new(table, "fixed-conflict-2".to_string())
-            .commit(second_messages)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Postpone fixed-bucket conflict"));
     }
 
     #[tokio::test]

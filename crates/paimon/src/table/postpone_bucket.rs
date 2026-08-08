@@ -294,7 +294,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_java_binary_row_size_differs_from_arrow_buffers() {
+    fn test_java_binary_row_size() {
         let row_count = 1_000;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", ArrowDataType::Int32, false),
@@ -326,10 +326,7 @@ mod tests {
 
         assert_eq!(binary_row_batch_size(&batch, &fields).unwrap(), 32_000);
         assert_ne!(batch.get_array_memory_size() as i64, 32_000);
-    }
 
-    #[test]
-    fn test_internal_value_kind_is_excluded() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", ArrowDataType::Int32, false),
             Field::new("value", ArrowDataType::Int32, false),
@@ -350,10 +347,7 @@ mod tests {
         ];
 
         assert_eq!(binary_row_batch_size(&batch, &fields).unwrap(), 24);
-    }
 
-    #[test]
-    fn test_nested_and_local_zoned_timestamp_size() {
         let array =
             ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![Some(1), Some(2)])]);
         let timestamp =
@@ -391,10 +385,7 @@ mod tests {
         ];
 
         assert_eq!(binary_row_batch_size(&batch, &fields).unwrap(), 56);
-    }
 
-    #[test]
-    fn test_non_compact_null_timestamp_reserves_space() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "event_time",
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
