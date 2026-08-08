@@ -19,7 +19,7 @@
 
 use super::write_builder::{ensure_table_write_allowed, validate_commit_user};
 use super::{PostponeBucketPlan, Table, TableCommit, TableWrite};
-use crate::spec::{CoreOptions, POSTPONE_BUCKET};
+use crate::table::postpone_batch_table_write::validate_postpone_fixed_bucket_table;
 use uuid::Uuid;
 
 /// Builder for one-shot fixed-bucket writes to a postpone table.
@@ -32,18 +32,7 @@ pub struct PostponeFixedBucketWriteBuilder<'a> {
 
 impl<'a> PostponeFixedBucketWriteBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> crate::Result<Self> {
-        let schema = table.schema();
-        let bucket = CoreOptions::new(schema.options()).bucket();
-        if table.is_format_table() || bucket != POSTPONE_BUCKET || schema.primary_keys().is_empty()
-        {
-            return Err(crate::Error::Unsupported {
-                message: format!(
-                    "Postpone fixed-bucket writes require a Paimon primary-key table with bucket=-2, but table '{}' has bucket={bucket}",
-                    table.identifier().full_name()
-                ),
-            });
-        }
-
+        validate_postpone_fixed_bucket_table(table)?;
         Ok(Self {
             table,
             commit_user: Uuid::new_v4().to_string(),

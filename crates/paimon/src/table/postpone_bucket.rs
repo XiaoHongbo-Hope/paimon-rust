@@ -19,8 +19,7 @@
 
 use crate::spec::{BinaryRow, DataField, DataType, IntType, VALUE_KIND_FIELD_NAME};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    MapArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, BinaryArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };
 
 /// Return the Java-compatible BinaryRow size, excluding `_VALUE_KIND`.
@@ -80,27 +79,16 @@ fn variable_size(array: &ArrayRef, row: usize, data_type: &DataType) -> crate::R
             let len = binary_len(array, row, data_type)?;
             Ok(binary_size(len))
         }
-        DataType::Variant(_) => variant_size(array, row),
+        DataType::Variant(_) => variant_size(array, row, data_type),
         DataType::Array(array_type) => {
-            if let Some(array) = array.as_any().downcast_ref::<ListArray>() {
-                let offsets = array.value_offsets();
-                Ok(round_to_word(binary_array_size(
-                    array.values(),
-                    offsets[row] as usize,
-                    offsets[row + 1] as usize,
-                    array_type.element_type(),
-                )?))
-            } else if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() {
-                let offsets = array.value_offsets();
-                Ok(round_to_word(binary_array_size(
-                    array.values(),
-                    offsets[row] as usize,
-                    offsets[row + 1] as usize,
-                    array_type.element_type(),
-                )?))
-            } else {
-                Err(type_mismatch("ListArray", data_type))
-            }
+            let array = downcast::<ListArray>(array, "ListArray", data_type)?;
+            let offsets = array.value_offsets();
+            Ok(round_to_word(binary_array_size(
+                array.values(),
+                offsets[row] as usize,
+                offsets[row + 1] as usize,
+                array_type.element_type(),
+            )?))
         }
         DataType::Map(map_type) => {
             let map = downcast::<MapArray>(array, "MapArray", data_type)?;
@@ -171,7 +159,7 @@ fn binary_array_size(
     }
     let count = end - start;
     let header = 4_u128.saturating_add((count as u128).div_ceil(32).saturating_mul(4));
-    let fixed = (count as u128).saturating_mul(fixed_width(element_type)?);
+    let fixed = (count as u128).saturating_mul(fixed_width(element_type));
     let mut size = round_to_word(header.saturating_add(fixed));
     for row in start..end {
         if !values.is_null(row) {
@@ -204,12 +192,8 @@ fn map_size(
     ))
 }
 
-fn variant_size(array: &ArrayRef, row: usize) -> crate::Result<u128> {
-    let variant = downcast::<StructArray>(
-        array,
-        "StructArray",
-        &DataType::Variant(crate::spec::VariantType::new()),
-    )?;
+fn variant_size(array: &ArrayRef, row: usize, data_type: &DataType) -> crate::Result<u128> {
+    let variant = downcast::<StructArray>(array, "StructArray", data_type)?;
     if variant.num_columns() != 2 {
         return Err(crate::Error::DataInvalid {
             message: format!(
@@ -219,16 +203,8 @@ fn variant_size(array: &ArrayRef, row: usize) -> crate::Result<u128> {
             source: None,
         });
     }
-    let value_len = binary_len(
-        variant.column(0),
-        row,
-        &DataType::Variant(crate::spec::VariantType::new()),
-    )?;
-    let metadata_len = binary_len(
-        variant.column(1),
-        row,
-        &DataType::Variant(crate::spec::VariantType::new()),
-    )?;
+    let value_len = binary_len(variant.column(0), row, data_type)?;
+    let metadata_len = binary_len(variant.column(1), row, data_type)?;
     Ok(round_to_word(
         4_u128
             .saturating_add(value_len as u128)
@@ -237,29 +213,19 @@ fn variant_size(array: &ArrayRef, row: usize) -> crate::Result<u128> {
 }
 
 fn string_len(array: &ArrayRef, row: usize, data_type: &DataType) -> crate::Result<usize> {
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        Ok(array.value(row).len())
-    } else if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
-        Ok(array.value(row).len())
-    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        Ok(array.value(row).len())
-    } else {
-        Err(type_mismatch("StringArray", data_type))
-    }
+    Ok(downcast::<StringArray>(array, "StringArray", data_type)?
+        .value(row)
+        .len())
 }
 
 fn binary_len(array: &ArrayRef, row: usize, data_type: &DataType) -> crate::Result<usize> {
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        Ok(array.value(row).len())
-    } else if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        Ok(array.value(row).len())
-    } else {
-        Err(type_mismatch("BinaryArray", data_type))
-    }
+    Ok(downcast::<BinaryArray>(array, "BinaryArray", data_type)?
+        .value(row)
+        .len())
 }
 
-fn fixed_width(data_type: &DataType) -> crate::Result<u128> {
-    Ok(match data_type {
+fn fixed_width(data_type: &DataType) -> u128 {
+    match data_type {
         DataType::Boolean(_) | DataType::TinyInt(_) => 1,
         DataType::SmallInt(_) => 2,
         DataType::Int(_) | DataType::Float(_) | DataType::Date(_) | DataType::Time(_) => 4,
@@ -279,7 +245,7 @@ fn fixed_width(data_type: &DataType) -> crate::Result<u128> {
         | DataType::Multiset(_)
         | DataType::Row(_)
         | DataType::Vector(_) => 8,
-    })
+    }
 }
 
 fn primitive_width(data_type: &DataType) -> crate::Result<u128> {

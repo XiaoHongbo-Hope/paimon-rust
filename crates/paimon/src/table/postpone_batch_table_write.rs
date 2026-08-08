@@ -23,9 +23,10 @@ use crate::spec::{
 };
 use crate::table::bucket_function::{batch_bucket_ids, validate_bucket_function};
 use crate::table::postpone_bucket::binary_row_batch_size;
+use crate::table::table_write::take_rows;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
-use arrow_array::{Array, Int32Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, Int32Array, RecordBatch};
 use std::collections::HashMap;
 
 /// Column name used by [`PostponeBucketPlan::from_arrow`] for bucket counts.
@@ -139,6 +140,20 @@ impl PostponeBucketPlan {
     }
 }
 
+pub(super) fn validate_postpone_fixed_bucket_table(table: &Table) -> Result<()> {
+    let schema = table.schema();
+    let bucket = CoreOptions::new(schema.options()).bucket();
+    if table.is_format_table() || bucket != POSTPONE_BUCKET || schema.primary_keys().is_empty() {
+        return Err(crate::Error::Unsupported {
+            message: format!(
+                "Postpone fixed-bucket writes require a Paimon primary-key table with bucket=-2, but table '{}' has bucket={bucket}",
+                table.identifier().full_name()
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub(super) struct PostponeBucketBatch {
     pub(super) partition: Vec<u8>,
     pub(super) bucket: i32,
@@ -157,7 +172,6 @@ pub(super) struct PostponeFixedBucketWriter {
     known_bucket_counts: HashMap<Vec<u8>, i32>,
     postpone_row_counts: HashMap<Vec<u8>, i64>,
     buffered_batches: HashMap<Vec<u8>, Vec<RecordBatch>>,
-    bucket_counts: HashMap<Vec<u8>, i32>,
     prepare_started: bool,
 }
 
@@ -169,17 +183,9 @@ impl PostponeFixedBucketWriter {
         bucket_function_type: BucketFunctionType,
         bucket_plan: Option<PostponeBucketPlan>,
     ) -> Result<Self> {
+        validate_postpone_fixed_bucket_table(table)?;
         let schema = table.schema();
         let options = CoreOptions::new(schema.options());
-        let total_buckets = options.bucket();
-        if total_buckets != POSTPONE_BUCKET || schema.primary_keys().is_empty() {
-            return Err(crate::Error::Unsupported {
-                message: format!(
-                    "Postpone fixed-bucket writes require a primary-key table with bucket=-2, but table '{}' has bucket={total_buckets}",
-                    table.identifier().full_name()
-                ),
-            });
-        }
         if options.deletion_vectors_enabled() {
             return Err(crate::Error::Unsupported {
                 message: format!(
@@ -220,7 +226,6 @@ impl PostponeFixedBucketWriter {
             known_bucket_counts,
             postpone_row_counts: HashMap::new(),
             buffered_batches: HashMap::new(),
-            bucket_counts: HashMap::new(),
             prepare_started: false,
         })
     }
@@ -276,7 +281,6 @@ impl PostponeFixedBucketWriter {
         for (partition, rows) in groups {
             let sub_batch = take_rows(batch, &rows)?;
             if let Some(total_buckets) = self.known_bucket_counts.get(&partition).copied() {
-                self.bucket_counts.insert(partition.clone(), total_buckets);
                 output.extend(self.route_batch(table, partition, sub_batch, total_buckets)?);
             } else {
                 self.buffered_batches
@@ -331,7 +335,6 @@ impl PostponeFixedBucketWriter {
             );
             self.known_bucket_counts
                 .insert(partition.clone(), total_buckets);
-            self.bucket_counts.insert(partition.clone(), total_buckets);
 
             for batch in batches {
                 output.extend(self.route_batch(table, partition.clone(), batch, total_buckets)?);
@@ -341,14 +344,12 @@ impl PostponeFixedBucketWriter {
     }
 
     pub(super) fn total_buckets(&self, partition: &[u8]) -> Option<i32> {
-        self.bucket_counts.get(partition).copied()
+        self.known_bucket_counts.get(partition).copied()
     }
 
     pub(super) fn finish(&mut self) {
-        self.metadata_loaded = false;
         self.known_bucket_counts.clear();
         self.postpone_row_counts.clear();
-        self.bucket_counts.clear();
     }
 
     #[cfg(test)]
@@ -470,29 +471,4 @@ fn infer_bucket_count(
         estimated_size.saturating_add(target_size_per_bucket - 1) / target_size_per_bucket
     };
     buckets.max(1).min(i64::from(max_parallelism)) as i32
-}
-
-fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> Result<RecordBatch> {
-    if row_indices.len() == batch.num_rows() {
-        return Ok(batch.clone());
-    }
-    let indices = UInt32Array::from(
-        row_indices
-            .iter()
-            .map(|&index| index as u32)
-            .collect::<Vec<_>>(),
-    );
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| crate::Error::DataInvalid {
-            message: format!("Failed to take rows for postpone bucket planning: {error}"),
-            source: None,
-        })?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|error| crate::Error::DataInvalid {
-        message: format!("Failed to create postpone bucket batch: {error}"),
-        source: None,
-    })
 }

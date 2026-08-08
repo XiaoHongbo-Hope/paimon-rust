@@ -56,6 +56,27 @@ enum FileWriter {
     Postpone(PostponeFileWriter),
 }
 
+pub(super) fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> Result<RecordBatch> {
+    if row_indices.len() == batch.num_rows() {
+        return Ok(batch.clone());
+    }
+    let indices =
+        arrow_array::UInt32Array::from(row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|col| arrow_select::take::take(col.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to take rows: {e}"),
+            source: None,
+        })?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| crate::Error::DataInvalid {
+        message: format!("Failed to create sub-batch: {e}"),
+        source: None,
+    })
+}
+
 impl FileWriter {
     async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         match self {
@@ -666,7 +687,7 @@ impl TableWrite {
             || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
             || !output.deletes.is_empty();
         for (key, row_indices) in groups {
-            let sub_batch = Self::take_rows(batch, &row_indices)?;
+            let sub_batch = take_rows(batch, &row_indices)?;
             let sub_batch = if needs_value_kind && !batch_has_value_kind {
                 Self::add_value_kind_column(&sub_batch, 0)?
             } else {
@@ -684,36 +705,13 @@ impl TableWrite {
                     .push(*row_idx);
             }
             for (key, row_indices) in delete_groups {
-                let sub_batch = Self::take_rows(batch, &row_indices)?;
+                let sub_batch = take_rows(batch, &row_indices)?;
                 let delete_batch = Self::add_value_kind_column(&sub_batch, 1)?;
                 result.push((key, delete_batch));
             }
         }
 
         Ok(result)
-    }
-
-    /// Extract rows from a batch by indices.
-    fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> Result<RecordBatch> {
-        if row_indices.len() == batch.num_rows() {
-            return Ok(batch.clone());
-        }
-        let indices = arrow_array::UInt32Array::from(
-            row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-        );
-        let columns: Vec<Arc<dyn arrow_array::Array>> = batch
-            .columns()
-            .iter()
-            .map(|col| arrow_select::take::take(col.as_ref(), &indices, None))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to take rows: {e}"),
-                source: None,
-            })?;
-        RecordBatch::try_new(batch.schema(), columns).map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to create sub-batch: {e}"),
-            source: None,
-        })
     }
 
     /// Add a `_VALUE_KIND` column to a batch with the given value for all rows.
@@ -771,7 +769,7 @@ impl TableWrite {
         if keep_rows.is_empty() {
             return Ok(RecordBatch::new_empty(batch.schema()));
         }
-        let filtered = Self::take_rows(batch, &keep_rows)?;
+        let filtered = take_rows(batch, &keep_rows)?;
         Self::add_per_row_value_kind_column(&filtered, kinds)
     }
 
