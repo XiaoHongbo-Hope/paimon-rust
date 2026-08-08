@@ -32,6 +32,13 @@ use std::collections::HashMap;
 /// Column name used by [`PostponeBucketPlan::from_arrow`] for bucket counts.
 pub const POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD: &str = "total_buckets";
 
+fn data_invalid(message: impl Into<String>) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: message.into(),
+        source: None,
+    }
+}
+
 /// A shared bucket plan for distributed writers.
 #[derive(Debug, Clone)]
 pub struct PostponeBucketPlan {
@@ -44,14 +51,11 @@ impl PostponeBucketPlan {
         let partition_fields = table.schema().partition_fields();
         let partition_count = partition_fields.len();
         if batch.num_columns() != partition_count + 1 {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
+            return Err(data_invalid(format!(
                     "Postpone bucket plan expected {} partition column(s) plus '{POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD}', got {} columns",
                     partition_count,
                     batch.num_columns()
-                ),
-                source: None,
-            });
+                )));
         }
 
         let expected_partition_schema = crate::arrow::build_target_arrow_schema(&partition_fields)?;
@@ -59,25 +63,19 @@ impl PostponeBucketPlan {
         for (index, expected) in expected_partition_schema.fields().iter().enumerate() {
             let actual = batch_schema.field(index);
             if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
+                return Err(data_invalid(format!(
                         "Postpone bucket plan partition field mismatch at index {index}: expected '{}': {:?}, got '{}': {:?}",
                         expected.name(),
                         expected.data_type(),
                         actual.name(),
                         actual.data_type()
-                    ),
-                    source: None,
-                });
+                    )));
             }
             if !expected.is_nullable() && batch.column(index).null_count() != 0 {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
+                return Err(data_invalid(format!(
                         "Postpone bucket plan partition column '{}' is NOT NULL but contains null values",
                         expected.name()
-                    ),
-                    source: None,
-                });
+                    )));
             }
         }
 
@@ -85,50 +83,39 @@ impl PostponeBucketPlan {
         if count_field.name() != POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD
             || count_field.data_type() != &arrow_schema::DataType::Int32
         {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
+            return Err(data_invalid(format!(
                     "Postpone bucket plan final field must be '{POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD}': Int32, got '{}': {:?}",
                     count_field.name(),
                     count_field.data_type()
-                ),
-                source: None,
-            });
+                )));
         }
         let counts = batch
             .column(partition_count)
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: "Postpone bucket plan total_buckets column is not Int32".to_string(),
-                source: None,
+            .ok_or_else(|| {
+                data_invalid("Postpone bucket plan total_buckets column is not Int32")
             })?;
         let partition_indices = (0..partition_count).collect::<Vec<_>>();
         let partitions = batch_to_serialized_bytes(batch, &partition_indices, &partition_fields)?;
         let mut bucket_counts = HashMap::with_capacity(batch.num_rows());
         for (row, partition) in partitions.into_iter().enumerate() {
             if counts.is_null(row) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!("Postpone bucket plan total_buckets is null at row {row}"),
-                    source: None,
-                });
+                return Err(data_invalid(format!(
+                    "Postpone bucket plan total_buckets is null at row {row}"
+                )));
             }
             let total_buckets = counts.value(row);
             if total_buckets <= 0 {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
+                return Err(data_invalid(format!(
                         "Postpone bucket plan total_buckets must be positive at row {row}, got {total_buckets}"
-                    ),
-                    source: None,
-                });
+                    )));
             }
             if let Some(previous) = bucket_counts.insert(partition, total_buckets) {
                 if previous != total_buckets {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
+                    return Err(data_invalid(format!(
                             "Postpone bucket plan contains conflicting total bucket counts {previous} and {total_buckets} for one partition"
-                        ),
-                        source: None,
-                    });
+                        )));
                 }
             }
         }
@@ -271,10 +258,9 @@ impl PostponeFixedBucketWriter {
                 .keys()
                 .any(|partition| !self.known_bucket_counts.contains_key(partition))
         {
-            return Err(crate::Error::DataInvalid {
-                message: "Postpone bucket plan does not contain an input partition".to_string(),
-                source: None,
-            });
+            return Err(data_invalid(
+                "Postpone bucket plan does not contain an input partition",
+            ));
         }
 
         let mut output = Vec::new();
@@ -403,10 +389,7 @@ impl PostponeFixedBucketWriter {
     }
 
     fn one_shot_error() -> crate::Error {
-        crate::Error::DataInvalid {
-            message: "Fixed-bucket postpone TableWrite only supports one prepare_commit call; create a new writer for the next batch".to_string(),
-            source: None,
-        }
+        data_invalid("Fixed-bucket postpone TableWrite only supports one prepare_commit call; create a new writer for the next batch")
     }
 }
 
@@ -432,13 +415,10 @@ async fn load_bucket_metadata(
                 known_bucket_counts.insert(partition.clone(), entry.total_buckets())
             {
                 if previous != entry.total_buckets() {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Partition has inconsistent total bucket counts: {previous} and {}",
-                            entry.total_buckets()
-                        ),
-                        source: None,
-                    });
+                    return Err(data_invalid(format!(
+                        "Partition has inconsistent total bucket counts: {previous} and {}",
+                        entry.total_buckets()
+                    )));
                 }
             }
         }

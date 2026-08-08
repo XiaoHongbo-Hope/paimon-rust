@@ -207,10 +207,7 @@ impl<'a> PaimonWriteBuilder<'a> {
 
 pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
     table.ensure_not_branch_reference_for_write()?;
-    // A table with a time-travel selector reads a pinned snapshot (and may
-    // carry that snapshot's historical schema), so writing through the same
-    // copy would be inconsistent with what its reads observe. Commit-only
-    // flows stay untouched.
+    // A time-travel table may carry a historical schema.
     let selector =
         crate::spec::CoreOptions::new(table.schema().options()).try_time_travel_selector();
     if !matches!(selector, Ok(None)) {

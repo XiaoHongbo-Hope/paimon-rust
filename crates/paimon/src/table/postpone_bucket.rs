@@ -22,6 +22,13 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };
 
+fn data_invalid(message: impl Into<String>) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: message.into(),
+        source: None,
+    }
+}
+
 /// Return the Java-compatible BinaryRow size, excluding `_VALUE_KIND`.
 pub(crate) fn binary_row_batch_size(
     batch: &RecordBatch,
@@ -32,13 +39,10 @@ pub(crate) fn binary_row_batch_size(
         && batch.schema().field(field_count).name() == VALUE_KIND_FIELD_NAME
         && batch.schema().field(field_count).data_type() == &arrow_schema::DataType::Int8;
     if batch.num_columns() != field_count && !has_value_kind {
-        return Err(crate::Error::DataInvalid {
-            message: format!(
+        return Err(data_invalid(format!(
                 "BinaryRow size planning expected {field_count} user columns with an optional trailing {VALUE_KIND_FIELD_NAME}, got {}",
                 batch.num_columns()
-            ),
-            source: None,
-        });
+            )));
     }
 
     let mut total = 0_u128;
@@ -149,13 +153,10 @@ fn binary_array_size(
     element_type: &DataType,
 ) -> crate::Result<u128> {
     if end < start || end > values.len() {
-        return Err(crate::Error::DataInvalid {
-            message: format!(
-                "Invalid nested array range [{start}, {end}) for {} values",
-                values.len()
-            ),
-            source: None,
-        });
+        return Err(data_invalid(format!(
+            "Invalid nested array range [{start}, {end}) for {} values",
+            values.len()
+        )));
     }
     let count = end - start;
     let header = 4_u128.saturating_add((count as u128).div_ceil(32).saturating_mul(4));
@@ -177,13 +178,10 @@ fn map_size(
     value_type: &DataType,
 ) -> crate::Result<u128> {
     if entries.num_columns() != 2 {
-        return Err(crate::Error::DataInvalid {
-            message: format!(
-                "BinaryMap size planning expected 2 entry columns, got {}",
-                entries.num_columns()
-            ),
-            source: None,
-        });
+        return Err(data_invalid(format!(
+            "BinaryMap size planning expected 2 entry columns, got {}",
+            entries.num_columns()
+        )));
     }
     let keys = binary_array_size(entries.column(0), start, end, key_type)?;
     let values = binary_array_size(entries.column(1), start, end, value_type)?;
@@ -195,13 +193,10 @@ fn map_size(
 fn variant_size(array: &ArrayRef, row: usize, data_type: &DataType) -> crate::Result<u128> {
     let variant = downcast::<StructArray>(array, "StructArray", data_type)?;
     if variant.num_columns() != 2 {
-        return Err(crate::Error::DataInvalid {
-            message: format!(
-                "Variant size planning expected 2 child columns, got {}",
-                variant.num_columns()
-            ),
-            source: None,
-        });
+        return Err(data_invalid(format!(
+            "Variant size planning expected 2 child columns, got {}",
+            variant.num_columns()
+        )));
     }
     let value_len = binary_len(variant.column(0), row, data_type)?;
     let metadata_len = binary_len(variant.column(1), row, data_type)?;
@@ -254,10 +249,9 @@ fn primitive_width(data_type: &DataType) -> crate::Result<u128> {
         DataType::SmallInt(_) => Ok(2),
         DataType::Int(_) | DataType::Float(_) => Ok(4),
         DataType::BigInt(_) | DataType::Double(_) => Ok(8),
-        other => Err(crate::Error::DataInvalid {
-            message: format!("Unsupported vector element type for size planning: {other:?}"),
-            source: None,
-        }),
+        other => Err(data_invalid(format!(
+            "Unsupported vector element type for size planning: {other:?}"
+        ))),
     }
 }
 
@@ -285,10 +279,9 @@ fn downcast<'a, T: 'static>(
 }
 
 fn type_mismatch(expected: &str, data_type: &DataType) -> crate::Error {
-    crate::Error::DataInvalid {
-        message: format!("BinaryRow size planning expected {expected} for {data_type:?}"),
-        source: None,
-    }
+    data_invalid(format!(
+        "BinaryRow size planning expected {expected} for {data_type:?}"
+    ))
 }
 
 #[cfg(test)]
