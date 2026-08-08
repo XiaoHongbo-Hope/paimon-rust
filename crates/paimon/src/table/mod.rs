@@ -75,7 +75,6 @@ mod pk_vector_scan;
 mod postpone_batch_table_write;
 mod postpone_bucket;
 mod postpone_file_writer;
-mod postpone_fixed_bucket_write_builder;
 mod prepared_files;
 mod read_builder;
 pub mod referenced_files;
@@ -124,9 +123,8 @@ pub use incremental_scan::{
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use partition_stat::PartitionStat;
 pub use postpone_batch_table_write::{
-    PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD,
+    PostponeBucketPlan, PostponeFixedBucketWriteBuilder, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD,
 };
-pub use postpone_fixed_bucket_write_builder::PostponeFixedBucketWriteBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;

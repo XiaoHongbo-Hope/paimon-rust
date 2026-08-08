@@ -73,17 +73,6 @@ fn not_null_table_schema() -> TableSchema {
     TableSchema::new(0, &schema)
 }
 
-fn postpone_table_schema() -> TableSchema {
-    let schema = Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .column("name", DataType::VarChar(VarCharType::string_type()))
-        .primary_key(["id"])
-        .option("bucket", "-2")
-        .build()
-        .unwrap();
-    TableSchema::new(0, &schema)
-}
-
 fn partitioned_postpone_table_schema() -> TableSchema {
     let schema = Schema::builder()
         .column("pt", DataType::VarChar(VarCharType::string_type()))
@@ -1007,47 +996,6 @@ fn test_write_new_builder_and_free() {
 }
 
 #[test]
-fn test_postpone_fixed_bucket_builder_is_explicit() {
-    let path = "memory:/test_explicit_postpone_fixed_bucket_builder";
-    let file_io = memory_file_io();
-    setup_table_dirs(&file_io, path);
-    let table = Table::new(
-        file_io,
-        Identifier::new("default", "test"),
-        path.to_string(),
-        postpone_table_schema(),
-        None,
-    );
-    let handle = unsafe { wrap_table(table) };
-
-    unsafe {
-        let normal = paimon_table_new_write_builder(handle);
-        assert!(normal.error.is_null());
-        let normal_state = &*((*normal.write_builder).inner as *const WriteBuilderState);
-        assert!(!normal_state.postpone_fixed_bucket);
-        paimon_write_builder_free(normal.write_builder);
-
-        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle);
-        assert!(fixed.error.is_null());
-        let fixed_state = &*((*fixed.write_builder).inner as *const WriteBuilderState);
-        assert!(fixed_state.postpone_fixed_bucket);
-        paimon_write_builder_free(fixed.write_builder);
-
-        let commit_user = CString::new("fixed-user").unwrap();
-        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
-            handle,
-            commit_user.as_ptr(),
-        );
-        assert!(fixed.error.is_null());
-        let fixed_state = &*((*fixed.write_builder).inner as *const WriteBuilderState);
-        assert!(fixed_state.postpone_fixed_bucket);
-        assert_eq!(fixed_state.commit_user, "fixed-user");
-        paimon_write_builder_free(fixed.write_builder);
-        unwrap_table(handle);
-    }
-}
-
-#[test]
 fn test_write_commit_read_roundtrip() {
     let path = "memory:/test_write_roundtrip";
     let file_io = memory_file_io();
@@ -1555,6 +1503,20 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
     let commit_user = CString::new("distributed-postpone-job").unwrap();
 
     unsafe {
+        let normal = paimon_table_new_write_builder(handle);
+        assert!(normal.error.is_null());
+        assert!(
+            !(&*((*normal.write_builder).inner as *const WriteBuilderState)).postpone_fixed_bucket
+        );
+        paimon_write_builder_free(normal.write_builder);
+
+        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle);
+        assert!(fixed.error.is_null());
+        assert!(
+            (&*((*fixed.write_builder).inner as *const WriteBuilderState)).postpone_fixed_bucket
+        );
+        paimon_write_builder_free(fixed.write_builder);
+
         let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
             handle,
             commit_user.as_ptr(),

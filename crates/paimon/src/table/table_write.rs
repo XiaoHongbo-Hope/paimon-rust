@@ -1082,6 +1082,13 @@ mod tests {
         FileIOBuilder::new("memory").build().unwrap()
     }
 
+    fn options(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
     fn test_schema() -> TableSchema {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -3747,22 +3754,10 @@ mod tests {
     }
 
     fn test_fixed_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "-2")
-            .option("postpone.target-row-num-per-bucket", "2")
-            .option("postpone.batch-write-fixed-bucket.max-parallelism", "8")
-            .build()
-            .unwrap();
-        Table::new(
-            file_io.clone(),
-            Identifier::new("default", "test_fixed_postpone_table"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        )
+        test_postpone_pk_table(file_io, table_path).copy_with_options(options(&[
+            ("postpone.target-row-num-per-bucket", "2"),
+            ("postpone.batch-write-fixed-bucket.max-parallelism", "8"),
+        ]))
     }
 
     fn test_postpone_partitioned_schema() -> TableSchema {
@@ -3805,12 +3800,11 @@ mod tests {
         .unwrap()
     }
 
-    fn make_partition_bucket_plan(
-        table: &Table,
+    fn make_partition_bucket_plan_batch(
         partitions: Vec<&str>,
         total_buckets: Vec<i32>,
-    ) -> PostponeBucketPlan {
-        let batch = RecordBatch::try_new(
+    ) -> RecordBatch {
+        RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("pt", ArrowDataType::Utf8, false),
                 ArrowField::new("total_buckets", ArrowDataType::Int32, false),
@@ -3820,8 +3814,37 @@ mod tests {
                 Arc::new(Int32Array::from(total_buckets)),
             ],
         )
-        .unwrap();
-        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+        .unwrap()
+    }
+
+    fn make_partition_bucket_plan(
+        table: &Table,
+        partitions: Vec<&str>,
+        total_buckets: Vec<i32>,
+    ) -> PostponeBucketPlan {
+        PostponeBucketPlan::from_arrow(
+            table,
+            &make_partition_bucket_plan_batch(partitions, total_buckets),
+        )
+        .unwrap()
+    }
+
+    async fn write_fixed_batch(
+        table: &Table,
+        commit_user: &str,
+        batch: &RecordBatch,
+    ) -> Vec<CommitMessage> {
+        let mut write =
+            TableWrite::new_postpone_fixed_bucket(table, commit_user.to_string()).unwrap();
+        write.write_arrow_batch(batch).await.unwrap();
+        write.prepare_commit().await.unwrap()
+    }
+
+    fn assert_total_buckets(messages: &[CommitMessage], total_buckets: i32) {
+        assert!(!messages.is_empty());
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(total_buckets)));
     }
 
     #[test]
@@ -3829,17 +3852,7 @@ mod tests {
         let file_io = test_file_io();
         let table =
             test_postpone_partitioned_table(&file_io, "memory:/test_postpone_invalid_bucket_plan");
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("pt", ArrowDataType::Utf8, false),
-                ArrowField::new("total_buckets", ArrowDataType::Int32, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec!["p"])),
-                Arc::new(Int32Array::from(vec![0])),
-            ],
-        )
-        .unwrap();
+        let batch = make_partition_bucket_plan_batch(vec!["p"], vec![0]);
 
         let error = PostponeBucketPlan::from_arrow(&table, &batch).unwrap_err();
         assert!(error.to_string().contains("must be positive"));
@@ -3886,15 +3899,10 @@ mod tests {
             .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
             .await
             .unwrap();
-        let state = write.postpone_fixed_bucket.as_ref().unwrap();
-        assert_eq!(state.buffered_partition_count(), 1);
         assert!(write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
-        assert!(!messages.is_empty());
         assert!(messages.iter().all(|message| message.bucket >= 0));
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(2)));
+        assert_total_buckets(&messages, 2);
         TableCommit::new(table.clone(), "fixed-user-1".to_string())
             .commit(messages)
             .await
@@ -3910,13 +3918,9 @@ mod tests {
             .write_arrow_batch(&make_batch(vec![5], vec![50]))
             .await
             .unwrap();
-        let state = write.postpone_fixed_bucket.as_ref().unwrap();
-        assert_eq!(state.buffered_partition_count(), 0);
         assert!(!write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(2)));
+        assert_total_buckets(&messages, 2);
         TableCommit::new(table.clone(), "fixed-user-2".to_string())
             .commit(messages)
             .await
@@ -3958,10 +3962,7 @@ mod tests {
 
         let mut messages = first.prepare_commit().await.unwrap();
         messages.extend(second.prepare_commit().await.unwrap());
-        assert!(!messages.is_empty());
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(3)));
+        assert_total_buckets(&messages, 3);
         builder.new_commit().commit(messages).await.unwrap();
     }
 
@@ -4029,9 +4030,7 @@ mod tests {
             .await
             .unwrap();
         let messages = overwrite_write.prepare_commit().await.unwrap();
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(3)));
+        assert_total_buckets(&messages, 3);
         overwrite_builder
             .new_commit()
             .overwrite(messages, None)
@@ -4057,33 +4056,17 @@ mod tests {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_row_target_precedence";
         setup_dirs(&file_io, table_path).await;
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "-2")
-            .option("postpone.target-row-num-per-bucket", "2")
-            .option("postpone.target-size-per-bucket", "invalid")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_postpone_row_target_precedence"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(&table, "row-target".to_string()).unwrap();
-        write
-            .write_arrow_batch(&make_batch(vec![1, 2, 3], vec![10, 20, 30]))
-            .await
-            .unwrap();
-        let messages = write.prepare_commit().await.unwrap();
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(2)));
+        let table = test_postpone_pk_table(&file_io, table_path).copy_with_options(options(&[
+            ("postpone.target-row-num-per-bucket", "2"),
+            ("postpone.target-size-per-bucket", "invalid"),
+        ]));
+        let messages = write_fixed_batch(
+            &table,
+            "row-target",
+            &make_batch(vec![1, 2, 3], vec![10, 20, 30]),
+        )
+        .await;
+        assert_total_buckets(&messages, 2);
     }
 
     #[tokio::test]
@@ -4121,10 +4104,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-rowkind".to_string()).unwrap();
-        write.write_arrow_batch(&batch).await.unwrap();
-        let messages = write.prepare_commit().await.unwrap();
+        let messages = write_fixed_batch(&table, "fixed-rowkind", &batch).await;
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].bucket, 0);
@@ -4169,15 +4149,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-size-user".to_string()).unwrap();
-        write.write_arrow_batch(&batch).await.unwrap();
-        let messages = write.prepare_commit().await.unwrap();
-
-        assert!(!messages.is_empty());
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(2)));
+        let messages = write_fixed_batch(&table, "fixed-size-user", &batch).await;
+        assert_total_buckets(&messages, 2);
     }
 
     #[tokio::test]
@@ -4194,9 +4167,7 @@ mod tests {
             .await
             .unwrap();
         let messages = write.prepare_commit().await.unwrap();
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(1)));
+        assert_total_buckets(&messages, 1);
 
         let write_error = write
             .write_arrow_batch(&make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]))
@@ -4219,21 +4190,8 @@ mod tests {
     #[test]
     fn test_postpone_fixed_bucket_rejects_deletion_vectors() {
         let file_io = test_file_io();
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "-2")
-            .option("deletion-vectors.enabled", "true")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_postpone_dv"),
-            "memory:/test_postpone_dv".to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
+        let table = test_postpone_pk_table(&file_io, "memory:/test_postpone_dv")
+            .copy_with_options(options(&[("deletion-vectors.enabled", "true")]));
 
         let error = TableWrite::new_postpone_fixed_bucket(&table, "test-user".to_string())
             .err()
@@ -4250,27 +4208,16 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let table = test_fixed_postpone_pk_table(&file_io, table_path);
 
-        let mut first =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-conflict-1".to_string()).unwrap();
-        first
-            .write_arrow_batch(&make_batch(vec![1], vec![10]))
-            .await
-            .unwrap();
-        let first_messages = first.prepare_commit().await.unwrap();
-        assert!(first_messages
-            .iter()
-            .all(|message| message.total_buckets == Some(1)));
-
-        let mut second =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-conflict-2".to_string()).unwrap();
-        second
-            .write_arrow_batch(&make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]))
-            .await
-            .unwrap();
-        let second_messages = second.prepare_commit().await.unwrap();
-        assert!(second_messages
-            .iter()
-            .all(|message| message.total_buckets == Some(2)));
+        let first_messages =
+            write_fixed_batch(&table, "fixed-conflict-1", &make_batch(vec![1], vec![10])).await;
+        assert_total_buckets(&first_messages, 1);
+        let second_messages = write_fixed_batch(
+            &table,
+            "fixed-conflict-2",
+            &make_batch(vec![2, 3, 4, 5], vec![20, 30, 40, 50]),
+        )
+        .await;
+        assert_total_buckets(&second_messages, 2);
 
         TableCommit::new(table.clone(), "fixed-conflict-1".to_string())
             .commit(first_messages)

@@ -1179,17 +1179,15 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn postpone_target_row_num_per_bucket(&self) -> crate::Result<Option<i64>> {
-        let value = self.parse_i64_option(POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION)?;
-        if value.is_some_and(|value| value <= 0) {
-            return Err(crate::Error::DataInvalid {
+        match self.parse_i64_option(POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION)? {
+            Some(value @ ..=0) => Err(crate::Error::DataInvalid {
                 message: format!(
-                    "Option '{POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION}' must be positive, got: {}",
-                    value.unwrap()
+                    "Option '{POSTPONE_TARGET_ROW_NUM_PER_BUCKET_OPTION}' must be positive, got: {value}"
                 ),
                 source: None,
-            });
+            }),
+            value => Ok(value),
         }
-        Ok(value)
     }
 
     pub fn postpone_target_size_per_bucket(&self) -> crate::Result<i64> {

@@ -24,10 +24,12 @@ use crate::spec::{
 use crate::table::bucket_function::{batch_bucket_ids, validate_bucket_function};
 use crate::table::postpone_bucket::binary_row_batch_size;
 use crate::table::table_write::take_rows;
-use crate::table::{SnapshotManager, Table, TableScan};
+use crate::table::write_builder::{ensure_table_write_allowed, validate_commit_user};
+use crate::table::{SnapshotManager, Table, TableCommit, TableScan, TableWrite};
 use crate::Result;
 use arrow_array::{Array, Int32Array, RecordBatch};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Column name used by [`PostponeBucketPlan::from_arrow`] for bucket counts.
 pub const POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD: &str = "total_buckets";
@@ -60,17 +62,19 @@ impl PostponeBucketPlan {
 
         let expected_partition_schema = crate::arrow::build_target_arrow_schema(&partition_fields)?;
         let batch_schema = batch.schema();
+        if !expected_partition_schema
+            .fields()
+            .iter()
+            .zip(batch_schema.fields())
+            .all(|(expected, actual)| {
+                actual.name() == expected.name() && actual.data_type() == expected.data_type()
+            })
+        {
+            return Err(data_invalid(
+                "Postpone bucket plan partition fields do not match the table schema",
+            ));
+        }
         for (index, expected) in expected_partition_schema.fields().iter().enumerate() {
-            let actual = batch_schema.field(index);
-            if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
-                return Err(data_invalid(format!(
-                        "Postpone bucket plan partition field mismatch at index {index}: expected '{}': {:?}, got '{}': {:?}",
-                        expected.name(),
-                        expected.data_type(),
-                        actual.name(),
-                        actual.data_type()
-                    )));
-            }
             if !expected.is_nullable() && batch.column(index).null_count() != 0 {
                 return Err(data_invalid(format!(
                         "Postpone bucket plan partition column '{}' is NOT NULL but contains null values",
@@ -124,6 +128,80 @@ impl PostponeBucketPlan {
 
     fn into_bucket_counts(self) -> HashMap<Vec<u8>, i32> {
         self.bucket_counts
+    }
+}
+
+/// Builder for one-shot fixed-bucket writes to a postpone table.
+pub struct PostponeFixedBucketWriteBuilder<'a> {
+    table: &'a Table,
+    commit_user: String,
+    overwrite: bool,
+    bucket_plan: Option<PostponeBucketPlan>,
+}
+
+impl<'a> PostponeFixedBucketWriteBuilder<'a> {
+    pub(crate) fn new(table: &'a Table) -> Result<Self> {
+        validate_postpone_fixed_bucket_table(table)?;
+        Ok(Self {
+            table,
+            commit_user: Uuid::new_v4().to_string(),
+            overwrite: false,
+            bucket_plan: None,
+        })
+    }
+
+    /// Return the shared commit user.
+    pub fn commit_user(&self) -> &str {
+        &self.commit_user
+    }
+
+    /// Set the shared commit user.
+    pub fn with_commit_user(mut self, commit_user: impl Into<String>) -> Result<Self> {
+        let commit_user = commit_user.into();
+        validate_commit_user(&commit_user)?;
+        self.commit_user = commit_user;
+        Ok(self)
+    }
+
+    /// Enable overwrite mode.
+    pub fn with_overwrite(mut self) -> Self {
+        self.overwrite = true;
+        self
+    }
+
+    /// Set the shared bucket plan.
+    pub fn with_bucket_plan(mut self, bucket_plan: PostponeBucketPlan) -> Self {
+        self.bucket_plan = Some(bucket_plan);
+        self
+    }
+
+    /// Create a committer.
+    pub fn new_commit(&self) -> TableCommit {
+        TableCommit::new(self.table.clone(), self.commit_user.clone())
+    }
+
+    /// Try to create a committer.
+    pub fn try_new_commit(&self) -> Result<TableCommit> {
+        self.table.ensure_not_branch_reference_for_write()?;
+        Ok(self.new_commit())
+    }
+
+    /// Create a table writer.
+    pub fn new_write(&self) -> Result<TableWrite> {
+        ensure_table_write_allowed(self.table)?;
+        let write = match self.bucket_plan.clone() {
+            Some(plan) => TableWrite::new_postpone_fixed_bucket_with_plan(
+                self.table,
+                self.commit_user.clone(),
+                plan,
+            )?,
+            None => TableWrite::new_postpone_fixed_bucket(self.table, self.commit_user.clone())?,
+        };
+        Ok(if self.overwrite {
+            write.with_overwrite()
+        } else {
+            write
+        })
     }
 }
 
@@ -250,17 +328,12 @@ impl PostponeFixedBucketWriter {
 
         let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         for (row, partition) in partitions.into_iter().enumerate() {
+            if self.plan_provided && !self.known_bucket_counts.contains_key(&partition) {
+                return Err(data_invalid(
+                    "Postpone bucket plan does not contain an input partition",
+                ));
+            }
             groups.entry(partition).or_default().push(row);
-        }
-
-        if self.plan_provided
-            && groups
-                .keys()
-                .any(|partition| !self.known_bucket_counts.contains_key(partition))
-        {
-            return Err(data_invalid(
-                "Postpone bucket plan does not contain an input partition",
-            ));
         }
 
         let mut output = Vec::new();
@@ -336,11 +409,6 @@ impl PostponeFixedBucketWriter {
     pub(super) fn finish(&mut self) {
         self.known_bucket_counts.clear();
         self.postpone_row_counts.clear();
-    }
-
-    #[cfg(test)]
-    pub(super) fn buffered_partition_count(&self) -> usize {
-        self.buffered_batches.len()
     }
 
     async fn ensure_metadata_loaded(&mut self, table: &Table) -> Result<()> {
