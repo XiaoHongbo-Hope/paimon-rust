@@ -53,7 +53,7 @@ pub(crate) const OSS_RETRY_COUNT: &str = "fs.oss.retry.count";
 /// Initial exponential retry interval in milliseconds.
 pub(crate) const OSS_RETRY_INTERVAL_MILLIS: &str = "fs.oss.retry.interval.millisecond";
 
-const DEFAULT_OSS_RETRY_COUNT: usize = 5;
+const DEFAULT_OSS_RETRY_COUNT: usize = 10;
 const DEFAULT_OSS_RETRY_INTERVAL_MILLIS: u64 = 500;
 
 #[derive(Debug)]
