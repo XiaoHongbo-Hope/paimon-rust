@@ -131,7 +131,8 @@ With `storage-jindo`, set `fs.oss.impl` to `jindo` to use an installed JindoSDK
 for OSS scan planning. Set `fs.jindo.library.path` unless the library is
 available through `JINDOSDK_HOME` or `JINDOSDK_LIBRARY_PATH`. The Python binding
 also discovers it from an installed `pyjindosdk` package. This initial
-integration supports object stat and reads, but not writes or listings.
+integration supports object stat, reads, and listings, but not writes, deletes,
+or copies.
 
 Supported metastore types:
 

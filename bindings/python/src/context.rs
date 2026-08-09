@@ -113,41 +113,17 @@ fn pyjindo_library_in(directory: &std::path::Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn configure_pyjindo(
-    catalog_options: &mut HashMap<String, String>,
-    discovered_library: Option<PathBuf>,
-) {
-    let impl_name = catalog_options.get(OSS_IMPL).map(String::as_str);
-    if impl_name.is_some_and(|value| !value.eq_ignore_ascii_case("jindo")) {
-        return;
-    }
-
-    if catalog_options.contains_key(JINDO_LIBRARY_PATH) {
-        catalog_options
-            .entry(OSS_IMPL.to_string())
-            .or_insert_with(|| "jindo".to_string());
-        return;
-    }
-
-    if let Some(path) = discovered_library {
-        catalog_options
-            .entry(OSS_IMPL.to_string())
-            .or_insert_with(|| "jindo".to_string());
-        catalog_options.insert(JINDO_LIBRARY_PATH.to_string(), path.display().to_string());
-    }
-}
-
 fn build_paimon_catalog(
     mut catalog_options: HashMap<String, String>,
 ) -> PyResult<Arc<dyn Catalog>> {
-    let discover_jindo = catalog_options
+    let use_jindo = catalog_options
         .get(OSS_IMPL)
-        .is_none_or(|value| value.eq_ignore_ascii_case("jindo"))
-        && !catalog_options.contains_key(JINDO_LIBRARY_PATH);
-    configure_pyjindo(
-        &mut catalog_options,
-        discover_jindo.then(discover_pyjindo_library).flatten(),
-    );
+        .is_some_and(|value| value.eq_ignore_ascii_case("jindo"));
+    if use_jindo && !catalog_options.contains_key(JINDO_LIBRARY_PATH) {
+        if let Some(path) = discover_pyjindo_library() {
+            catalog_options.insert(JINDO_LIBRARY_PATH.to_string(), path.display().to_string());
+        }
+    }
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
@@ -180,43 +156,6 @@ mod tests {
         assert_eq!(pyjindo_library_in(&directory), Some(library));
 
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn test_installed_pyjindo_is_preferred_by_default() {
-        let library = PathBuf::from("/pyjindo/libjindosdk_python.so");
-        let mut options = HashMap::new();
-
-        configure_pyjindo(&mut options, Some(library.clone()));
-
-        assert_eq!(options.get(OSS_IMPL).map(String::as_str), Some("jindo"));
-        assert_eq!(
-            options.get(JINDO_LIBRARY_PATH).map(String::as_str),
-            library.to_str()
-        );
-    }
-
-    #[test]
-    fn test_missing_pyjindo_keeps_legacy_default() {
-        let mut options = HashMap::new();
-
-        configure_pyjindo(&mut options, None);
-
-        assert!(!options.contains_key(OSS_IMPL));
-        assert!(!options.contains_key(JINDO_LIBRARY_PATH));
-    }
-
-    #[test]
-    fn test_explicit_legacy_ignores_installed_pyjindo() {
-        let mut options = HashMap::from([(OSS_IMPL.to_string(), "legacy".to_string())]);
-
-        configure_pyjindo(
-            &mut options,
-            Some(PathBuf::from("/pyjindo/libjindosdk_python.so")),
-        );
-
-        assert_eq!(options.get(OSS_IMPL).map(String::as_str), Some("legacy"));
-        assert!(!options.contains_key(JINDO_LIBRARY_PATH));
     }
 }
 
