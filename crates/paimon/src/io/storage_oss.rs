@@ -175,16 +175,25 @@ mod tests {
         ])
     }
 
+    fn temporary_failure() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(
+                "<Error><Code>QpsLimitExceeded</Code><Message>retry</Message></Error>",
+            ))
+            .unwrap()
+    }
+
     async fn retry_once(State(attempts): State<Arc<AtomicUsize>>) -> Response<Body> {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from(
-                    "<Error><Code>QpsLimitExceeded</Code><Message>retry</Message></Error>",
-                ))
-                .unwrap();
+            return temporary_failure();
         }
         Response::new(Body::from("ok"))
+    }
+
+    async fn always_fail(State(attempts): State<Arc<AtomicUsize>>) -> Response<Body> {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        temporary_failure()
     }
 
     #[test]
@@ -258,6 +267,29 @@ mod tests {
 
         let op = oss_config_build(&storage_config(cfg), "oss://bucket/path").unwrap();
         assert_eq!(op.read("object").await.unwrap().to_bytes(), "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_oss_retry_count_is_additional_attempts() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(get(always_fail))
+            .with_state(attempts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut props = required_props();
+        props.insert(OSS_ENDPOINT.to_string(), format!("http://{address}"));
+        props.insert(OSS_RETRY_COUNT.to_string(), "1".to_string());
+        props.insert(OSS_RETRY_INTERVAL_MILLIS.to_string(), "1".to_string());
+        let mut cfg = oss_config_parse(props).unwrap();
+        cfg.service.addressing_style = Some("path".to_string());
+        cfg.service.skip_signature = true;
+
+        let op = oss_config_build(&cfg, "oss://bucket/path").unwrap();
+        assert!(op.read("object").await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }
