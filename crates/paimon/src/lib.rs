@@ -50,9 +50,11 @@ pub use catalog::FileSystemCatalog;
 pub use table::{
     CommitMessage, DataEvolutionDeleteWriter, DataEvolutionWriter, DataSplit, DataSplitBuilder,
     DeletionFile, IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
-    PartitionBucket, Plan, RESTEnv, RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit,
-    RowRange, ScanTrace, SnapshotCommit, SnapshotManager, Table, TableCommit, TableRead, TableScan,
-    TableUpdate, TableWrite, TagManager, WriteBuilder,
+    PartitionBucket, Plan, PostponeBucketPlan, PostponeBucketPlanner,
+    PostponeFixedBucketBatchTableWrite, PostponeFixedBucketRouter, PostponeFixedBucketTableCommit,
+    PostponeFixedBucketTableWrite, PostponePartitionStats, RESTEnv, RESTSnapshotCommit,
+    ReadBuilder, RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager,
+    Table, TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
 };
 
 pub use table::{

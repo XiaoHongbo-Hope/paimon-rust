@@ -1642,10 +1642,14 @@ fn test_distributed_postpone_writers_reject_overlapping_bucket_ownership() {
         let messages1 = paimon_table_write_prepare_commit(tw1).messages;
         let messages2 = paimon_table_write_prepare_commit(tw2).messages;
         let error = paimon_commit_messages_merge(messages1, messages2);
+        assert!(error.is_null());
+        let commit = paimon_write_builder_new_commit(wb1).commit;
+        let error = paimon_table_commit_commit(commit, messages1);
         assert!(!error.is_null());
         assert!(error_message(error).contains("writer ownership conflict for bucket 0"));
         paimon_error_free(error);
 
+        paimon_table_commit_free(commit);
         paimon_commit_messages_free(messages2);
         paimon_commit_messages_free(messages1);
         paimon_table_write_free(tw2);
@@ -1808,7 +1812,7 @@ fn test_write_overwrite_mode() {
 
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
-            paimon_table_commit_overwrite(tc_result.commit, pc.messages);
+            paimon_table_commit_commit(tc_result.commit, pc.messages);
             paimon_commit_messages_free(pc.messages);
 
             paimon_table_commit_free(tc_result.commit);

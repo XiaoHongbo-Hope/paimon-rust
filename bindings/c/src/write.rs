@@ -180,8 +180,7 @@ pub unsafe extern "C" fn paimon_write_builder_free(wb: *mut paimon_write_builder
 
 /// Enable overwrite mode for the WriteBuilder.
 ///
-/// In overwrite mode, a subsequent `paimon_table_commit_overwrite` will replace
-/// the data in the written partitions rather than appending.
+/// Writers and committers created afterwards use overwrite mode.
 ///
 /// # Safety
 /// `wb` must be a valid pointer from `paimon_table_new_write_builder`, or null (returns error).
@@ -201,8 +200,8 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
 ///
 /// The Arrow batch contains partition columns followed by a non-null Int32
 /// `total_buckets`. Ownership of the Arrow C Data structs is transferred.
-/// Each `(partition, bucket)` must be routed to exactly one writer; merging
-/// overlapping writer messages is rejected.
+/// Each `(partition, bucket)` must be routed to exactly one writer; commit
+/// rejects overlapping writer messages.
 ///
 /// # Safety
 /// `wb` must be an explicit postpone fixed-bucket builder. `array` and
@@ -369,7 +368,7 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
     }
 }
 
-fn create_table_write(state: &WriteBuilderState) -> paimon::Result<paimon::TableWrite> {
+fn create_table_write(state: &WriteBuilderState) -> paimon::Result<TableWriteKind> {
     if state.postpone_fixed_bucket {
         let mut builder = state
             .table
@@ -381,7 +380,10 @@ fn create_table_write(state: &WriteBuilderState) -> paimon::Result<paimon::Table
         if state.overwrite {
             builder = builder.with_overwrite();
         }
-        builder.new_write()
+        builder
+            .new_write()
+            .map(Box::new)
+            .map(TableWriteKind::PostponeFixed)
     } else {
         let mut builder = state
             .table
@@ -390,7 +392,10 @@ fn create_table_write(state: &WriteBuilderState) -> paimon::Result<paimon::Table
         if state.overwrite {
             builder = builder.with_overwrite();
         }
-        builder.new_write()
+        builder
+            .new_write()
+            .map(Box::new)
+            .map(TableWriteKind::Standard)
     }
 }
 
@@ -447,7 +452,11 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
         return error;
     }
 
-    match runtime().block_on(table_write.write.write_arrow_batch(&batch)) {
+    let result = match &mut table_write.write {
+        TableWriteKind::Standard(write) => runtime().block_on(write.write_arrow_batch(&batch)),
+        TableWriteKind::PostponeFixed(write) => runtime().block_on(write.write_arrow_batch(&batch)),
+    };
+    match result {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -478,7 +487,11 @@ pub unsafe extern "C" fn paimon_table_write_prepare_commit(
     }
     let table_write = &mut *((*tw).inner as *mut TableWriteState);
 
-    match runtime().block_on(table_write.write.prepare_commit()) {
+    let result = match &mut table_write.write {
+        TableWriteKind::Standard(write) => runtime().block_on(write.prepare_commit()),
+        TableWriteKind::PostponeFixed(write) => runtime().block_on(write.prepare_commit()),
+    };
+    match result {
         Ok(messages) => {
             let messages = CommitMessagesState {
                 messages,
@@ -545,6 +558,7 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
 
     let table_commit = TableCommitState {
         commit: tc,
+        overwrite: state.overwrite,
         table_location: state.table.location().to_string(),
         commit_user: state.commit_user.clone(),
     };
@@ -588,8 +602,7 @@ pub unsafe extern "C" fn paimon_commit_messages_free(msgs: *mut paimon_commit_me
 /// Merge `source` messages into `target` for one logical commit.
 ///
 /// Both handles retain ownership and must be freed separately. They must have
-/// been prepared for the same table and `commit_user`. Fixed-bucket messages
-/// must not contain the same `(partition, bucket)` from multiple writers.
+/// been prepared for the same table and `commit_user`.
 ///
 /// # Safety
 /// `target` and `source` must be distinct valid commit-message handles.
@@ -615,21 +628,6 @@ pub unsafe extern "C" fn paimon_commit_messages_merge(
             "commit messages can only be merged when table and commit_user both match",
         );
     }
-    if let Some(message) = target.messages.iter().find(|target_message| {
-        target_message.total_buckets.is_some()
-            && !target_message.new_files.is_empty()
-            && source.messages.iter().any(|source_message| {
-                source_message.total_buckets.is_some()
-                    && !source_message.new_files.is_empty()
-                    && source_message.partition == target_message.partition
-                    && source_message.bucket == target_message.bucket
-            })
-    }) {
-        return invalid_input(format!(
-            "postpone fixed-bucket writer ownership conflict for bucket {}: route all rows for one partition and bucket to a single writer",
-            message.bucket
-        ));
-    }
     target.messages.extend(source.messages.clone());
     ptr::null_mut()
 }
@@ -654,7 +652,7 @@ fn validate_commit_context(
     Ok(())
 }
 
-/// Commit the given messages in APPEND mode.
+/// Commit the given messages in the mode configured by the WriteBuilder.
 ///
 /// Empty messages is a no-op success.
 /// The caller retains ownership of `msgs`; it may retry after an error and
@@ -698,11 +696,20 @@ pub unsafe extern "C" fn paimon_table_commit_commit_with_identifier(
         return error;
     }
 
-    match runtime().block_on(
-        table_commit
-            .commit
-            .commit_with_identifier(messages.messages.clone(), commit_identifier),
-    ) {
+    let result = if table_commit.overwrite {
+        runtime().block_on(table_commit.commit.overwrite_with_identifier(
+            messages.messages.clone(),
+            None,
+            commit_identifier,
+        ))
+    } else {
+        runtime().block_on(
+            table_commit
+                .commit
+                .commit_with_identifier(messages.messages.clone(), commit_identifier),
+        )
+    };
+    match result {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -733,11 +740,20 @@ pub unsafe extern "C" fn paimon_table_commit_filter_and_commit_with_identifier(
         return error;
     }
 
-    match runtime().block_on(
-        table_commit
-            .commit
-            .filter_and_commit_with_identifier(messages.messages.clone(), commit_identifier),
-    ) {
+    let result = if table_commit.overwrite {
+        runtime().block_on(table_commit.commit.overwrite_with_identifier(
+            messages.messages.clone(),
+            None,
+            commit_identifier,
+        ))
+    } else {
+        runtime().block_on(
+            table_commit
+                .commit
+                .filter_and_commit_with_identifier(messages.messages.clone(), commit_identifier),
+        )
+    };
+    match result {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }

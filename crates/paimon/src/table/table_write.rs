@@ -38,7 +38,6 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
-use crate::table::postpone_batch_table_write::{PostponeBucketPlan, PostponeFixedBucketWriter};
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
@@ -148,35 +147,14 @@ pub struct TableWrite {
     has_dedicated_vector_fields: bool,
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
-    postpone_fixed_bucket: Option<PostponeFixedBucketWriter>,
 }
 
 impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
-        Self::new_inner(table, commit_user, false, None)
+        Self::new_inner(table, commit_user)
     }
 
-    pub(crate) fn new_postpone_fixed_bucket(
-        table: &Table,
-        commit_user: String,
-    ) -> crate::Result<Self> {
-        Self::new_inner(table, commit_user, true, None)
-    }
-
-    pub(crate) fn new_postpone_fixed_bucket_with_plan(
-        table: &Table,
-        commit_user: String,
-        bucket_plan: PostponeBucketPlan,
-    ) -> crate::Result<Self> {
-        Self::new_inner(table, commit_user, true, Some(bucket_plan))
-    }
-
-    fn new_inner(
-        table: &Table,
-        commit_user: String,
-        use_postpone_fixed_bucket: bool,
-        postpone_bucket_plan: Option<PostponeBucketPlan>,
-    ) -> crate::Result<Self> {
+    fn new_inner(table: &Table, commit_user: String) -> crate::Result<Self> {
         let is_overwrite = false;
         let schema = table.schema();
         let write_schema = build_target_arrow_schema(schema.fields())?;
@@ -342,18 +320,6 @@ impl TableWrite {
         let target_bucket_row_number = core_options.dynamic_bucket_target_row_num();
         let bucket_function_type = core_options.bucket_function_type()?;
 
-        let postpone_fixed_bucket = use_postpone_fixed_bucket
-            .then(|| {
-                PostponeFixedBucketWriter::new(
-                    table,
-                    partition_field_indices.clone(),
-                    bucket_key_indices.clone(),
-                    bucket_function_type,
-                    postpone_bucket_plan,
-                )
-            })
-            .transpose()?;
-
         let bucket_assigner = if is_dynamic_cross_partition {
             BucketAssignerEnum::CrossPartition(Box::new(CrossPartitionAssigner::new(
                 table.clone(),
@@ -436,7 +402,6 @@ impl TableWrite {
             has_dedicated_vector_fields,
             row_kind_generator,
             row_kind_filter,
-            postpone_fixed_bucket,
         })
     }
 
@@ -497,37 +462,9 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        if let Some(writer) = self.postpone_fixed_bucket.as_ref() {
-            writer.ensure_writable()?;
-        }
-        self.validate_write_batch_schema(batch)?;
-
-        if batch.num_rows() == 0 {
+        let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
-        }
-
-        let batch = self.enrich_rowkind_batch(batch)?;
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        if self.postpone_fixed_bucket.is_some() {
-            let routed = self
-                .postpone_fixed_bucket
-                .as_mut()
-                .unwrap()
-                .write_batch(&self.table, &batch)
-                .await?;
-            for routed_batch in routed {
-                self.write_bucket(
-                    routed_batch.partition,
-                    routed_batch.bucket,
-                    routed_batch.batch,
-                )
-                .await?;
-            }
-            return Ok(());
-        }
+        };
 
         let grouped = self.divide_by_partition_bucket(&batch).await?;
         for ((partition_bytes, bucket), sub_batch) in grouped {
@@ -535,6 +472,24 @@ impl TableWrite {
                 .await?;
         }
         Ok(())
+    }
+
+    pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+        self.validate_write_batch_schema(batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let batch = self.enrich_rowkind_batch(batch)?;
+        Ok((batch.num_rows() != 0).then_some(batch))
+    }
+
+    pub(super) async fn write_partition_bucket_batch(
+        &mut self,
+        partition: Vec<u8>,
+        bucket: i32,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        self.write_bucket(partition, bucket, batch).await
     }
 
     fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
@@ -839,21 +794,7 @@ impl TableWrite {
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
-    /// Writers are cleared after this call; fixed-bucket postpone writes are one-shot.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        if let Some(writer) = self.postpone_fixed_bucket.as_mut() {
-            writer.start_prepare()?;
-            let routed = writer.prepare_batch(&self.table, self.is_overwrite).await?;
-            for routed_batch in routed {
-                self.write_bucket(
-                    routed_batch.partition,
-                    routed_batch.bucket,
-                    routed_batch.batch,
-                )
-                .await?;
-            }
-        }
-
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
 
@@ -884,10 +825,6 @@ impl TableWrite {
                 || !index_files.is_empty()
             {
                 let mut msg = CommitMessage::new(partition_bytes, bucket, files.data_files);
-                msg.total_buckets = self
-                    .postpone_fixed_bucket
-                    .as_ref()
-                    .and_then(|writer| writer.total_buckets(&msg.partition));
                 msg.new_changelog_files = files.changelog_files;
                 msg.new_index_files = index_files;
                 messages.push(msg);
@@ -901,9 +838,6 @@ impl TableWrite {
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }
-        }
-        if let Some(writer) = self.postpone_fixed_bucket.as_mut() {
-            writer.finish();
         }
         Ok(messages)
     }
@@ -1070,7 +1004,7 @@ mod tests {
         SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
         VALUE_KIND_FIELD_NAME,
     };
-    use crate::table::{SnapshotManager, TableCommit};
+    use crate::table::{PostponeBucketPlan, PostponeBucketPlanner, SnapshotManager, TableCommit};
     use arrow_array::RecordBatchReader as _;
     use arrow_array::{Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray};
     use arrow_schema::{
@@ -3834,8 +3768,13 @@ mod tests {
         commit_user: &str,
         batch: &RecordBatch,
     ) -> Vec<CommitMessage> {
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(table, commit_user.to_string()).unwrap();
+        let mut write = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user(commit_user)
+            .unwrap()
+            .new_write()
+            .unwrap();
         write.write_arrow_batch(batch).await.unwrap();
         write.prepare_commit().await.unwrap()
     }
@@ -3890,13 +3829,16 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let table = test_fixed_postpone_pk_table(&file_io, table_path);
 
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-user-1".to_string()).unwrap();
+        let first_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("fixed-user-1")
+            .unwrap();
+        let mut write = first_builder.new_write().unwrap();
         write
             .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
             .await
             .unwrap();
-        assert!(write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert!(messages.iter().all(|message| message.bucket >= 0));
         assert_total_buckets(&messages, 2);
@@ -3918,13 +3860,16 @@ mod tests {
             vec![(1, 10), (2, 20), (3, 30), (4, 40)]
         );
 
-        let mut write =
-            TableWrite::new_postpone_fixed_bucket(&table, "fixed-user-2".to_string()).unwrap();
+        let second_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("fixed-user-2")
+            .unwrap();
+        let mut write = second_builder.new_write().unwrap();
         write
             .write_arrow_batch(&make_batch(vec![5], vec![50]))
             .await
             .unwrap();
-        assert!(!write.partition_writers.is_empty());
         let messages = write.prepare_commit().await.unwrap();
         assert_total_buckets(&messages, 2);
         assert_one_shot_error(
@@ -3958,8 +3903,8 @@ mod tests {
             .with_commit_user("shared-plan-user")
             .unwrap()
             .with_bucket_plan(plan);
-        let mut first = builder.new_write().unwrap();
-        let mut second = builder.new_write().unwrap();
+        let mut first = builder.new_planned_write().unwrap();
+        let mut second = builder.new_planned_write().unwrap();
         first
             .write_arrow_batch(&make_partitioned_batch_3col(vec!["p1"], vec![1], vec![10]))
             .await
@@ -3980,6 +3925,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_postpone_planner_merges_partition_stats() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_planner_stats";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path)
+            .copy_with_options(options(&[("postpone.target-row-num-per-bucket", "2")]));
+        let planner = PostponeBucketPlanner::new(&table).await.unwrap();
+        let first = make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]);
+        let second = make_partitioned_batch_3col(vec!["p", "p"], vec![2, 3], vec![20, 30]);
+        let mut stats = planner.input_partition_stats(&first).unwrap();
+        stats.merge(&planner.input_partition_stats(&second).unwrap());
+        let plan = planner.plan(&stats, true);
+
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(plan);
+        let mut write = builder.new_planned_write().unwrap();
+        write.write_arrow_batch(&first).await.unwrap();
+        write.write_arrow_batch(&second).await.unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_total_buckets(&messages, 2);
+    }
+
+    #[tokio::test]
     async fn test_postpone_distributed_writers_reject_overlapping_bucket_ownership() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_overlapping_writer_ownership";
@@ -3992,8 +3962,8 @@ mod tests {
             .unwrap()
             .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]));
 
-        let mut first = builder.new_write().unwrap();
-        let mut second = builder.new_write().unwrap();
+        let mut first = builder.new_planned_write().unwrap();
+        let mut second = builder.new_planned_write().unwrap();
         first
             .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
             .await
@@ -4086,7 +4056,7 @@ mod tests {
         assert_total_buckets(&messages, 3);
         overwrite_builder
             .new_commit()
-            .overwrite(messages, None)
+            .commit(messages)
             .await
             .unwrap();
 
