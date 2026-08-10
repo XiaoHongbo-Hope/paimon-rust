@@ -20,6 +20,7 @@ use crate::table::Table;
 use crate::Result;
 use arrow_array::{Array, Int32Array, RecordBatch};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD: &str = "total_buckets";
 
@@ -32,7 +33,7 @@ pub(crate) fn data_invalid(message: impl Into<String>) -> crate::Error {
 
 #[derive(Debug, Clone, Default)]
 pub struct PostponeBucketPlan {
-    bucket_counts: HashMap<Vec<u8>, i32>,
+    bucket_counts: Arc<HashMap<Vec<u8>, i32>>,
 }
 
 impl PostponeBucketPlan {
@@ -110,7 +111,9 @@ impl PostponeBucketPlan {
                 }
             }
         }
-        Ok(Self { bucket_counts })
+        Ok(Self {
+            bucket_counts: Arc::new(bucket_counts),
+        })
     }
 
     pub(crate) fn total_buckets(&self, partition: &[u8]) -> Option<i32> {

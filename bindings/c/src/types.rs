@@ -215,6 +215,18 @@ pub(crate) enum WriteBuilderKind {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteKind {
+    Standard,
+    PostponeFixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteContext {
+    pub kind: WriteKind,
+    pub overwrite: bool,
+}
+
 pub(crate) struct WriteBuilderState {
     pub table: Table,
     pub commit_user: String,
@@ -229,6 +241,7 @@ pub(crate) enum TableWriteKind {
 
 pub(crate) struct TableWriteState {
     pub write: TableWriteKind,
+    pub context: WriteContext,
     pub target_schema: Arc<ArrowSchema>,
     pub table_location: String,
     pub commit_user: String,
@@ -241,12 +254,14 @@ pub(crate) enum TableCommitKind {
 
 pub(crate) struct TableCommitState {
     pub commit: TableCommitKind,
+    pub context: WriteContext,
     pub table_location: String,
     pub commit_user: String,
 }
 
 pub(crate) struct CommitMessagesState {
     pub messages: Vec<CommitMessage>,
+    pub context: WriteContext,
     pub table_location: String,
     pub commit_user: String,
 }

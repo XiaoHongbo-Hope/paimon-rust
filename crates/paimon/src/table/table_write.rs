@@ -406,23 +406,22 @@ impl TableWrite {
     /// Scan the latest snapshot for a specific partition and return a map of
     /// bucket → (max_sequence_number + 1) for each bucket in that partition.
     async fn scan_partition_sequence_numbers(
-        &self,
+        table: &Table,
+        sequence_snapshot: Option<Option<Snapshot>>,
         partition_bytes: &[u8],
     ) -> crate::Result<HashMap<i32, i64>> {
-        let latest_snapshot = match &self.sequence_snapshot {
-            Some(snapshot) => snapshot.clone(),
+        let latest_snapshot = match sequence_snapshot {
+            Some(snapshot) => snapshot,
             None => {
-                let snapshot_manager = SnapshotManager::new(
-                    self.table.file_io().clone(),
-                    self.table.location().to_string(),
-                );
+                let snapshot_manager =
+                    SnapshotManager::new(table.file_io().clone(), table.location().to_string());
                 snapshot_manager.get_latest_snapshot().await?
             }
         };
         let mut bucket_seq: HashMap<i32, i64> = HashMap::new();
         if let Some(snapshot) = latest_snapshot {
-            let partition_filter = Self::build_partition_filter(&self.table, partition_bytes)?;
-            let scan = TableScan::new(&self.table, partition_filter, vec![], None, None, None)
+            let partition_filter = Self::build_partition_filter(table, partition_bytes)?;
+            let scan = TableScan::new(table, partition_filter, vec![], None, None, None)
                 .with_scan_all_files();
             let entries = scan.plan_manifest_entries(&snapshot).await?;
             for entry in &entries {
@@ -966,9 +965,11 @@ impl TableWrite {
         // Lazily scan partition sequence numbers on first writer creation per partition.
         // Overwrite mode skips this — old data will be replaced, so seq starts at 0.
         if !self.is_overwrite && !self.partition_seq_cache.contains_key(partition_bytes) {
-            let bucket_seq = self
-                .scan_partition_sequence_numbers(partition_bytes)
-                .await?;
+            let table = self.table.clone();
+            let sequence_snapshot = self.sequence_snapshot.clone();
+            let bucket_seq =
+                Self::scan_partition_sequence_numbers(&table, sequence_snapshot, partition_bytes)
+                    .await?;
             self.partition_seq_cache
                 .insert(partition_bytes.to_vec(), bucket_seq);
         }

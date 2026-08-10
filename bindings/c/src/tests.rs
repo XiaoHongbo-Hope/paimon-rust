@@ -1317,6 +1317,101 @@ fn test_commit_rejects_messages_from_different_builder_identity() {
 }
 
 #[test]
+fn test_commit_rejects_mismatched_write_kind_and_overwrite_mode() {
+    let path = "memory:/test_commit_write_context";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("write-context-job").unwrap();
+
+    unsafe {
+        let standard_wb =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+                .write_builder;
+        let standard_tw = paimon_write_builder_new_write(standard_wb).write;
+        let (array, schema) = export_batch_to_ffi(make_partitioned_write_batch(
+            vec!["p"],
+            vec![1],
+            vec!["standard"],
+        ));
+        assert!(paimon_table_write_write_arrow_batch(
+            standard_tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let standard_messages = paimon_table_write_prepare_commit(standard_tw).messages;
+
+        let fixed_wb = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        assert!(paimon_write_builder_with_overwrite(fixed_wb).is_null());
+        let (array, schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+        assert!(paimon_write_builder_with_postpone_bucket_plan(
+            fixed_wb,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let fixed_tw = paimon_write_builder_new_write(fixed_wb).write;
+        let (array, schema) = export_batch_to_ffi(make_partitioned_write_batch(
+            vec!["p"],
+            vec![1],
+            vec!["fixed"],
+        ));
+        assert!(paimon_table_write_write_arrow_batch(
+            fixed_tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let fixed_messages = paimon_table_write_prepare_commit(fixed_tw).messages;
+
+        let error = paimon_commit_messages_merge(standard_messages, fixed_messages);
+        assert!(!error.is_null());
+        assert!(error_message(error).contains("write kind and overwrite mode"));
+        paimon_error_free(error);
+
+        let fixed_commit = paimon_write_builder_new_commit(fixed_wb).commit;
+        let error = paimon_table_commit_commit(fixed_commit, standard_messages);
+        assert!(!error.is_null());
+        assert!(error_message(error).contains("different write kind or overwrite mode"));
+        paimon_error_free(error);
+
+        let standard_commit = paimon_write_builder_new_commit(standard_wb).commit;
+        let error = paimon_table_commit_overwrite(standard_commit, standard_messages);
+        assert!(!error.is_null());
+        assert!(error_message(error).contains("append messages cannot be committed"));
+        paimon_error_free(error);
+
+        assert!(crate::runtime()
+            .block_on(SnapshotManager::new(file_io, path.to_string()).get_latest_snapshot())
+            .unwrap()
+            .is_none());
+
+        paimon_table_commit_free(standard_commit);
+        paimon_table_commit_free(fixed_commit);
+        paimon_commit_messages_free(fixed_messages);
+        paimon_commit_messages_free(standard_messages);
+        paimon_table_write_free(fixed_tw);
+        paimon_write_builder_free(fixed_wb);
+        paimon_table_write_free(standard_tw);
+        paimon_write_builder_free(standard_wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_commit_messages_live_until_explicit_free() {
     const CHILD_ENV: &str = "PAIMON_C_MESSAGES_LIFETIME_CHILD";
     if std::env::var_os(CHILD_ENV).is_some() {

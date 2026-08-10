@@ -521,6 +521,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_postpone_concurrent_overwrites_reject_overlapping_bucket_ownership() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_concurrent_overwrite_ownership";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let plan = make_unpartitioned_bucket_plan(&table, 1);
+
+        let first_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("overwrite-writer-1")
+            .unwrap()
+            .with_bucket_plan(plan.clone())
+            .with_overwrite();
+        let second_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("overwrite-writer-2")
+            .unwrap()
+            .with_bucket_plan(plan)
+            .with_overwrite();
+        let mut first_write = first_builder.new_write().unwrap();
+        let mut second_write = second_builder.new_write().unwrap();
+        first_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        second_write
+            .write_arrow_batch(&make_batch(vec![1], vec![20]))
+            .await
+            .unwrap();
+        let first_messages = first_write.prepare_commit().await.unwrap();
+        let second_messages = second_write.prepare_commit().await.unwrap();
+
+        first_builder
+            .new_commit()
+            .commit(first_messages)
+            .await
+            .unwrap();
+        let error = second_builder
+            .new_commit()
+            .commit(second_messages)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("writer ownership conflict for bucket 0"));
+    }
+
+    #[tokio::test]
     async fn test_postpone_concurrent_commits_allow_disjoint_ownership() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_disjoint_writer_ownership";
@@ -543,6 +593,85 @@ mod tests {
             .commit(second_messages)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_postpone_rejects_negative_bucket_after_fixed_layout() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_rejects_negative_bucket_after_fixed";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+
+        let fixed_messages =
+            write_fixed_batch(&table, "fixed-writer", 1, &make_batch(vec![1], vec![10])).await;
+        TableCommit::new(table.clone(), "fixed-writer".to_string())
+            .commit(fixed_messages)
+            .await
+            .unwrap();
+
+        let normal_builder = table
+            .new_write_builder()
+            .with_commit_user("normal-writer")
+            .unwrap();
+        let mut normal_write = normal_builder.new_write().unwrap();
+        normal_write
+            .write_arrow_batch(&make_batch(vec![1], vec![20]))
+            .await
+            .unwrap();
+        let messages = normal_write.prepare_commit().await.unwrap();
+        assert!(messages.iter().all(|message| message.bucket == -2));
+        let error = normal_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already uses fixed buckets"));
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 10)]);
+    }
+
+    #[tokio::test]
+    async fn test_postpone_fixed_commit_rejects_concurrent_negative_bucket() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_fixed_rejects_concurrent_negative_bucket";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+
+        let fixed_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("fixed-writer")
+            .unwrap()
+            .with_bucket_plan(make_unpartitioned_bucket_plan(&table, 1));
+        let mut fixed_write = fixed_builder.new_write().unwrap();
+        fixed_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let fixed_messages = fixed_write.prepare_commit().await.unwrap();
+
+        let normal_builder = table
+            .new_write_builder()
+            .with_commit_user("normal-writer")
+            .unwrap();
+        let mut normal_write = normal_builder.new_write().unwrap();
+        normal_write
+            .write_arrow_batch(&make_batch(vec![1], vec![20]))
+            .await
+            .unwrap();
+        normal_builder
+            .new_commit()
+            .commit(normal_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let error = fixed_builder
+            .new_commit()
+            .commit(fixed_messages)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("another commit wrote bucket=-2 files"));
     }
 
     #[tokio::test]

@@ -210,6 +210,8 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
 }
 
 /// Set a shared `partition -> total_buckets` plan.
+/// Ownership of `array` and `schema` is transferred to this call; the caller
+/// must not release the Arrow C Data structs afterward.
 ///
 /// # Safety
 /// `wb` must be an explicit postpone fixed-bucket builder. `array` and
@@ -365,6 +367,7 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
     };
     let table_write = TableWriteState {
         write,
+        context: write_context(state),
         target_schema,
         table_location: state.table.location().to_string(),
         commit_user: state.commit_user.clone(),
@@ -407,6 +410,17 @@ fn create_table_write(state: &WriteBuilderState) -> paimon::Result<TableWriteKin
                 .map(Box::new)
                 .map(TableWriteKind::PostponeFixed)
         }
+    }
+}
+
+fn write_context(state: &WriteBuilderState) -> WriteContext {
+    let kind = match &state.kind {
+        WriteBuilderKind::Standard => WriteKind::Standard,
+        WriteBuilderKind::PostponeFixed { .. } => WriteKind::PostponeFixed,
+    };
+    WriteContext {
+        kind,
+        overwrite: state.overwrite,
     }
 }
 
@@ -506,6 +520,7 @@ pub unsafe extern "C" fn paimon_table_write_prepare_commit(
         Ok(messages) => {
             let messages = CommitMessagesState {
                 messages,
+                context: table_write.context,
                 table_location: table_write.table_location.clone(),
                 commit_user: table_write.commit_user.clone(),
             };
@@ -576,6 +591,7 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
 
     let table_commit = TableCommitState {
         commit,
+        context: write_context(state),
         table_location: state.table.location().to_string(),
         commit_user: state.commit_user.clone(),
     };
@@ -645,6 +661,12 @@ pub unsafe extern "C" fn paimon_commit_messages_merge(
             "commit messages can only be merged when table and commit_user both match",
         );
     }
+    if target.context != source.context {
+        return invalid_input(format!(
+            "commit messages can only be merged when write kind and overwrite mode both match (target {:?}, source {:?})",
+            target.context, source.context
+        ));
+    }
     target.messages.extend(source.messages.clone());
     ptr::null_mut()
 }
@@ -666,6 +688,12 @@ fn validate_commit_context(
             "commit messages were prepared with a different commit_user",
         ));
     }
+    if commit.context != messages.context {
+        return Err(invalid_input(format!(
+            "commit messages were prepared with a different write kind or overwrite mode (message {:?}, committer {:?})",
+            messages.context, commit.context
+        )));
+    }
     Ok(())
 }
 
@@ -686,6 +714,11 @@ unsafe fn commit_with_identifier_impl(
     let messages = &*((*msgs).inner as *const CommitMessagesState);
     if let Err(error) = validate_commit_context(table_commit, messages) {
         return error;
+    }
+    if messages.context.kind == WriteKind::Standard && messages.context.overwrite {
+        return invalid_input(
+            "standard overwrite messages must be committed with paimon_table_commit_overwrite",
+        );
     }
 
     let messages = messages.messages.clone();
@@ -802,6 +835,11 @@ unsafe fn paimon_table_commit_overwrite_impl(
     let messages = &*((*msgs).inner as *const CommitMessagesState);
     if let Err(error) = validate_commit_context(table_commit, messages) {
         return error;
+    }
+    if !messages.context.overwrite {
+        return invalid_input(
+            "append messages cannot be committed with paimon_table_commit_overwrite",
+        );
     }
 
     let messages = messages.messages.clone();
