@@ -161,7 +161,6 @@ impl TableCommit {
             return Ok(());
         }
 
-        Self::validate_postpone_fixed_bucket_ownership(&commit_messages)?;
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
@@ -205,7 +204,6 @@ impl TableCommit {
             return Ok(());
         }
 
-        Self::validate_postpone_fixed_bucket_ownership(&commit_messages)?;
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
@@ -277,7 +275,6 @@ impl TableCommit {
             return Ok(());
         }
 
-        Self::validate_postpone_fixed_bucket_ownership(&commit_messages)?;
         let new_entries = self.messages_to_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let has_new_data_entries = new_entries
@@ -1893,31 +1890,12 @@ impl TableCommit {
                 if previous != entry.total_buckets() {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
-                            "Postpone fixed-bucket conflict: one partition uses different total bucket counts {previous} and {}",
+                            "Fixed-bucket conflict: one partition uses different total bucket counts {previous} and {}",
                             entry.total_buckets()
                         ),
                         source: None,
                     });
                 }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_postpone_fixed_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
-        let mut owners = HashSet::new();
-        for message in messages {
-            if message.total_buckets.is_none() || message.new_files.is_empty() {
-                continue;
-            }
-            if !owners.insert((message.partition.clone(), message.bucket)) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Postpone fixed-bucket writer ownership conflict for bucket {}: route all rows for one partition and bucket to a single writer",
-                        message.bucket
-                    ),
-                    source: None,
-                });
             }
         }
         Ok(())

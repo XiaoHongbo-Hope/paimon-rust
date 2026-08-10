@@ -3852,7 +3852,7 @@ mod tests {
             .commit(stale_messages)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Postpone fixed-bucket conflict"));
+        assert!(error.to_string().contains("Fixed-bucket conflict"));
         assert_eq!(
             read_id_value_rows(&table).await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40)]

@@ -23,6 +23,7 @@ use crate::spec::CoreOptions;
 use crate::table::{CommitMessage, PostponeBucketPlan, Table, TableCommit, TableWrite};
 use crate::Result;
 use arrow_array::RecordBatch;
+use std::collections::HashSet;
 
 pub struct PostponeFixedBucketTableWrite {
     inner: TableWrite,
@@ -102,6 +103,7 @@ impl PostponeFixedBucketTableCommit {
     }
 
     pub async fn commit(&self, messages: Vec<CommitMessage>) -> Result<()> {
+        validate_bucket_ownership(&messages)?;
         if self.overwrite {
             self.inner.overwrite(messages, None).await
         } else {
@@ -114,6 +116,7 @@ impl PostponeFixedBucketTableCommit {
         messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_bucket_ownership(&messages)?;
         if self.overwrite {
             self.inner
                 .overwrite_with_identifier(messages, None, commit_identifier)
@@ -130,6 +133,7 @@ impl PostponeFixedBucketTableCommit {
         messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_bucket_ownership(&messages)?;
         if self.overwrite {
             self.inner
                 .overwrite_with_identifier(messages, None, commit_identifier)
@@ -142,6 +146,7 @@ impl PostponeFixedBucketTableCommit {
     }
 
     pub async fn overwrite(&self, messages: Vec<CommitMessage>) -> Result<()> {
+        validate_bucket_ownership(&messages)?;
         self.inner.overwrite(messages, None).await
     }
 
@@ -150,6 +155,7 @@ impl PostponeFixedBucketTableCommit {
         messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_bucket_ownership(&messages)?;
         self.inner
             .overwrite_with_identifier(messages, None, commit_identifier)
             .await
@@ -168,6 +174,22 @@ impl PostponeFixedBucketTableCommit {
     pub async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {
         self.inner.abort(messages).await
     }
+}
+
+fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
+    let mut owners = HashSet::new();
+    for message in messages {
+        if message.total_buckets.is_none() || message.new_files.is_empty() {
+            continue;
+        }
+        if !owners.insert((message.partition.clone(), message.bucket)) {
+            return Err(data_invalid(format!(
+                "Postpone fixed-bucket writer ownership conflict for bucket {}: route all rows for one partition and bucket to a single writer",
+                message.bucket
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_postpone_fixed_bucket_write(table: &Table) -> Result<()> {
