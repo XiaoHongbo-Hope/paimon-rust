@@ -3950,7 +3950,7 @@ mod tests {
         let table_path = "memory:/test_postpone_shared_bucket_plan";
         setup_dirs(&file_io, table_path).await;
         let table = test_postpone_partitioned_table(&file_io, table_path);
-        let plan = make_partition_bucket_plan(&table, vec!["p"], vec![3]);
+        let plan = make_partition_bucket_plan(&table, vec!["p1", "p2"], vec![3, 3]);
 
         let builder = table
             .new_postpone_fixed_bucket_write_builder()
@@ -3961,12 +3961,12 @@ mod tests {
         let mut first = builder.new_write().unwrap();
         let mut second = builder.new_write().unwrap();
         first
-            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p1"], vec![1], vec![10]))
             .await
             .unwrap();
         second
             .write_arrow_batch(&make_partitioned_batch_3col(
-                vec!["p", "p", "p", "p"],
+                vec!["p2", "p2", "p2", "p2"],
                 vec![2, 3, 4, 5],
                 vec![20, 30, 40, 50],
             ))
@@ -3977,6 +3977,38 @@ mod tests {
         messages.extend(second.prepare_commit().await.unwrap());
         assert_total_buckets(&messages, 3);
         builder.new_commit().commit(messages).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_postpone_distributed_writers_reject_overlapping_bucket_ownership() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_overlapping_writer_ownership";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("overlapping-writers")
+            .unwrap()
+            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]));
+
+        let mut first = builder.new_write().unwrap();
+        let mut second = builder.new_write().unwrap();
+        first
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
+            .await
+            .unwrap();
+        second
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![20]))
+            .await
+            .unwrap();
+
+        let mut messages = first.prepare_commit().await.unwrap();
+        messages.extend(second.prepare_commit().await.unwrap());
+        let error = builder.new_commit().commit(messages).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("writer ownership conflict for bucket 0"));
     }
 
     #[tokio::test]

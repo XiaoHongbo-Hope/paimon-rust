@@ -1529,8 +1529,10 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         .write_builder;
 
         for wb in [wb1, wb2] {
-            let (array, schema) =
-                export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![3]));
+            let (array, schema) = export_batch_to_ffi(make_postpone_bucket_plan_batch(
+                vec!["p1", "p2"],
+                vec![3, 3],
+            ));
             let error = paimon_write_builder_with_postpone_bucket_plan(
                 wb,
                 (&**array) as *const FFI_ArrowArray as *mut c_void,
@@ -1541,15 +1543,17 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
 
         let tw1 = paimon_write_builder_new_write(wb1).write;
         let tw2 = paimon_write_builder_new_write(wb2).write;
-        for (tw, ids, names) in [
-            (tw1, vec![1], vec!["a"]),
-            (tw2, vec![2, 3, 4, 5], vec!["b", "c", "d", "e"]),
+        for (tw, partitions, ids, names) in [
+            (tw1, vec!["p1"], vec![1], vec!["a"]),
+            (
+                tw2,
+                vec!["p2", "p2", "p2", "p2"],
+                vec![2, 3, 4, 5],
+                vec!["b", "c", "d", "e"],
+            ),
         ] {
-            let (array, schema) = export_batch_to_ffi(make_partitioned_write_batch(
-                vec!["p"; ids.len()],
-                ids,
-                names,
-            ));
+            let (array, schema) =
+                export_batch_to_ffi(make_partitioned_write_batch(partitions, ids, names));
             let error = paimon_table_write_write_arrow_batch(
                 tw,
                 (&**array) as *const FFI_ArrowArray as *mut c_void,
@@ -1575,6 +1579,73 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         assert!(error.is_null());
 
         paimon_table_commit_free(commit);
+        paimon_commit_messages_free(messages2);
+        paimon_commit_messages_free(messages1);
+        paimon_table_write_free(tw2);
+        paimon_table_write_free(tw1);
+        paimon_write_builder_free(wb2);
+        paimon_write_builder_free(wb1);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_distributed_postpone_writers_reject_overlapping_bucket_ownership() {
+    let path = "memory:/test_distributed_postpone_overlapping_ownership";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("overlapping-postpone-job").unwrap();
+
+    unsafe {
+        let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        let wb2 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        for wb in [wb1, wb2] {
+            let (array, schema) =
+                export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+            assert!(paimon_write_builder_with_postpone_bucket_plan(
+                wb,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            )
+            .is_null());
+        }
+
+        let tw1 = paimon_write_builder_new_write(wb1).write;
+        let tw2 = paimon_write_builder_new_write(wb2).write;
+        for (tw, name) in [(tw1, "first"), (tw2, "second")] {
+            let (array, schema) =
+                export_batch_to_ffi(make_partitioned_write_batch(vec!["p"], vec![1], vec![name]));
+            assert!(paimon_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            )
+            .is_null());
+        }
+
+        let messages1 = paimon_table_write_prepare_commit(tw1).messages;
+        let messages2 = paimon_table_write_prepare_commit(tw2).messages;
+        let error = paimon_commit_messages_merge(messages1, messages2);
+        assert!(!error.is_null());
+        assert!(error_message(error).contains("writer ownership conflict for bucket 0"));
+        paimon_error_free(error);
+
         paimon_commit_messages_free(messages2);
         paimon_commit_messages_free(messages1);
         paimon_table_write_free(tw2);

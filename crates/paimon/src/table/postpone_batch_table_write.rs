@@ -41,7 +41,10 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
-/// A shared bucket plan for distributed writers.
+/// A shared bucket-count plan for distributed writers.
+///
+/// Distributed callers must route each `(partition, bucket)` to exactly one
+/// writer. Commits reject overlapping writer ownership.
 #[derive(Debug, Clone)]
 pub struct PostponeBucketPlan {
     bucket_counts: HashMap<Vec<u8>, i32>,
@@ -169,7 +172,10 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         self
     }
 
-    /// Set the shared bucket plan.
+    /// Set the shared bucket-count plan.
+    ///
+    /// Distributed callers must route each `(partition, bucket)` to exactly one
+    /// writer. Commits reject overlapping writer ownership.
     pub fn with_bucket_plan(mut self, bucket_plan: PostponeBucketPlan) -> Self {
         self.bucket_plan = Some(bucket_plan);
         self

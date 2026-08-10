@@ -197,10 +197,12 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
     ptr::null_mut()
 }
 
-/// Set a shared bucket plan for distributed fixed-bucket writers.
+/// Set a shared bucket-count plan for distributed fixed-bucket writers.
 ///
 /// The Arrow batch contains partition columns followed by a non-null Int32
 /// `total_buckets`. Ownership of the Arrow C Data structs is transferred.
+/// Each `(partition, bucket)` must be routed to exactly one writer; merging
+/// overlapping writer messages is rejected.
 ///
 /// # Safety
 /// `wb` must be an explicit postpone fixed-bucket builder. `array` and
@@ -586,7 +588,8 @@ pub unsafe extern "C" fn paimon_commit_messages_free(msgs: *mut paimon_commit_me
 /// Merge `source` messages into `target` for one logical commit.
 ///
 /// Both handles retain ownership and must be freed separately. They must have
-/// been prepared for the same table and `commit_user`.
+/// been prepared for the same table and `commit_user`. Fixed-bucket messages
+/// must not contain the same `(partition, bucket)` from multiple writers.
 ///
 /// # Safety
 /// `target` and `source` must be distinct valid commit-message handles.
@@ -611,6 +614,21 @@ pub unsafe extern "C" fn paimon_commit_messages_merge(
         return invalid_input(
             "commit messages can only be merged when table and commit_user both match",
         );
+    }
+    if let Some(message) = target.messages.iter().find(|target_message| {
+        target_message.total_buckets.is_some()
+            && !target_message.new_files.is_empty()
+            && source.messages.iter().any(|source_message| {
+                source_message.total_buckets.is_some()
+                    && !source_message.new_files.is_empty()
+                    && source_message.partition == target_message.partition
+                    && source_message.bucket == target_message.bucket
+            })
+    }) {
+        return invalid_input(format!(
+            "postpone fixed-bucket writer ownership conflict for bucket {}: route all rows for one partition and bucket to a single writer",
+            message.bucket
+        ));
     }
     target.messages.extend(source.messages.clone());
     ptr::null_mut()
