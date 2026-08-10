@@ -47,6 +47,7 @@ env:
 
 jobs:
   sdist:
+    if: inputs.tag != 'bundle'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -85,6 +86,7 @@ jobs:
           path: bindings/python/dist/*.tar.gz
 
   wheels:
+    if: inputs.tag != 'bundle'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -216,6 +218,69 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.rust_target }}
           path: bindings/python/dist/*.whl
+
+  bundle:
+    if: inputs.tag == 'bundle'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: apache/paimon
+          ref: 30bfd4a600a930079b15f5e6bacea34b8d3ff4c8
+          path: paimon
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download pypaimon-rust wheels
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 31352752522
+          pattern: wheels-*
+          merge-multiple: true
+          path: rust-artifacts
+
+      - name: Build PyPaimon distributions
+        run: |
+          python -m pip install build
+          python -m build --wheel --sdist paimon/paimon-python \
+            --outdir pypaimon-dist
+
+      - name: Assemble and verify bundle
+        run: |
+          python .github/native-plan-bundle/assemble.py \
+            --rust-artifacts rust-artifacts \
+            --pypaimon-dist pypaimon-dist \
+            --templates .github/native-plan-bundle \
+            --output bundle
+          (cd bundle && sha512sum -c *.zip.sha512)
+          unzip -q bundle/pypaimon-native-plan-2.1.dev20260809-rust20260810.zip \
+            -d verify-bundle
+          python -m venv verify-venv
+          verify-venv/bin/python \
+            verify-bundle/pypaimon-native-plan-2.1.dev20260809-rust20260810/install.py
+          verify-venv/bin/python - <<'PY'
+          import importlib.metadata
+          from pypaimon_rust.datafusion import ReadBuilder
+
+          assert importlib.metadata.version("pypaimon") == "2.1.dev20260809"
+          assert importlib.metadata.version("pypaimon-rust") == "0.4.0"
+          assert hasattr(ReadBuilder, "with_row_ranges")
+          PY
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: pypaimon-native-plan-2.1.dev20260809-rust20260810
+          path: |
+            bundle/pypaimon-native-plan-2.1.dev20260809-rust20260810.zip
+            bundle/pypaimon-native-plan-2.1.dev20260809-rust20260810.zip.sha512
+          if-no-files-found: error
 
   release:
     name: Publish to PyPI
