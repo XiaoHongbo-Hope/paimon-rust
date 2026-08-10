@@ -125,7 +125,6 @@ pub use incremental_scan::{
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use partition_stat::PartitionStat;
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
-pub use postpone_fixed_bucket_router::{PostponeBucketBatch, PostponeFixedBucketRouter};
 pub use postpone_fixed_bucket_write::{
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite,
 };

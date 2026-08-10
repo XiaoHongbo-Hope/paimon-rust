@@ -16,11 +16,11 @@
 // under the License.
 
 use super::postpone_bucket_plan::data_invalid;
-use super::postpone_fixed_bucket_router::validate_postpone_fixed_bucket_table;
-use crate::spec::CoreOptions;
-use crate::table::{
-    CommitMessage, PostponeBucketPlan, PostponeFixedBucketRouter, Table, TableCommit, TableWrite,
+use super::postpone_fixed_bucket_router::{
+    validate_postpone_fixed_bucket_table, PostponeFixedBucketRouter,
 };
+use crate::spec::CoreOptions;
+use crate::table::{CommitMessage, PostponeBucketPlan, Table, TableCommit, TableWrite};
 use crate::Result;
 use arrow_array::RecordBatch;
 

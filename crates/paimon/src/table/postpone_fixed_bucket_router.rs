@@ -28,13 +28,13 @@ use arrow_array::RecordBatch;
 use std::collections::HashMap;
 
 #[derive(Debug)]
-pub struct PostponeBucketBatch {
-    pub partition: Vec<u8>,
-    pub bucket: i32,
-    pub batch: RecordBatch,
+pub(crate) struct PostponeBucketBatch {
+    pub(crate) partition: Vec<u8>,
+    pub(crate) bucket: i32,
+    pub(crate) batch: RecordBatch,
 }
 
-pub struct PostponeFixedBucketRouter {
+pub(crate) struct PostponeFixedBucketRouter {
     fields: Vec<DataField>,
     partition_field_indices: Vec<usize>,
     bucket_key_indices: Vec<usize>,
@@ -43,7 +43,7 @@ pub struct PostponeFixedBucketRouter {
 }
 
 impl PostponeFixedBucketRouter {
-    pub fn new(table: &Table, plan: PostponeBucketPlan) -> Result<Self> {
+    pub(crate) fn new(table: &Table, plan: PostponeBucketPlan) -> Result<Self> {
         validate_postpone_fixed_bucket_table(table)?;
         let schema = table.schema();
         let options = CoreOptions::new(schema.options());
@@ -65,7 +65,7 @@ impl PostponeFixedBucketRouter {
         })
     }
 
-    pub fn route(&self, batch: &RecordBatch) -> Result<Vec<PostponeBucketBatch>> {
+    pub(crate) fn route(&self, batch: &RecordBatch) -> Result<Vec<PostponeBucketBatch>> {
         let mut output = Vec::new();
         for (partition, batch) in
             partition_batches(batch, &self.partition_field_indices, &self.fields)?
