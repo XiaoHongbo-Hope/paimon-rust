@@ -21,8 +21,8 @@ use std::sync::Arc;
 use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
 use paimon::table::{
-    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
-    TableWrite,
+    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableCommit,
+    PostponeFixedBucketTableWrite, Table, TableCommit, TableWrite,
 };
 
 /// C-compatible key-value pair for options.
@@ -208,12 +208,18 @@ pub struct paimon_arrow_batch {
 
 // === Write/Commit opaque types ===
 
+pub(crate) enum WriteBuilderKind {
+    Standard,
+    PostponeFixed {
+        bucket_plan: Option<PostponeBucketPlan>,
+    },
+}
+
 pub(crate) struct WriteBuilderState {
     pub table: Table,
     pub commit_user: String,
     pub overwrite: bool,
-    pub postpone_fixed_bucket: bool,
-    pub postpone_bucket_plan: Option<PostponeBucketPlan>,
+    pub kind: WriteBuilderKind,
 }
 
 pub(crate) enum TableWriteKind {
@@ -228,9 +234,13 @@ pub(crate) struct TableWriteState {
     pub commit_user: String,
 }
 
+pub(crate) enum TableCommitKind {
+    Standard(TableCommit),
+    PostponeFixed(PostponeFixedBucketTableCommit),
+}
+
 pub(crate) struct TableCommitState {
-    pub commit: TableCommit,
-    pub overwrite: bool,
+    pub commit: TableCommitKind,
     pub table_location: String,
     pub commit_user: String,
 }

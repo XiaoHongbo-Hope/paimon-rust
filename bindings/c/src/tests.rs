@@ -1505,16 +1505,18 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
     unsafe {
         let normal = paimon_table_new_write_builder(handle);
         assert!(normal.error.is_null());
-        assert!(
-            !(&*((*normal.write_builder).inner as *const WriteBuilderState)).postpone_fixed_bucket
-        );
+        assert!(matches!(
+            (&*((*normal.write_builder).inner as *const WriteBuilderState)).kind,
+            WriteBuilderKind::Standard
+        ));
         paimon_write_builder_free(normal.write_builder);
 
         let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle);
         assert!(fixed.error.is_null());
-        assert!(
-            (&*((*fixed.write_builder).inner as *const WriteBuilderState)).postpone_fixed_bucket
-        );
+        assert!(matches!(
+            (&*((*fixed.write_builder).inner as *const WriteBuilderState)).kind,
+            WriteBuilderKind::PostponeFixed { .. }
+        ));
         let write = paimon_write_builder_new_write(fixed.write_builder);
         assert!(write.write.is_null());
         assert!(error_message(write.error).contains("bucket plan is required"));
@@ -1580,6 +1582,10 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         let error = paimon_commit_messages_merge(messages1, messages2);
         assert!(error.is_null());
         let commit = paimon_write_builder_new_commit(wb1).commit;
+        assert!(matches!(
+            (&*((*commit).inner as *const TableCommitState)).commit,
+            TableCommitKind::PostponeFixed(_)
+        ));
         let error = paimon_table_commit_commit(commit, messages1);
         assert!(error.is_null());
         let snapshot = crate::runtime()

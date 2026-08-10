@@ -125,8 +125,44 @@ impl PostponeFixedBucketTableCommit {
         }
     }
 
-    pub fn into_inner(self) -> TableCommit {
+    pub async fn filter_and_commit_with_identifier(
+        &self,
+        messages: Vec<CommitMessage>,
+        commit_identifier: i64,
+    ) -> Result<()> {
+        if self.overwrite {
+            self.inner
+                .overwrite_with_identifier(messages, None, commit_identifier)
+                .await
+        } else {
+            self.inner
+                .filter_and_commit_with_identifier(messages, commit_identifier)
+                .await
+        }
+    }
+
+    pub async fn overwrite(&self, messages: Vec<CommitMessage>) -> Result<()> {
+        self.inner.overwrite(messages, None).await
+    }
+
+    pub async fn overwrite_with_identifier(
+        &self,
+        messages: Vec<CommitMessage>,
+        commit_identifier: i64,
+    ) -> Result<()> {
         self.inner
+            .overwrite_with_identifier(messages, None, commit_identifier)
+            .await
+    }
+
+    pub async fn truncate_table(&self) -> Result<()> {
+        self.inner.truncate_table().await
+    }
+
+    pub async fn truncate_table_with_identifier(&self, commit_identifier: i64) -> Result<()> {
+        self.inner
+            .truncate_table_with_identifier(commit_identifier)
+            .await
     }
 
     pub async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {

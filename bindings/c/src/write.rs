@@ -37,7 +37,7 @@ use crate::types::*;
 unsafe fn new_write_builder(
     table: *const paimon_table,
     commit_user: Option<String>,
-    postpone_fixed_bucket: bool,
+    kind: WriteBuilderKind,
 ) -> paimon_result_write_builder {
     if let Err(e) = check_non_null(table, "table") {
         return paimon_result_write_builder {
@@ -46,7 +46,7 @@ unsafe fn new_write_builder(
         };
     }
     let table_ref = &*((*table).inner as *const Table);
-    let state = match create_write_builder_state(table_ref, commit_user, postpone_fixed_bucket) {
+    let state = match create_write_builder_state(table_ref, commit_user, kind) {
         Ok(state) => state,
         Err(error) => {
             return paimon_result_write_builder {
@@ -65,43 +65,45 @@ unsafe fn new_write_builder(
 fn create_write_builder_state(
     table: &Table,
     commit_user: Option<String>,
-    postpone_fixed_bucket: bool,
+    kind: WriteBuilderKind,
 ) -> paimon::Result<WriteBuilderState> {
-    let commit_user = if postpone_fixed_bucket {
-        let builder = table.new_postpone_fixed_bucket_write_builder()?;
-        match commit_user {
-            Some(commit_user) => builder
-                .with_commit_user(commit_user)?
-                .commit_user()
-                .to_string(),
-            None => builder.commit_user().to_string(),
+    let commit_user = match &kind {
+        WriteBuilderKind::Standard => {
+            let builder = table.new_write_builder();
+            match commit_user {
+                Some(commit_user) => builder
+                    .with_commit_user(commit_user)?
+                    .commit_user()
+                    .to_string(),
+                None => builder.commit_user().to_string(),
+            }
         }
-    } else {
-        let builder = table.new_write_builder();
-        match commit_user {
-            Some(commit_user) => builder
-                .with_commit_user(commit_user)?
-                .commit_user()
-                .to_string(),
-            None => builder.commit_user().to_string(),
+        WriteBuilderKind::PostponeFixed { .. } => {
+            let builder = table.new_postpone_fixed_bucket_write_builder()?;
+            match commit_user {
+                Some(commit_user) => builder
+                    .with_commit_user(commit_user)?
+                    .commit_user()
+                    .to_string(),
+                None => builder.commit_user().to_string(),
+            }
         }
     };
     Ok(WriteBuilderState {
         table: table.clone(),
         commit_user,
         overwrite: false,
-        postpone_fixed_bucket,
-        postpone_bucket_plan: None,
+        kind,
     })
 }
 
 unsafe fn new_write_builder_with_commit_user(
     table: *const paimon_table,
     commit_user: *const c_char,
-    postpone_fixed_bucket: bool,
+    kind: WriteBuilderKind,
 ) -> paimon_result_write_builder {
     match validate_cstr(commit_user, "commit_user") {
-        Ok(commit_user) => new_write_builder(table, Some(commit_user), postpone_fixed_bucket),
+        Ok(commit_user) => new_write_builder(table, Some(commit_user), kind),
         Err(error) => paimon_result_write_builder {
             write_builder: ptr::null_mut(),
             error,
@@ -121,7 +123,7 @@ unsafe fn new_write_builder_with_commit_user(
 pub unsafe extern "C" fn paimon_table_new_write_builder(
     table: *const paimon_table,
 ) -> paimon_result_write_builder {
-    new_write_builder(table, None, false)
+    new_write_builder(table, None, WriteBuilderKind::Standard)
 }
 
 /// Create a one-shot fixed-bucket WriteBuilder for a postpone table.
@@ -133,7 +135,11 @@ pub unsafe extern "C" fn paimon_table_new_write_builder(
 pub unsafe extern "C" fn paimon_table_new_postpone_fixed_bucket_write_builder(
     table: *const paimon_table,
 ) -> paimon_result_write_builder {
-    new_write_builder(table, None, true)
+    new_write_builder(
+        table,
+        None,
+        WriteBuilderKind::PostponeFixed { bucket_plan: None },
+    )
 }
 
 /// Create a WriteBuilder with a caller-provided stable commit identity.
@@ -149,7 +155,7 @@ pub unsafe extern "C" fn paimon_table_new_write_builder_with_commit_user(
     table: *const paimon_table,
     commit_user: *const c_char,
 ) -> paimon_result_write_builder {
-    new_write_builder_with_commit_user(table, commit_user, false)
+    new_write_builder_with_commit_user(table, commit_user, WriteBuilderKind::Standard)
 }
 
 /// Create a fixed-bucket WriteBuilder with a stable commit identity.
@@ -163,7 +169,11 @@ pub unsafe extern "C" fn paimon_table_new_postpone_fixed_bucket_write_builder_wi
     table: *const paimon_table,
     commit_user: *const c_char,
 ) -> paimon_result_write_builder {
-    new_write_builder_with_commit_user(table, commit_user, true)
+    new_write_builder_with_commit_user(
+        table,
+        commit_user,
+        WriteBuilderKind::PostponeFixed { bucket_plan: None },
+    )
 }
 
 /// Free a paimon_write_builder.
@@ -220,11 +230,11 @@ pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
         return error;
     }
     let state = &mut *((*wb).inner as *mut WriteBuilderState);
-    if !state.postpone_fixed_bucket {
+    let WriteBuilderKind::PostponeFixed { bucket_plan } = &mut state.kind else {
         return invalid_input(
             "a postpone bucket plan requires an explicit postpone fixed-bucket write builder",
         );
-    }
+    };
 
     let batch = match import_record_batch(array, schema) {
         Ok(batch) => batch,
@@ -232,7 +242,7 @@ pub unsafe extern "C" fn paimon_write_builder_with_postpone_bucket_plan(
     };
     match PostponeBucketPlan::from_arrow(&state.table, &batch) {
         Ok(plan) => {
-            state.postpone_bucket_plan = Some(plan);
+            *bucket_plan = Some(plan);
             ptr::null_mut()
         }
         Err(error) => paimon_error::from_paimon(error),
@@ -367,33 +377,36 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
 }
 
 fn create_table_write(state: &WriteBuilderState) -> paimon::Result<TableWriteKind> {
-    if state.postpone_fixed_bucket {
-        let mut builder = state
-            .table
-            .new_postpone_fixed_bucket_write_builder()
-            .and_then(|builder| builder.with_commit_user(state.commit_user.clone()))?;
-        if let Some(plan) = state.postpone_bucket_plan.clone() {
-            builder = builder.with_bucket_plan(plan);
+    match &state.kind {
+        WriteBuilderKind::Standard => {
+            let mut builder = state
+                .table
+                .new_write_builder()
+                .with_commit_user(state.commit_user.clone())?;
+            if state.overwrite {
+                builder = builder.with_overwrite();
+            }
+            builder
+                .new_write()
+                .map(Box::new)
+                .map(TableWriteKind::Standard)
         }
-        if state.overwrite {
-            builder = builder.with_overwrite();
+        WriteBuilderKind::PostponeFixed { bucket_plan } => {
+            let mut builder = state
+                .table
+                .new_postpone_fixed_bucket_write_builder()
+                .and_then(|builder| builder.with_commit_user(state.commit_user.clone()))?;
+            if let Some(plan) = bucket_plan.clone() {
+                builder = builder.with_bucket_plan(plan);
+            }
+            if state.overwrite {
+                builder = builder.with_overwrite();
+            }
+            builder
+                .new_write()
+                .map(Box::new)
+                .map(TableWriteKind::PostponeFixed)
         }
-        builder
-            .new_write()
-            .map(Box::new)
-            .map(TableWriteKind::PostponeFixed)
-    } else {
-        let mut builder = state
-            .table
-            .new_write_builder()
-            .with_commit_user(state.commit_user.clone())?;
-        if state.overwrite {
-            builder = builder.with_overwrite();
-        }
-        builder
-            .new_write()
-            .map(Box::new)
-            .map(TableWriteKind::Standard)
     }
 }
 
@@ -511,25 +524,24 @@ pub unsafe extern "C" fn paimon_table_write_prepare_commit(
 
 // ======================= TableCommit ===============================
 
-fn create_table_commit(
-    state: &WriteBuilderState,
-) -> paimon::Result<(paimon::table::TableCommit, bool)> {
-    if state.postpone_fixed_bucket {
-        let mut builder = state
-            .table
-            .new_postpone_fixed_bucket_write_builder()?
-            .with_commit_user(state.commit_user.clone())?;
-        if state.overwrite {
-            builder = builder.with_overwrite();
-        }
-        Ok((builder.try_new_commit()?.into_inner(), state.overwrite))
-    } else {
-        let commit = state
+fn create_table_commit(state: &WriteBuilderState) -> paimon::Result<TableCommitKind> {
+    match &state.kind {
+        WriteBuilderKind::Standard => state
             .table
             .new_write_builder()
             .with_commit_user(state.commit_user.clone())?
-            .try_new_commit()?;
-        Ok((commit, false))
+            .try_new_commit()
+            .map(TableCommitKind::Standard),
+        WriteBuilderKind::PostponeFixed { .. } => {
+            let mut builder = state
+                .table
+                .new_postpone_fixed_bucket_write_builder()?
+                .with_commit_user(state.commit_user.clone())?;
+            if state.overwrite {
+                builder = builder.with_overwrite();
+            }
+            builder.try_new_commit().map(TableCommitKind::PostponeFixed)
+        }
     }
 }
 
@@ -552,7 +564,7 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
     }
     let state = &*((*wb).inner as *const WriteBuilderState);
 
-    let (commit, overwrite) = match create_table_commit(state) {
+    let commit = match create_table_commit(state) {
         Ok(commit) => commit,
         Err(error) => {
             return paimon_result_table_commit {
@@ -564,7 +576,6 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
 
     let table_commit = TableCommitState {
         commit,
-        overwrite,
         table_location: state.table.location().to_string(),
         commit_user: state.commit_user.clone(),
     };
@@ -677,24 +688,18 @@ unsafe fn commit_with_identifier_impl(
         return error;
     }
 
-    let result = if table_commit.overwrite {
-        runtime().block_on(table_commit.commit.overwrite_with_identifier(
-            messages.messages.clone(),
-            None,
-            commit_identifier,
-        ))
-    } else if filter_committed {
-        runtime().block_on(
-            table_commit
-                .commit
-                .filter_and_commit_with_identifier(messages.messages.clone(), commit_identifier),
-        )
-    } else {
-        runtime().block_on(
-            table_commit
-                .commit
-                .commit_with_identifier(messages.messages.clone(), commit_identifier),
-        )
+    let messages = messages.messages.clone();
+    let result = match (&table_commit.commit, filter_committed) {
+        (TableCommitKind::Standard(commit), true) => runtime()
+            .block_on(commit.filter_and_commit_with_identifier(messages, commit_identifier)),
+        (TableCommitKind::Standard(commit), false) => {
+            runtime().block_on(commit.commit_with_identifier(messages, commit_identifier))
+        }
+        (TableCommitKind::PostponeFixed(commit), true) => runtime()
+            .block_on(commit.filter_and_commit_with_identifier(messages, commit_identifier)),
+        (TableCommitKind::PostponeFixed(commit), false) => {
+            runtime().block_on(commit.commit_with_identifier(messages, commit_identifier))
+        }
     };
     match result {
         Ok(()) => ptr::null_mut(),
@@ -799,19 +804,20 @@ unsafe fn paimon_table_commit_overwrite_impl(
         return error;
     }
 
-    let result = match commit_identifier {
-        Some(commit_identifier) => {
-            runtime().block_on(table_commit.commit.overwrite_with_identifier(
-                messages.messages.clone(),
-                None,
-                commit_identifier,
-            ))
+    let messages = messages.messages.clone();
+    let result = match (&table_commit.commit, commit_identifier) {
+        (TableCommitKind::Standard(commit), Some(commit_identifier)) => {
+            runtime().block_on(commit.overwrite_with_identifier(messages, None, commit_identifier))
         }
-        None => runtime().block_on(
-            table_commit
-                .commit
-                .overwrite(messages.messages.clone(), None),
-        ),
+        (TableCommitKind::Standard(commit), None) => {
+            runtime().block_on(commit.overwrite(messages, None))
+        }
+        (TableCommitKind::PostponeFixed(commit), Some(commit_identifier)) => {
+            runtime().block_on(commit.overwrite_with_identifier(messages, commit_identifier))
+        }
+        (TableCommitKind::PostponeFixed(commit), None) => {
+            runtime().block_on(commit.overwrite(messages))
+        }
     };
     match result {
         Ok(()) => ptr::null_mut(),
@@ -852,13 +858,17 @@ unsafe fn paimon_table_commit_truncate_table_impl(
 
     let table_commit = &*((*tc).inner as *const TableCommitState);
 
-    let result = match commit_identifier {
-        Some(commit_identifier) => runtime().block_on(
-            table_commit
-                .commit
-                .truncate_table_with_identifier(commit_identifier),
-        ),
-        None => runtime().block_on(table_commit.commit.truncate_table()),
+    let result = match (&table_commit.commit, commit_identifier) {
+        (TableCommitKind::Standard(commit), Some(commit_identifier)) => {
+            runtime().block_on(commit.truncate_table_with_identifier(commit_identifier))
+        }
+        (TableCommitKind::Standard(commit), None) => runtime().block_on(commit.truncate_table()),
+        (TableCommitKind::PostponeFixed(commit), Some(commit_identifier)) => {
+            runtime().block_on(commit.truncate_table_with_identifier(commit_identifier))
+        }
+        (TableCommitKind::PostponeFixed(commit), None) => {
+            runtime().block_on(commit.truncate_table())
+        }
     };
     match result {
         Ok(()) => ptr::null_mut(),
@@ -894,7 +904,13 @@ pub unsafe extern "C" fn paimon_table_commit_abort(
         return error;
     }
 
-    match runtime().block_on(table_commit.commit.abort(&messages.messages)) {
+    let result = match &table_commit.commit {
+        TableCommitKind::Standard(commit) => runtime().block_on(commit.abort(&messages.messages)),
+        TableCommitKind::PostponeFixed(commit) => {
+            runtime().block_on(commit.abort(&messages.messages))
+        }
+    };
+    match result {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
