@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
 use paimon::table::{
-    CommitMessage, PostponeBucketPlan, PostponeFixedBucketBatchTableWrite, Table, TableCommit,
+    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
     TableWrite,
 };
 
@@ -218,7 +218,7 @@ pub(crate) struct WriteBuilderState {
 
 pub(crate) enum TableWriteKind {
     Standard(Box<TableWrite>),
-    PostponeFixed(Box<PostponeFixedBucketBatchTableWrite>),
+    PostponeFixed(Box<PostponeFixedBucketTableWrite>),
 }
 
 pub(crate) struct TableWriteState {

@@ -280,6 +280,19 @@ mod tests {
         .unwrap()
     }
 
+    fn postpone_bucket_plan(table: &Table, total_buckets: i32) -> crate::table::PostponeBucketPlan {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "total_buckets",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![total_buckets]))],
+        )
+        .unwrap();
+        crate::table::PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+    }
+
     fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -427,11 +440,20 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.commit_user(), "my-commit-user");
 
+        let error = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .new_write()
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("bucket plan is required"));
+
         let builder = table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
             .with_commit_user("explicit-fixed-user")
-            .unwrap();
+            .unwrap()
+            .with_bucket_plan(postpone_bucket_plan(&table, 1));
         let mut fixed = builder.new_write().unwrap();
         fixed
             .write_arrow_batch(&make_batch(vec![4], vec![40]))
@@ -449,6 +471,7 @@ mod tests {
         let error = dv_table
             .new_postpone_fixed_bucket_write_builder()
             .unwrap()
+            .with_bucket_plan(postpone_bucket_plan(&dv_table, 1))
             .new_write()
             .err()
             .unwrap();

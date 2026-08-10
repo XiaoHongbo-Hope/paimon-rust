@@ -1515,6 +1515,10 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         assert!(
             (&*((*fixed.write_builder).inner as *const WriteBuilderState)).postpone_fixed_bucket
         );
+        let write = paimon_write_builder_new_write(fixed.write_builder);
+        assert!(write.write.is_null());
+        assert!(error_message(write.error).contains("bucket plan is required"));
+        paimon_error_free(write.error);
         paimon_write_builder_free(fixed.write_builder);
 
         let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
