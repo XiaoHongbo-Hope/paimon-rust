@@ -208,7 +208,6 @@ pub struct paimon_arrow_batch {
 
 // === Write/Commit opaque types ===
 
-/// Internal state for WriteBuilder that stores table, shared commit_user, and overwrite flag.
 pub(crate) struct WriteBuilderState {
     pub table: Table,
     pub commit_user: String,

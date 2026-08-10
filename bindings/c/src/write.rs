@@ -180,7 +180,8 @@ pub unsafe extern "C" fn paimon_write_builder_free(wb: *mut paimon_write_builder
 
 /// Enable overwrite mode for the WriteBuilder.
 ///
-/// Writers and committers created afterwards use overwrite mode.
+/// Fixed-bucket committers carry this mode. Standard callers use
+/// `paimon_table_commit_overwrite`.
 ///
 /// # Safety
 /// `wb` must be a valid pointer from `paimon_table_new_write_builder`, or null (returns error).
@@ -196,12 +197,7 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
     ptr::null_mut()
 }
 
-/// Set a shared bucket-count plan for distributed fixed-bucket writers.
-///
-/// The Arrow batch contains partition columns followed by a non-null Int32
-/// `total_buckets`. Ownership of the Arrow C Data structs is transferred.
-/// Each `(partition, bucket)` must be routed to exactly one writer; commit
-/// rejects overlapping writer messages.
+/// Set a shared `partition -> total_buckets` plan.
 ///
 /// # Safety
 /// `wb` must be an explicit postpone fixed-bucket builder. `array` and
@@ -513,6 +509,28 @@ pub unsafe extern "C" fn paimon_table_write_prepare_commit(
 
 // ======================= TableCommit ===============================
 
+fn create_table_commit(
+    state: &WriteBuilderState,
+) -> paimon::Result<(paimon::table::TableCommit, bool)> {
+    if state.postpone_fixed_bucket {
+        let mut builder = state
+            .table
+            .new_postpone_fixed_bucket_write_builder()?
+            .with_commit_user(state.commit_user.clone())?;
+        if state.overwrite {
+            builder = builder.with_overwrite();
+        }
+        Ok((builder.try_new_commit()?.into_inner(), state.overwrite))
+    } else {
+        let commit = state
+            .table
+            .new_write_builder()
+            .with_commit_user(state.commit_user.clone())?
+            .try_new_commit()?;
+        Ok((commit, false))
+    }
+}
+
 /// Create a new TableCommit from the WriteBuilder.
 ///
 /// The committer shares the same `commit_user` as the writer, which is
@@ -532,33 +550,19 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
     }
     let state = &*((*wb).inner as *const WriteBuilderState);
 
-    let builder = match state
-        .table
-        .new_write_builder()
-        .with_commit_user(state.commit_user.clone())
-    {
-        Ok(b) => b,
-        Err(e) => {
+    let (commit, overwrite) = match create_table_commit(state) {
+        Ok(commit) => commit,
+        Err(error) => {
             return paimon_result_table_commit {
                 commit: ptr::null_mut(),
-                error: paimon_error::from_paimon(e),
-            }
-        }
-    };
-
-    let tc = match builder.try_new_commit() {
-        Ok(c) => c,
-        Err(e) => {
-            return paimon_result_table_commit {
-                commit: ptr::null_mut(),
-                error: paimon_error::from_paimon(e),
+                error: paimon_error::from_paimon(error),
             }
         }
     };
 
     let table_commit = TableCommitState {
-        commit: tc,
-        overwrite: state.overwrite,
+        commit,
+        overwrite,
         table_location: state.table.location().to_string(),
         commit_user: state.commit_user.clone(),
     };
@@ -652,7 +656,51 @@ fn validate_commit_context(
     Ok(())
 }
 
-/// Commit the given messages in the mode configured by the WriteBuilder.
+unsafe fn commit_with_identifier_impl(
+    tc: *const paimon_table_commit,
+    msgs: *mut paimon_commit_messages,
+    commit_identifier: i64,
+    filter_committed: bool,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(tc, "tc") {
+        return error;
+    }
+    if let Err(error) = check_non_null(msgs, "msgs") {
+        return error;
+    }
+
+    let table_commit = &*((*tc).inner as *const TableCommitState);
+    let messages = &*((*msgs).inner as *const CommitMessagesState);
+    if let Err(error) = validate_commit_context(table_commit, messages) {
+        return error;
+    }
+
+    let result = if table_commit.overwrite {
+        runtime().block_on(table_commit.commit.overwrite_with_identifier(
+            messages.messages.clone(),
+            None,
+            commit_identifier,
+        ))
+    } else if filter_committed {
+        runtime().block_on(
+            table_commit
+                .commit
+                .filter_and_commit_with_identifier(messages.messages.clone(), commit_identifier),
+        )
+    } else {
+        runtime().block_on(
+            table_commit
+                .commit
+                .commit_with_identifier(messages.messages.clone(), commit_identifier),
+        )
+    };
+    match result {
+        Ok(()) => ptr::null_mut(),
+        Err(error) => paimon_error::from_paimon(error),
+    }
+}
+
+/// Commit in append mode, or in the configured fixed-bucket overwrite mode.
 ///
 /// Empty messages is a no-op success.
 /// The caller retains ownership of `msgs`; it may retry after an error and
@@ -683,36 +731,7 @@ pub unsafe extern "C" fn paimon_table_commit_commit_with_identifier(
     msgs: *mut paimon_commit_messages,
     commit_identifier: i64,
 ) -> *mut paimon_error {
-    if let Err(e) = check_non_null(tc, "tc") {
-        return e;
-    }
-    if let Err(e) = check_non_null(msgs, "msgs") {
-        return e;
-    }
-
-    let table_commit = &*((*tc).inner as *const TableCommitState);
-    let messages = &*((*msgs).inner as *const CommitMessagesState);
-    if let Err(error) = validate_commit_context(table_commit, messages) {
-        return error;
-    }
-
-    let result = if table_commit.overwrite {
-        runtime().block_on(table_commit.commit.overwrite_with_identifier(
-            messages.messages.clone(),
-            None,
-            commit_identifier,
-        ))
-    } else {
-        runtime().block_on(
-            table_commit
-                .commit
-                .commit_with_identifier(messages.messages.clone(), commit_identifier),
-        )
-    };
-    match result {
-        Ok(()) => ptr::null_mut(),
-        Err(e) => paimon_error::from_paimon(e),
-    }
+    commit_with_identifier_impl(tc, msgs, commit_identifier, false)
 }
 
 /// Filter a previously committed identifier, then commit if it is new.
@@ -727,36 +746,7 @@ pub unsafe extern "C" fn paimon_table_commit_filter_and_commit_with_identifier(
     msgs: *mut paimon_commit_messages,
     commit_identifier: i64,
 ) -> *mut paimon_error {
-    if let Err(e) = check_non_null(tc, "tc") {
-        return e;
-    }
-    if let Err(e) = check_non_null(msgs, "msgs") {
-        return e;
-    }
-
-    let table_commit = &*((*tc).inner as *const TableCommitState);
-    let messages = &*((*msgs).inner as *const CommitMessagesState);
-    if let Err(error) = validate_commit_context(table_commit, messages) {
-        return error;
-    }
-
-    let result = if table_commit.overwrite {
-        runtime().block_on(table_commit.commit.overwrite_with_identifier(
-            messages.messages.clone(),
-            None,
-            commit_identifier,
-        ))
-    } else {
-        runtime().block_on(
-            table_commit
-                .commit
-                .filter_and_commit_with_identifier(messages.messages.clone(), commit_identifier),
-        )
-    };
-    match result {
-        Ok(()) => ptr::null_mut(),
-        Err(e) => paimon_error::from_paimon(e),
-    }
+    commit_with_identifier_impl(tc, msgs, commit_identifier, true)
 }
 
 /// Commit in OVERWRITE mode, replacing data in the written partitions.

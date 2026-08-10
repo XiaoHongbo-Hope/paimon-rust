@@ -555,6 +555,10 @@ impl PostponeFixedBucketTableCommit {
         }
     }
 
+    pub fn into_inner(self) -> TableCommit {
+        self.inner
+    }
+
     pub async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {
         self.inner.abort(messages).await
     }

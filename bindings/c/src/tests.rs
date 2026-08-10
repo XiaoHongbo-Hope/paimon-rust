@@ -38,7 +38,7 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
-use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema, VarCharType};
 use paimon::table::{SnapshotManager, Table};
 
 use crate::error::*;
@@ -1529,6 +1529,7 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         .write_builder;
 
         for wb in [wb1, wb2] {
+            assert!(paimon_write_builder_with_overwrite(wb).is_null());
             let (array, schema) = export_batch_to_ffi(make_postpone_bucket_plan_batch(
                 vec!["p1", "p2"],
                 vec![3, 3],
@@ -1577,6 +1578,14 @@ fn test_distributed_postpone_writers_share_bucket_plan() {
         let commit = paimon_write_builder_new_commit(wb1).commit;
         let error = paimon_table_commit_commit(commit, messages1);
         assert!(error.is_null());
+        let snapshot = crate::runtime()
+            .block_on(
+                SnapshotManager::new(table_ref(handle).file_io().clone(), path.to_string())
+                    .get_latest_snapshot(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
 
         paimon_table_commit_free(commit);
         paimon_commit_messages_free(messages2);
@@ -1812,7 +1821,7 @@ fn test_write_overwrite_mode() {
 
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
-            paimon_table_commit_commit(tc_result.commit, pc.messages);
+            paimon_table_commit_overwrite(tc_result.commit, pc.messages);
             paimon_commit_messages_free(pc.messages);
 
             paimon_table_commit_free(tc_result.commit);
