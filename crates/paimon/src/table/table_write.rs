@@ -151,10 +151,6 @@ pub struct TableWrite {
 
 impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
-        Self::new_inner(table, commit_user)
-    }
-
-    fn new_inner(table: &Table, commit_user: String) -> crate::Result<Self> {
         let is_overwrite = false;
         let schema = table.schema();
         let write_schema = build_target_arrow_schema(schema.fields())?;
