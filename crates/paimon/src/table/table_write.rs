@@ -767,6 +767,7 @@ impl TableWrite {
         })
     }
 
+    /// Write a batch directly to the writer for the given (partition, bucket).
     async fn write_bucket(
         &mut self,
         partition_bytes: Vec<u8>,
@@ -790,6 +791,7 @@ impl TableWrite {
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
+    /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
@@ -987,7 +989,7 @@ impl TableWrite {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::table) mod tests {
     use super::*;
     use crate::arrow::format::create_format_reader;
     use crate::catalog::Identifier;
@@ -1000,7 +1002,7 @@ mod tests {
         SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
         VALUE_KIND_FIELD_NAME,
     };
-    use crate::table::{PostponeBucketPlan, SnapshotManager, TableCommit};
+    use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::RecordBatchReader as _;
     use arrow_array::{Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray};
     use arrow_schema::{
@@ -1008,7 +1010,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn test_file_io() -> FileIO {
+    pub(in crate::table) fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
     }
 
@@ -1076,7 +1078,7 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+    pub(in crate::table) async fn setup_dirs(file_io: &FileIO, table_path: &str) {
         file_io
             .mkdirs(&format!("{table_path}/snapshot/"))
             .await
@@ -1087,7 +1089,7 @@ mod tests {
             .unwrap();
     }
 
-    fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+    pub(in crate::table) fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new("value", ArrowDataType::Int32, false),
@@ -3666,7 +3668,7 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+    pub(in crate::table) fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_postpone_table"),
@@ -3689,7 +3691,10 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    fn test_postpone_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
+    pub(in crate::table) fn test_postpone_partitioned_table(
+        file_io: &FileIO,
+        table_path: &str,
+    ) -> Table {
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_postpone_table"),
@@ -3699,7 +3704,11 @@ mod tests {
         )
     }
 
-    fn make_partitioned_batch_3col(pts: Vec<&str>, ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+    pub(in crate::table) fn make_partitioned_batch_3col(
+        pts: Vec<&str>,
+        ids: Vec<i32>,
+        values: Vec<i32>,
+    ) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("pt", ArrowDataType::Utf8, false),
             ArrowField::new("id", ArrowDataType::Int32, false),
@@ -3714,81 +3723,6 @@ mod tests {
             ],
         )
         .unwrap()
-    }
-
-    fn make_partition_bucket_plan_batch(
-        partitions: Vec<&str>,
-        total_buckets: Vec<i32>,
-    ) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("pt", ArrowDataType::Utf8, false),
-                ArrowField::new("total_buckets", ArrowDataType::Int32, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(partitions)),
-                Arc::new(Int32Array::from(total_buckets)),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn make_partition_bucket_plan(
-        table: &Table,
-        partitions: Vec<&str>,
-        total_buckets: Vec<i32>,
-    ) -> PostponeBucketPlan {
-        PostponeBucketPlan::from_arrow(
-            table,
-            &make_partition_bucket_plan_batch(partitions, total_buckets),
-        )
-        .unwrap()
-    }
-
-    fn make_unpartitioned_bucket_plan(table: &Table, total_buckets: i32) -> PostponeBucketPlan {
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "total_buckets",
-                ArrowDataType::Int32,
-                false,
-            )])),
-            vec![Arc::new(Int32Array::from(vec![total_buckets]))],
-        )
-        .unwrap();
-        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
-    }
-
-    async fn write_fixed_batch(
-        table: &Table,
-        commit_user: &str,
-        total_buckets: i32,
-        batch: &RecordBatch,
-    ) -> Vec<CommitMessage> {
-        let mut write = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user(commit_user)
-            .unwrap()
-            .with_bucket_plan(make_unpartitioned_bucket_plan(table, total_buckets))
-            .new_write()
-            .unwrap();
-        write.write_arrow_batch(batch).await.unwrap();
-        write.prepare_commit().await.unwrap()
-    }
-
-    fn assert_total_buckets(messages: &[CommitMessage], total_buckets: i32) {
-        assert!(!messages.is_empty());
-        assert!(messages
-            .iter()
-            .all(|message| message.total_buckets == Some(total_buckets)));
-    }
-
-    fn assert_one_shot_error(error: crate::Error) {
-        assert!(
-            matches!(error, crate::Error::DataInvalid { ref message, .. }
-            if message.contains("only supports one prepare_commit call")
-                && message.contains("create a new writer"))
-        );
     }
 
     #[tokio::test]
@@ -3817,278 +3751,6 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert_eq!(snapshot.total_record_count(), Some(3));
-    }
-
-    #[tokio::test]
-    async fn test_postpone_batch_write_uses_visible_fixed_buckets() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_fixed_bucket_write";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_postpone_pk_table(&file_io, table_path);
-
-        let first_builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("fixed-user-1")
-            .unwrap()
-            .with_bucket_plan(make_unpartitioned_bucket_plan(&table, 2));
-        let mut write = first_builder.new_write().unwrap();
-        write
-            .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
-            .await
-            .unwrap();
-        let messages = write.prepare_commit().await.unwrap();
-        assert!(messages.iter().all(|message| message.bucket >= 0));
-        assert_total_buckets(&messages, 2);
-
-        let stale_messages =
-            write_fixed_batch(&table, "stale-user", 1, &make_batch(vec![9], vec![90])).await;
-        assert_total_buckets(&stale_messages, 1);
-        TableCommit::new(table.clone(), "fixed-user-1".to_string())
-            .commit(messages)
-            .await
-            .unwrap();
-        let error = TableCommit::new(table.clone(), "stale-user".to_string())
-            .commit(stale_messages)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Fixed-bucket conflict"));
-        assert_eq!(
-            read_id_value_rows(&table).await,
-            vec![(1, 10), (2, 20), (3, 30), (4, 40)]
-        );
-
-        let second_builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("fixed-user-2")
-            .unwrap()
-            .with_bucket_plan(make_unpartitioned_bucket_plan(&table, 2));
-        let mut write = second_builder.new_write().unwrap();
-        write
-            .write_arrow_batch(&make_batch(vec![5], vec![50]))
-            .await
-            .unwrap();
-        let messages = write.prepare_commit().await.unwrap();
-        assert_total_buckets(&messages, 2);
-        assert_one_shot_error(
-            write
-                .write_arrow_batch(&make_batch(vec![6], vec![60]))
-                .await
-                .unwrap_err(),
-        );
-        assert_one_shot_error(write.prepare_commit().await.unwrap_err());
-        TableCommit::new(table.clone(), "fixed-user-2".to_string())
-            .commit(messages)
-            .await
-            .unwrap();
-        assert_eq!(
-            read_id_value_rows(&table).await,
-            vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_postpone_distributed_writers_share_bucket_plan() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_shared_bucket_plan";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_postpone_partitioned_table(&file_io, table_path);
-        let plan = make_partition_bucket_plan(&table, vec!["p1", "p2"], vec![3, 3]);
-
-        let builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("shared-plan-user")
-            .unwrap()
-            .with_bucket_plan(plan);
-        let mut first = builder.new_write().unwrap();
-        let mut second = builder.new_write().unwrap();
-        first
-            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p1"], vec![1], vec![10]))
-            .await
-            .unwrap();
-        second
-            .write_arrow_batch(&make_partitioned_batch_3col(
-                vec!["p2", "p2", "p2", "p2"],
-                vec![2, 3, 4, 5],
-                vec![20, 30, 40, 50],
-            ))
-            .await
-            .unwrap();
-
-        let mut messages = first.prepare_commit().await.unwrap();
-        messages.extend(second.prepare_commit().await.unwrap());
-        assert_total_buckets(&messages, 3);
-        builder.new_commit().commit(messages).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_postpone_distributed_writers_reject_overlapping_bucket_ownership() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_overlapping_writer_ownership";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_postpone_partitioned_table(&file_io, table_path);
-        let builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("overlapping-writers")
-            .unwrap()
-            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]));
-
-        let mut first = builder.new_write().unwrap();
-        let mut second = builder.new_write().unwrap();
-        first
-            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
-            .await
-            .unwrap();
-        second
-            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![20]))
-            .await
-            .unwrap();
-
-        let mut messages = first.prepare_commit().await.unwrap();
-        messages.extend(second.prepare_commit().await.unwrap());
-        let error = builder.new_commit().commit(messages).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("writer ownership conflict for bucket 0"));
-    }
-
-    #[tokio::test]
-    async fn test_postpone_provided_plan_must_cover_input_partitions() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_incomplete_bucket_plan";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_postpone_partitioned_table(&file_io, table_path);
-
-        let error = PostponeBucketPlan::from_arrow(
-            &table,
-            &make_partition_bucket_plan_batch(vec!["p"], vec![0]),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("must be positive"));
-
-        let plan = make_partition_bucket_plan(&table, vec!["p"], vec![2]);
-        let mut write = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_bucket_plan(plan)
-            .new_write()
-            .unwrap();
-
-        let error = write
-            .write_arrow_batch(&make_partitioned_batch_3col(
-                vec!["missing"],
-                vec![1],
-                vec![10],
-            ))
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("does not contain an input partition"));
-    }
-
-    #[tokio::test]
-    async fn test_postpone_overwrite_allows_bucket_rescale() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_overwrite_bucket_rescale";
-        setup_dirs(&file_io, table_path).await;
-        let table = test_postpone_partitioned_table(&file_io, table_path);
-
-        let initial_builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("initial-layout")
-            .unwrap()
-            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![1]));
-        let mut initial_write = initial_builder.new_write().unwrap();
-        initial_write
-            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![1], vec![10]))
-            .await
-            .unwrap();
-        initial_builder
-            .new_commit()
-            .commit(initial_write.prepare_commit().await.unwrap())
-            .await
-            .unwrap();
-
-        let overwrite_builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("replacement-layout")
-            .unwrap()
-            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["p"], vec![3]))
-            .with_overwrite();
-        let mut overwrite_write = overwrite_builder.new_write().unwrap();
-        overwrite_write
-            .write_arrow_batch(&make_partitioned_batch_3col(vec!["p"], vec![2], vec![20]))
-            .await
-            .unwrap();
-        let messages = overwrite_write.prepare_commit().await.unwrap();
-        assert_total_buckets(&messages, 3);
-        overwrite_builder
-            .new_commit()
-            .commit(messages)
-            .await
-            .unwrap();
-
-        let snapshot = SnapshotManager::new(file_io, table_path.to_string())
-            .get_latest_snapshot()
-            .await
-            .unwrap()
-            .unwrap();
-        let entries = TableScan::new(&table, None, vec![], None, None, None)
-            .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
-            .await
-            .unwrap();
-        assert!(!entries.is_empty());
-        assert!(entries.iter().all(|entry| entry.total_buckets() == 3));
-    }
-
-    #[tokio::test]
-    async fn test_postpone_fixed_bucket_write_with_rowkind_field() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_postpone_fixed_bucket_rowkind";
-        setup_dirs(&file_io, table_path).await;
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .column("op", DataType::VarChar(VarCharType::string_type()))
-            .primary_key(["id"])
-            .option("bucket", "-2")
-            .option("rowkind.field", "op")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_postpone_fixed_bucket_rowkind"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("id", ArrowDataType::Int32, false),
-                ArrowField::new("value", ArrowDataType::Int32, false),
-                ArrowField::new("op", ArrowDataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(Int32Array::from(vec![10])),
-                Arc::new(StringArray::from(vec!["+I"])),
-            ],
-        )
-        .unwrap();
-
-        let messages = write_fixed_batch(&table, "fixed-rowkind", 1, &batch).await;
-
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].bucket, 0);
-        assert_eq!(messages[0].total_buckets, Some(1));
-        assert_eq!(messages[0].new_files[0].row_count, 1);
     }
 
     #[tokio::test]
@@ -4571,7 +4233,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn read_id_value_rows(table: &Table) -> Vec<(i32, i32)> {
+    pub(in crate::table) async fn read_id_value_rows(table: &Table) -> Vec<(i32, i32)> {
         let rb = table.new_read_builder();
         let plan = rb.new_scan().plan().await.unwrap();
         let read = rb.new_read().unwrap();
