@@ -280,19 +280,6 @@ mod tests {
         .unwrap()
     }
 
-    fn postpone_bucket_plan(table: &Table, total_buckets: i32) -> crate::table::PostponeBucketPlan {
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "total_buckets",
-                ArrowDataType::Int32,
-                false,
-            )])),
-            vec![Arc::new(Int32Array::from(vec![total_buckets]))],
-        )
-        .unwrap();
-        crate::table::PostponeBucketPlan::from_arrow(table, &batch).unwrap()
-    }
-
     fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -400,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_postpone_write_builder_modes() {
+    async fn test_custom_commit_user_is_shared_by_write_and_commit() {
         let file_io = test_file_io();
         let table_path = "memory:/test_write_builder_commit_user";
         setup_dirs(&file_io, table_path).await;
@@ -439,45 +426,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.commit_user(), "my-commit-user");
-
-        let error = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .new_write()
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("bucket plan is required"));
-
-        let builder = table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_commit_user("explicit-fixed-user")
-            .unwrap()
-            .with_bucket_plan(postpone_bucket_plan(&table, 1));
-        let mut fixed = builder.new_write().unwrap();
-        fixed
-            .write_arrow_batch(&make_batch(vec![4], vec![40]))
-            .await
-            .unwrap();
-        let fixed_messages = fixed.prepare_commit().await.unwrap();
-        assert_eq!(fixed_messages.len(), 1);
-        assert_eq!(fixed_messages[0].bucket, 0);
-        assert_eq!(fixed_messages[0].total_buckets, Some(1));
-
-        let dv_table = table.copy_with_options(std::collections::HashMap::from([(
-            "deletion-vectors.enabled".to_string(),
-            "true".to_string(),
-        )]));
-        let error = dv_table
-            .new_postpone_fixed_bucket_write_builder()
-            .unwrap()
-            .with_bucket_plan(postpone_bucket_plan(&dv_table, 1))
-            .new_write()
-            .err()
-            .unwrap();
-        assert!(matches!(error, crate::Error::Unsupported { ref message }
-                if message.contains("postpone fixed-bucket writes")
-                    && message.contains("deletion-vectors.enabled=true")));
     }
 
     #[tokio::test]

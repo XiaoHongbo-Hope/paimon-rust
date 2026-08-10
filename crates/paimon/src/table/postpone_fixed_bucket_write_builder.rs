@@ -86,3 +86,74 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::table::table_write::tests::{
+        make_batch, setup_dirs, test_file_io, test_postpone_pk_table,
+    };
+    use crate::table::{PostponeBucketPlan, Table};
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn bucket_plan(table: &Table, total_buckets: i32) -> PostponeBucketPlan {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "total_buckets",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![total_buckets]))],
+        )
+        .unwrap();
+        PostponeBucketPlan::from_arrow(table, &batch).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_postpone_fixed_bucket_builder_modes() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_fixed_bucket_builder";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+
+        let error = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .new_write()
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("bucket plan is required"));
+
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("explicit-fixed-user")
+            .unwrap()
+            .with_bucket_plan(bucket_plan(&table, 1));
+        let mut write = builder.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_batch(vec![4], vec![40]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, 0);
+        assert_eq!(messages[0].total_buckets, Some(1));
+
+        let dv_table = table.copy_with_options(std::collections::HashMap::from([(
+            "deletion-vectors.enabled".to_string(),
+            "true".to_string(),
+        )]));
+        let error = dv_table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(bucket_plan(&dv_table, 1))
+            .new_write()
+            .err()
+            .unwrap();
+        assert!(matches!(error, crate::Error::Unsupported { ref message }
+                if message.contains("postpone fixed-bucket writes")
+                    && message.contains("deletion-vectors.enabled=true")));
+    }
+}
