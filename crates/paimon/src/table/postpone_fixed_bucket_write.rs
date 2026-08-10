@@ -192,6 +192,7 @@ fn validate_postpone_fixed_bucket_write(table: &Table) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::catalog::Identifier;
+    use crate::io::FileIO;
     use crate::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
     use crate::table::table_write::tests::{
         make_batch, make_partitioned_batch_3col, read_id_value_rows, setup_dirs, test_file_io,
@@ -247,6 +248,25 @@ mod tests {
         PostponeBucketPlan::from_arrow(table, &batch).unwrap()
     }
 
+    fn cross_partition_postpone_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .partition_keys(["pt"])
+            .option("bucket", "-2")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "cross_partition_postpone"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
     async fn write_fixed_batch(
         table: &Table,
         commit_user: &str,
@@ -290,6 +310,20 @@ mod tests {
             .unwrap();
         let messages = write.prepare_commit().await.unwrap();
         (builder, messages)
+    }
+
+    #[test]
+    fn test_postpone_fixed_bucket_rejects_cross_partition_update() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_fixed_cross_partition";
+        let table = cross_partition_postpone_table(&file_io, table_path);
+        let error = match table.new_postpone_fixed_bucket_write_builder() {
+            Ok(_) => panic!("cross-partition postpone fixed-bucket writes should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("do not support cross-partition updates"));
     }
 
     fn assert_total_buckets(messages: &[CommitMessage], total_buckets: i32) {

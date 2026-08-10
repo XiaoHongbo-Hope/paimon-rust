@@ -115,6 +115,16 @@ pub(crate) fn validate_postpone_fixed_bucket_table(table: &Table) -> Result<()> 
             ),
         });
     }
+    if schema
+        .partition_keys()
+        .iter()
+        .any(|key| !schema.primary_keys().contains(key))
+    {
+        return Err(crate::Error::Unsupported {
+            message: "Postpone fixed-bucket writes do not support cross-partition updates"
+                .to_string(),
+        });
+    }
     Ok(())
 }
 
