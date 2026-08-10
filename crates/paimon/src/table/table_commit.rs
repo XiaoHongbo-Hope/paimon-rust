@@ -1888,6 +1888,12 @@ impl TableCommit {
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
         self.check_total_bucket_conflicts(&merged_entries)?;
+        self.check_fixed_bucket_ownership_conflicts(
+            latest_snapshot,
+            delta_entries,
+            check_from_snapshot,
+        )
+        .await?;
 
         if !self.data_evolution_enabled {
             return Ok(());
@@ -1899,6 +1905,61 @@ impl TableCommit {
         self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
         self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
             .await
+    }
+
+    async fn check_fixed_bucket_ownership_conflicts(
+        &self,
+        latest_snapshot: Option<&Snapshot>,
+        entries: &[ManifestEntry],
+        check_from_snapshot: Option<i64>,
+    ) -> Result<()> {
+        let Some(check_from_snapshot) = check_from_snapshot else {
+            return Ok(());
+        };
+        let Some(latest_snapshot) = latest_snapshot else {
+            return Ok(());
+        };
+        if latest_snapshot.id() <= check_from_snapshot {
+            return Ok(());
+        }
+
+        let fixed_entries = entries
+            .iter()
+            .filter(|entry| {
+                *entry.kind() == FileKind::Add
+                    && entry.total_buckets() != self.total_buckets
+                    && entry.total_buckets() > 0
+            })
+            .collect::<Vec<_>>();
+        if fixed_entries.is_empty() {
+            return Ok(());
+        }
+        let owned_buckets = fixed_entries
+            .iter()
+            .map(|entry| (entry.partition(), entry.bucket()))
+            .collect::<HashSet<_>>();
+        let partition_filter = self.build_entries_partition_filter(&fixed_entries)?;
+
+        for snapshot_id in check_from_snapshot.max(0) + 1..=latest_snapshot.id() {
+            let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            let concurrent_entries = self
+                .read_delta_entries(partition_filter.as_ref(), &snapshot)
+                .await?;
+            for entry in concurrent_entries {
+                if *entry.kind() == FileKind::Add
+                    && owned_buckets.contains(&(entry.partition(), entry.bucket()))
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone fixed-bucket writer ownership conflict for bucket {}: another commit wrote the same partition and bucket after snapshot {check_from_snapshot}",
+                            entry.bucket()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn check_total_bucket_conflicts(&self, entries: &[ManifestEntry]) -> Result<()> {

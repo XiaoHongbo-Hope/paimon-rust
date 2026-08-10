@@ -41,7 +41,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
-use crate::table::{SnapshotManager, Table, TableScan};
+use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
@@ -130,6 +130,7 @@ pub struct TableWrite {
     changelog_file_format: String,
     changelog_file_compression: String,
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
+    sequence_snapshot: Option<Option<Snapshot>>,
     commit_user: String,
     /// Bucket assignment strategy (fixed, dynamic, or cross-partition).
     bucket_assigner: BucketAssignerEnum,
@@ -388,6 +389,7 @@ impl TableWrite {
             changelog_file_format,
             changelog_file_compression,
             partition_seq_cache: HashMap::new(),
+            sequence_snapshot: None,
             commit_user,
             bucket_assigner,
             is_overwrite,
@@ -404,16 +406,23 @@ impl TableWrite {
     /// Scan the latest snapshot for a specific partition and return a map of
     /// bucket → (max_sequence_number + 1) for each bucket in that partition.
     async fn scan_partition_sequence_numbers(
-        table: &Table,
+        &self,
         partition_bytes: &[u8],
     ) -> crate::Result<HashMap<i32, i64>> {
-        let snapshot_manager =
-            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
-        let latest_snapshot = snapshot_manager.get_latest_snapshot().await?;
+        let latest_snapshot = match &self.sequence_snapshot {
+            Some(snapshot) => snapshot.clone(),
+            None => {
+                let snapshot_manager = SnapshotManager::new(
+                    self.table.file_io().clone(),
+                    self.table.location().to_string(),
+                );
+                snapshot_manager.get_latest_snapshot().await?
+            }
+        };
         let mut bucket_seq: HashMap<i32, i64> = HashMap::new();
         if let Some(snapshot) = latest_snapshot {
-            let partition_filter = Self::build_partition_filter(table, partition_bytes)?;
-            let scan = TableScan::new(table, partition_filter, vec![], None, None, None)
+            let partition_filter = Self::build_partition_filter(&self.table, partition_bytes)?;
+            let scan = TableScan::new(&self.table, partition_filter, vec![], None, None, None)
                 .with_scan_all_files();
             let entries = scan.plan_manifest_entries(&snapshot).await?;
             for entry in &entries {
@@ -426,6 +435,17 @@ impl TableWrite {
             }
         }
         Ok(bucket_seq)
+    }
+
+    pub(super) async fn pin_sequence_snapshot(&mut self) -> Result<i64> {
+        let snapshot_manager = SnapshotManager::new(
+            self.table.file_io().clone(),
+            self.table.location().to_string(),
+        );
+        let snapshot = snapshot_manager.get_latest_snapshot().await?;
+        let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
+        self.sequence_snapshot = Some(snapshot);
+        Ok(snapshot_id)
     }
 
     /// Build a partition filter from serialized partition bytes.
@@ -946,8 +966,9 @@ impl TableWrite {
         // Lazily scan partition sequence numbers on first writer creation per partition.
         // Overwrite mode skips this — old data will be replaced, so seq starts at 0.
         if !self.is_overwrite && !self.partition_seq_cache.contains_key(partition_bytes) {
-            let bucket_seq =
-                Self::scan_partition_sequence_numbers(&self.table, partition_bytes).await?;
+            let bucket_seq = self
+                .scan_partition_sequence_numbers(partition_bytes)
+                .await?;
             self.partition_seq_cache
                 .insert(partition_bytes.to_vec(), bucket_seq);
         }

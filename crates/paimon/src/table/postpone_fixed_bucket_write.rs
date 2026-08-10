@@ -27,6 +27,7 @@ use arrow_array::RecordBatch;
 pub struct PostponeFixedBucketTableWrite {
     inner: TableWrite,
     router: PostponeFixedBucketRouter,
+    check_from_snapshot: Option<i64>,
     prepare_started: bool,
 }
 
@@ -46,6 +47,7 @@ impl PostponeFixedBucketTableWrite {
                 inner
             },
             router: PostponeFixedBucketRouter::new(table, plan)?,
+            check_from_snapshot: None,
             prepare_started: false,
         })
     }
@@ -55,6 +57,9 @@ impl PostponeFixedBucketTableWrite {
         let Some(batch) = self.inner.normalize_write_batch(batch)? else {
             return Ok(());
         };
+        if self.check_from_snapshot.is_none() {
+            self.check_from_snapshot = Some(self.inner.pin_sequence_snapshot().await?);
+        }
         for routed in self.router.route(&batch)? {
             self.inner
                 .write_partition_bucket_batch(routed.partition, routed.bucket, routed.batch)
@@ -76,6 +81,7 @@ impl PostponeFixedBucketTableWrite {
         let mut messages = self.inner.prepare_commit().await?;
         for message in &mut messages {
             message.total_buckets = self.router.total_buckets(&message.partition);
+            message.check_from_snapshot = self.check_from_snapshot;
         }
         Ok(messages)
     }
@@ -192,7 +198,8 @@ mod tests {
         test_postpone_partitioned_table, test_postpone_pk_table,
     };
     use crate::table::{
-        CommitMessage, PostponeBucketPlan, SnapshotManager, Table, TableCommit, TableScan,
+        CommitMessage, PostponeBucketPlan, PostponeFixedBucketWriteBuilder, SnapshotManager, Table,
+        TableCommit, TableScan,
     };
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -256,6 +263,33 @@ mod tests {
             .unwrap();
         write.write_arrow_batch(batch).await.unwrap();
         write.prepare_commit().await.unwrap()
+    }
+
+    async fn prepare_partitioned_fixed_batch<'a>(
+        table: &'a Table,
+        commit_user: &str,
+        plan: PostponeBucketPlan,
+        partition: &str,
+        id: i32,
+        value: i32,
+    ) -> (PostponeFixedBucketWriteBuilder<'a>, Vec<CommitMessage>) {
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user(commit_user)
+            .unwrap()
+            .with_bucket_plan(plan);
+        let mut write = builder.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_partitioned_batch_3col(
+                vec![partition],
+                vec![id],
+                vec![value],
+            ))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        (builder, messages)
     }
 
     fn assert_total_buckets(messages: &[CommitMessage], total_buckets: i32) {
@@ -415,6 +449,66 @@ mod tests {
         assert!(error
             .to_string()
             .contains("writer ownership conflict for bucket 0"));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_concurrent_commits_reject_overlapping_bucket_ownership() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_concurrent_writer_ownership";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+        let plan = make_partition_bucket_plan(&table, vec!["p"], vec![1]);
+        let (first_builder, first_messages) = prepare_partitioned_fixed_batch(
+            &table,
+            "concurrent-writer-1",
+            plan.clone(),
+            "p",
+            1,
+            10,
+        )
+        .await;
+        let (second_builder, second_messages) =
+            prepare_partitioned_fixed_batch(&table, "concurrent-writer-2", plan, "p", 1, 20).await;
+        assert_eq!(first_messages[0].new_files[0].min_sequence_number, 0);
+        assert_eq!(second_messages[0].new_files[0].min_sequence_number, 0);
+        first_builder
+            .new_commit()
+            .commit(first_messages)
+            .await
+            .unwrap();
+        let error = second_builder
+            .new_commit()
+            .commit(second_messages)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("writer ownership conflict for bucket 0"));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_concurrent_commits_allow_disjoint_ownership() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_disjoint_writer_ownership";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+        let plan = make_partition_bucket_plan(&table, vec!["p1", "p2"], vec![1, 1]);
+        let (first_builder, first_messages) =
+            prepare_partitioned_fixed_batch(&table, "disjoint-writer-1", plan.clone(), "p1", 1, 10)
+                .await;
+        let (second_builder, second_messages) =
+            prepare_partitioned_fixed_batch(&table, "disjoint-writer-2", plan, "p2", 2, 20).await;
+
+        first_builder
+            .new_commit()
+            .commit(first_messages)
+            .await
+            .unwrap();
+        second_builder
+            .new_commit()
+            .commit(second_messages)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

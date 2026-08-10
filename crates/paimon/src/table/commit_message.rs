@@ -31,7 +31,7 @@ pub struct CommitMessage {
     pub total_buckets: Option<i32>,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
-    /// Snapshot id from which row-id/column conflicts should be checked.
+    /// Snapshot id from which state-dependent write conflicts should be checked.
     pub check_from_snapshot: Option<i64>,
     /// New changelog files to be added.
     pub new_changelog_files: Vec<DataFileMeta>,
