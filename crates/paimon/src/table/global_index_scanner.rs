@@ -122,7 +122,7 @@ struct GlobalIndexScanResult {
 /// The scanner filters index manifest entries for global index files,
 /// uses BTreeIndexMeta for file-level pruning, then reads matching
 /// BTree or bitmap files to evaluate predicates and collect row IDs.
-/// A bounded number of opened BTreeIndexReaders are cached for reuse across evaluations.
+/// Opened BTreeIndexReaders are cached for reuse across evaluations.
 pub(crate) struct GlobalIndexScanner {
     file_io: FileIO,
     table_path: String,
@@ -139,7 +139,6 @@ pub(crate) struct GlobalIndexScanner {
     schema_fields: Vec<DataField>,
     /// Cache of opened BTree readers, keyed by file name.
     reader_cache: Mutex<HashMap<String, BTreeIndexReader<BoxedCmp>>>,
-    reader_cache_capacity: usize,
     #[cfg(test)]
     query_io_probe: Option<Arc<QueryIoProbe>>,
 }
@@ -385,7 +384,6 @@ impl GlobalIndexScanner {
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
             reader_cache: Mutex::new(HashMap::new()),
-            reader_cache_capacity: global_index_thread_num,
             #[cfg(test)]
             query_io_probe: None,
         }))
@@ -948,9 +946,7 @@ impl GlobalIndexScanner {
     /// Return a reader to the cache for future reuse.
     fn return_reader(&self, file_name: String, reader: BTreeIndexReader<BoxedCmp>) {
         let mut cache = self.reader_cache.lock().unwrap();
-        if cache.len() < self.reader_cache_capacity || cache.contains_key(&file_name) {
-            cache.insert(file_name, reader);
-        }
+        cache.insert(file_name, reader);
     }
 
     fn find_field_id_by_name(&self, column: &str) -> Result<Option<i32>> {
@@ -2227,44 +2223,6 @@ mod tests {
             crate::Error::DataInvalid { message, .. }
                 if message.contains("Failed to open BTree index file")
         ));
-    }
-
-    #[tokio::test]
-    async fn test_btree_reader_cache_is_bounded() {
-        let (file_io, table_path, file_name, tmp) =
-            setup_testdata_table("btree_int_100_no_compress.bin");
-        let source = tmp.path().join("index").join(&file_name);
-        let file_size = std::fs::metadata(&source).unwrap().len() as i64;
-        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
-        let mut entries = Vec::new();
-        for shard in 0..5 {
-            let shard_name = format!("btree-{shard}.bin");
-            std::fs::copy(&source, tmp.path().join("index").join(&shard_name)).unwrap();
-            let mut entry =
-                make_global_index_entry(&shard_name, 1, shard * 100, shard * 100 + 99, &meta);
-            entry.index_file.file_size = file_size;
-            entries.push(entry);
-        }
-
-        let scanner = GlobalIndexScanner::create(
-            &file_io,
-            &table_path,
-            2,
-            i64::MAX,
-            i64::MAX,
-            &entries,
-            &int_schema_fields(),
-        )
-        .unwrap()
-        .unwrap();
-        let result = scanner
-            .evaluate(&int_eq("id", 0, 50))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.row_ranges.len(), 5);
-        assert!(scanner.reader_cache.lock().unwrap().len() <= 2);
     }
 
     #[tokio::test]
