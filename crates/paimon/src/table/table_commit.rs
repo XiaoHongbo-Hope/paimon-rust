@@ -50,6 +50,25 @@ type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 
+fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
+    let mut owners = HashSet::new();
+    for message in messages {
+        if message.total_buckets.is_none() || message.new_files.is_empty() {
+            continue;
+        }
+        if !owners.insert((message.partition.as_slice(), message.bucket)) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Postpone fixed-bucket writer ownership conflict for bucket {}: route all rows for one partition and bucket to a single writer",
+                    message.bucket
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Table commit logic for Paimon write operations.
 ///
 /// Provides atomic commit functionality including append, overwrite and truncate
@@ -156,6 +175,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
             return Ok(());
@@ -199,6 +219,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
             return Ok(());
@@ -270,6 +291,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
