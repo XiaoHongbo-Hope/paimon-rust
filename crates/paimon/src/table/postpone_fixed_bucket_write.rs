@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_postpone_fixed_bucket_write_with_rowkind_field() {
+    async fn test_postpone_fixed_bucket_delete_with_rowkind_field() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_fixed_bucket_rowkind";
         setup_dirs(&file_io, table_path).await;
@@ -540,7 +540,7 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from(vec![1])),
                 Arc::new(Int32Array::from(vec![10])),
-                Arc::new(StringArray::from(vec!["+I"])),
+                Arc::new(StringArray::from(vec!["-D"])),
             ],
         )
         .unwrap();
@@ -550,6 +550,8 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].bucket, 0);
         assert_eq!(messages[0].total_buckets, Some(1));
+        assert_eq!(messages[0].new_files.len(), 1);
         assert_eq!(messages[0].new_files[0].row_count, 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
     }
 }
