@@ -41,7 +41,7 @@ pub struct CommitMessage {
     pub deleted_index_files: Vec<IndexFileMeta>,
     /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
     pub deleted_files: Vec<DataFileMeta>,
-    overwrite: bool,
+    fixed_bucket_overwrite: bool,
 }
 
 impl CommitMessage {
@@ -56,18 +56,15 @@ impl CommitMessage {
             new_index_files: Vec::new(),
             deleted_index_files: Vec::new(),
             deleted_files: Vec::new(),
-            overwrite: false,
+            fixed_bucket_overwrite: false,
         }
     }
 
-    /// Mark this message as produced by an overwrite writer.
-    pub fn with_overwrite(mut self) -> Self {
-        self.overwrite = true;
-        self
+    pub(crate) fn mark_fixed_bucket_overwrite(&mut self) {
+        self.fixed_bucket_overwrite = true;
     }
 
-    /// Whether this message was produced by an overwrite writer.
-    pub fn is_overwrite(&self) -> bool {
-        self.overwrite
+    pub(crate) fn is_fixed_bucket_overwrite(&self) -> bool {
+        self.fixed_bucket_overwrite
     }
 }

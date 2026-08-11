@@ -842,9 +842,6 @@ impl TableWrite {
                 || !index_files.is_empty()
             {
                 let mut msg = CommitMessage::new(partition_bytes, bucket, files.data_files);
-                if self.is_overwrite {
-                    msg = msg.with_overwrite();
-                }
                 msg.new_changelog_files = files.changelog_files;
                 msg.new_index_files = index_files;
                 messages.push(msg);
@@ -855,9 +852,6 @@ impl TableWrite {
         for ((partition_bytes, bucket), idx_files) in index_files_by_key {
             if !idx_files.is_empty() {
                 let mut msg = CommitMessage::new(partition_bytes, bucket, vec![]);
-                if self.is_overwrite {
-                    msg = msg.with_overwrite();
-                }
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }

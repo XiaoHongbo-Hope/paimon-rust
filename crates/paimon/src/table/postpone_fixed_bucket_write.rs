@@ -27,6 +27,7 @@ use arrow_array::RecordBatch;
 pub struct PostponeFixedBucketTableWrite {
     inner: TableWrite,
     router: PostponeFixedBucketRouter,
+    overwrite: bool,
     check_from_snapshot: Option<i64>,
     prepare_started: bool,
 }
@@ -47,6 +48,7 @@ impl PostponeFixedBucketTableWrite {
                 inner
             },
             router: PostponeFixedBucketRouter::new(table, plan)?,
+            overwrite,
             check_from_snapshot: None,
             prepare_started: false,
         })
@@ -81,6 +83,9 @@ impl PostponeFixedBucketTableWrite {
         let mut messages = self.inner.prepare_commit().await?;
         for message in &mut messages {
             message.total_buckets = self.router.total_buckets(&message.partition);
+            if self.overwrite {
+                message.mark_fixed_bucket_overwrite();
+            }
             message.check_from_snapshot = self.check_from_snapshot;
         }
         Ok(messages)

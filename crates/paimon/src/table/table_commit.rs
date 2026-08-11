@@ -82,11 +82,10 @@ fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
     Ok(())
 }
 
-fn validate_commit_mode(messages: &[CommitMessage], overwrite: bool) -> Result<()> {
-    if messages
-        .iter()
-        .any(|message| message.is_overwrite() != overwrite)
-    {
+fn validate_fixed_bucket_commit_mode(messages: &[CommitMessage], overwrite: bool) -> Result<()> {
+    if messages.iter().any(|message| {
+        message.total_buckets.is_some() && message.is_fixed_bucket_overwrite() != overwrite
+    }) {
         return Err(crate::Error::DataInvalid {
             message: format!(
                 "Commit messages were prepared for {} but submitted as {}",
@@ -205,7 +204,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
-        validate_commit_mode(&commit_messages, false)?;
+        validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
@@ -250,7 +249,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
-        validate_commit_mode(&commit_messages, false)?;
+        validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
@@ -323,7 +322,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
-        validate_commit_mode(&commit_messages, true)?;
+        validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() && static_partitions.is_none() {
@@ -3411,16 +3410,29 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let commit = setup_commit(&file_io, table_path);
 
-        let append = CommitMessage::new(vec![], 0, vec![test_data_file("append.parquet", 1)]);
+        let mut append = CommitMessage::new(vec![], 0, vec![test_data_file("append.parquet", 1)]);
+        append.total_buckets = Some(1);
         let error = commit.overwrite(vec![append], None).await.unwrap_err();
         assert!(error.to_string().contains("submitted as overwrite"));
 
-        let overwrite = CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 1)])
-            .with_overwrite();
+        let mut overwrite =
+            CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 1)]);
+        overwrite.total_buckets = Some(1);
+        overwrite.mark_fixed_bucket_overwrite();
         let error = commit.commit(vec![overwrite]).await.unwrap_err();
         assert!(error.to_string().contains("submitted as append"));
 
         assert!(latest_snapshot(&file_io, table_path).await.is_none());
+    }
+
+    #[test]
+    fn test_fixed_bucket_commit_mode_preserves_non_fixed_messages() {
+        let append = CommitMessage::new(vec![], 0, vec![]);
+        assert!(validate_fixed_bucket_commit_mode(&[append], true).is_ok());
+
+        let mut overwrite = CommitMessage::new(vec![], 0, vec![]);
+        overwrite.mark_fixed_bucket_overwrite();
+        assert!(validate_fixed_bucket_commit_mode(&[overwrite], false).is_ok());
     }
 
     #[tokio::test]
@@ -3558,8 +3570,7 @@ mod tests {
             .unwrap();
 
         let overwrite =
-            CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 100)])
-                .with_overwrite();
+            CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 100)]);
         commit
             .overwrite_with_identifier(vec![overwrite.clone()], None, 2)
             .await
@@ -4360,8 +4371,7 @@ mod tests {
                     partition_bytes("a"),
                     0,
                     vec![test_data_file("data-a2.parquet", 50)],
-                )
-                .with_overwrite()],
+                )],
                 None,
             )
             .await
@@ -4576,8 +4586,7 @@ mod tests {
                     partition_bytes("z"),
                     0,
                     vec![test_data_file("data-z.parquet", 10)],
-                )
-                .with_overwrite()],
+                )],
                 None,
             )
             .await
@@ -4671,7 +4680,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut message = CommitMessage::new(partition_bytes("a"), 0, vec![]).with_overwrite();
+        let mut message = CommitMessage::new(partition_bytes("a"), 0, vec![]);
         message.new_changelog_files = vec![test_data_file("changelog-a.parquet", 1)];
 
         commit.overwrite(vec![message], None).await.unwrap();
@@ -5157,8 +5166,7 @@ mod tests {
                     null_partition_bytes(),
                     0,
                     vec![test_data_file("data-null2.parquet", 50)],
-                )
-                .with_overwrite()],
+                )],
                 None,
             )
             .await
@@ -5201,8 +5209,7 @@ mod tests {
                     null_partition_bytes(),
                     0,
                     vec![test_data_file("data-null2.parquet", 50)],
-                )
-                .with_overwrite()],
+                )],
                 Some(HashMap::from([(
                     "pt".to_string(),
                     Some(Datum::String("__DEFAULT_PARTITION__".to_string())),
@@ -5241,8 +5248,7 @@ mod tests {
                     partition_bytes("b"),
                     0,
                     vec![test_data_file("data-b.parquet", 100)],
-                )
-                .with_overwrite()],
+                )],
                 Some(HashMap::from([(
                     "pt".to_string(),
                     Some(Datum::String("a".to_string())),
@@ -5264,8 +5270,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let commit = setup_commit(&file_io, table_path);
-        let mut message =
-            CommitMessage::new(vec![], 0, vec![test_data_file("data.parquet", 1)]).with_overwrite();
+        let mut message = CommitMessage::new(vec![], 0, vec![test_data_file("data.parquet", 1)]);
         message.new_changelog_files = vec![test_data_file("changelog.parquet", 1)];
 
         commit.overwrite(vec![message], None).await.unwrap();
@@ -5680,10 +5685,11 @@ mod tests {
 
         commit
             .overwrite(
-                vec![
-                    CommitMessage::new(vec![], 0, vec![test_data_file("data-1.parquet", 50)])
-                        .with_overwrite(),
-                ],
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("data-1.parquet", 50)],
+                )],
                 None,
             )
             .await
