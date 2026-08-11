@@ -750,6 +750,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_postpone_commit_rejects_writer_mode_mismatch() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_writer_mode_mismatch";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let plan = make_unpartitioned_bucket_plan(&table, 1);
+
+        let initial_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(plan.clone());
+        let mut initial_write = initial_builder.new_write().unwrap();
+        initial_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        initial_builder
+            .new_commit()
+            .commit(initial_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(plan);
+        let append_commit = builder.new_commit();
+        let overwrite_builder = builder.with_overwrite();
+        let mut overwrite_write = overwrite_builder.new_write().unwrap();
+        overwrite_write
+            .write_arrow_batch(&make_batch(vec![1], vec![100]))
+            .await
+            .unwrap();
+        let messages = overwrite_write.prepare_commit().await.unwrap();
+
+        let error = append_commit.commit(messages.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("submitted as append"));
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 10), (2, 20)]);
+
+        overwrite_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .unwrap();
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 100)]);
+    }
+
+    #[tokio::test]
     async fn test_postpone_commit_rejects_invalid_fixed_bucket_range() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_invalid_fixed_bucket_range";

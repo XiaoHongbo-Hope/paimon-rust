@@ -153,8 +153,7 @@ impl<'a> PaimonWriteBuilder<'a> {
     }
 
     /// Mark writers created by this builder as overwrite-aware.
-    ///
-    /// The commit kind remains explicit at the commit call site.
+    /// Their messages must be submitted through [`TableCommit::overwrite`].
     pub fn with_overwrite(mut self) -> Self {
         self.overwrite = true;
         self
@@ -504,7 +503,7 @@ mod tests {
             "Overwrite-aware writer must not produce input changelog files"
         );
 
-        wb.new_commit().commit(messages).await.unwrap();
+        wb.new_commit().overwrite(messages, None).await.unwrap();
 
         let snapshot_manager =
             crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
@@ -513,7 +512,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
     }
 
     #[test]
