@@ -210,8 +210,9 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
 }
 
 /// Set a shared `partition -> total_buckets` plan.
-/// Ownership of `array` and `schema` is transferred to this call; the caller
-/// must not release the Arrow C Data structs afterward.
+/// The caller retains ownership when pointer or builder validation fails. Once
+/// Arrow import starts, this call consumes both structs even if plan validation
+/// returns an error.
 ///
 /// # Safety
 /// `wb` must be an explicit postpone fixed-bucket builder. `array` and

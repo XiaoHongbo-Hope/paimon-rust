@@ -1583,6 +1583,55 @@ fn test_commit_messages_merge_preserves_all_writer_files() {
 }
 
 #[test]
+fn test_postpone_bucket_plan_arrow_ownership_on_errors() {
+    let path = "memory:/test_postpone_bucket_plan_arrow_ownership";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let standard = paimon_table_new_write_builder(handle).write_builder;
+        let (mut array, mut schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+        let error = paimon_write_builder_with_postpone_bucket_plan(
+            standard,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert!(!array.is_released());
+        assert!(schema.release.is_some());
+        paimon_error_free(error);
+        ManuallyDrop::drop(array.as_mut());
+        ManuallyDrop::drop(schema.as_mut());
+
+        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle).write_builder;
+        let (array, schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![0]));
+        let error = paimon_write_builder_with_postpone_bucket_plan(
+            fixed,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert!(array.is_released());
+        assert!(schema.release.is_none());
+        paimon_error_free(error);
+
+        paimon_write_builder_free(fixed);
+        paimon_write_builder_free(standard);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_distributed_postpone_writers_share_bucket_plan() {
     let path = "memory:/test_distributed_postpone_bucket_plan";
     let file_io = memory_file_io();

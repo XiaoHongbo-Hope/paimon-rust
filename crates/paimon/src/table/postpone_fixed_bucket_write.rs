@@ -567,7 +567,77 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("writer ownership conflict for bucket 0"));
+            .contains("another commit wrote the same partition"));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_overwrite_rejects_concurrent_write_to_same_partition() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_overwrite_partition_conflict";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let plan = make_unpartitioned_bucket_plan(&table, 2);
+
+        let overwrite_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("overwrite-writer")
+            .unwrap()
+            .with_bucket_plan(plan.clone())
+            .with_overwrite();
+        let mut overwrite_write = overwrite_builder.new_write().unwrap();
+        overwrite_write
+            .write_arrow_batch(&make_batch(
+                (0..32).collect(),
+                (0..32).map(|value| value * 10).collect(),
+            ))
+            .await
+            .unwrap();
+        let overwrite_messages = overwrite_write
+            .prepare_commit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.bucket == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(overwrite_messages.len(), 1);
+
+        let append_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("append-writer")
+            .unwrap()
+            .with_bucket_plan(plan);
+        let mut append_write = append_builder.new_write().unwrap();
+        append_write
+            .write_arrow_batch(&make_batch(
+                (100..132).collect(),
+                (100..132).map(|value| value * 10).collect(),
+            ))
+            .await
+            .unwrap();
+        let append_messages = append_write
+            .prepare_commit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.bucket == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(append_messages.len(), 1);
+        append_builder
+            .new_commit()
+            .commit(append_messages)
+            .await
+            .unwrap();
+
+        let error = overwrite_builder
+            .new_commit()
+            .commit(overwrite_messages)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("another commit wrote the same partition"));
     }
 
     #[tokio::test]
@@ -625,8 +695,79 @@ mod tests {
             .commit(messages)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("already uses fixed buckets"));
+        assert!(error.to_string().contains("Cannot mix bucket=-2 files"));
         assert_eq!(read_id_value_rows(&table).await, vec![(1, 10)]);
+    }
+
+    #[tokio::test]
+    async fn test_postpone_fixed_append_rejects_existing_negative_bucket() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_fixed_rejects_existing_negative_bucket";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+
+        let normal_builder = table
+            .new_write_builder()
+            .with_commit_user("normal-writer")
+            .unwrap();
+        let mut normal_write = normal_builder.new_write().unwrap();
+        normal_write
+            .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
+            .await
+            .unwrap();
+        normal_builder
+            .new_commit()
+            .commit(normal_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let fixed_messages =
+            write_fixed_batch(&table, "fixed-append", 1, &make_batch(vec![1], vec![100])).await;
+        let error = TableCommit::new(table.clone(), "fixed-append".to_string())
+            .commit(fixed_messages)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Cannot mix bucket=-2 files"));
+
+        let overwrite_builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_commit_user("fixed-overwrite")
+            .unwrap()
+            .with_bucket_plan(make_unpartitioned_bucket_plan(&table, 1))
+            .with_overwrite();
+        let mut overwrite_write = overwrite_builder.new_write().unwrap();
+        overwrite_write
+            .write_arrow_batch(&make_batch(vec![1], vec![100]))
+            .await
+            .unwrap();
+        overwrite_builder
+            .new_commit()
+            .commit(overwrite_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 100)]);
+    }
+
+    #[tokio::test]
+    async fn test_postpone_commit_rejects_invalid_fixed_bucket_range() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_invalid_fixed_bucket_range";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let messages =
+            write_fixed_batch(&table, "fixed-writer", 1, &make_batch(vec![1], vec![10])).await;
+
+        for (bucket, total_buckets) in [(1, 1), (-1, 1), (0, 0)] {
+            let mut invalid = messages.clone();
+            invalid[0].bucket = bucket;
+            invalid[0].total_buckets = Some(total_buckets);
+            let error = TableCommit::new(table.clone(), "fixed-writer".to_string())
+                .commit(invalid)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Invalid fixed bucket"));
+        }
     }
 
     #[tokio::test]
@@ -669,9 +810,7 @@ mod tests {
             .commit(fixed_messages)
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("another commit wrote bucket=-2 files"));
+        assert!(error.to_string().contains("Cannot mix bucket=-2 files"));
     }
 
     #[tokio::test]

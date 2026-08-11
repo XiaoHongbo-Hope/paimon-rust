@@ -54,7 +54,19 @@ type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
     let mut owners = HashSet::new();
     for message in messages {
-        if message.total_buckets.is_none() || message.new_files.is_empty() {
+        let Some(total_buckets) = message.total_buckets else {
+            continue;
+        };
+        if total_buckets <= 0 || message.bucket < 0 || message.bucket >= total_buckets {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Invalid fixed bucket {} for total_buckets={total_buckets}; expected a bucket in [0, {total_buckets})",
+                    message.bucket
+                ),
+                source: None,
+            });
+        }
+        if message.new_files.is_empty() {
             continue;
         }
         if !owners.insert((message.partition.as_slice(), message.bucket)) {
@@ -1899,16 +1911,16 @@ impl TableCommit {
 
         // Validate delta entries before duplicate files are merged.
         self.check_total_bucket_conflicts(delta_entries)?;
-        self.check_postpone_bucket_mixing(base_entries, delta_entries)?;
-
-        // Check the final layout so overwrite rescaling remains valid.
+        // Check the final layout so overwrite migration and rescaling remain valid.
         let mut all_entries = base_entries.to_vec();
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
         self.check_total_bucket_conflicts(&merged_entries)?;
+        self.check_postpone_bucket_mixing(&merged_entries)?;
         self.check_fixed_bucket_ownership_conflicts(
             latest_snapshot,
             delta_entries,
+            commit_kind,
             check_from_snapshot,
         )
         .await?;
@@ -1929,6 +1941,7 @@ impl TableCommit {
         &self,
         latest_snapshot: Option<&Snapshot>,
         entries: &[ManifestEntry],
+        commit_kind: &CommitKind,
         check_from_snapshot: Option<i64>,
     ) -> Result<()> {
         let Some(check_from_snapshot) = check_from_snapshot else {
@@ -1968,6 +1981,16 @@ impl TableCommit {
                 .read_delta_entries(partition_filter.as_ref(), &snapshot)
                 .await?;
             for entry in concurrent_entries {
+                if commit_kind == &CommitKind::OVERWRITE
+                    && owned_partitions.contains(entry.partition())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone fixed-bucket overwrite conflict: another commit wrote the same partition after snapshot {check_from_snapshot}"
+                        ),
+                        source: None,
+                    });
+                }
                 if *entry.kind() != FileKind::Add {
                     continue;
                 }
@@ -1994,31 +2017,25 @@ impl TableCommit {
         Ok(())
     }
 
-    fn check_postpone_bucket_mixing(
-        &self,
-        base_entries: &[ManifestEntry],
-        delta_entries: &[ManifestEntry],
-    ) -> Result<()> {
+    fn check_postpone_bucket_mixing(&self, active_entries: &[ManifestEntry]) -> Result<()> {
         if self.total_buckets != POSTPONE_BUCKET {
             return Ok(());
         }
-        let fixed_partitions = base_entries
+        let fixed_partitions = active_entries
             .iter()
-            .chain(delta_entries)
             .filter(|entry| {
                 *entry.kind() == FileKind::Add && entry.bucket() >= 0 && entry.total_buckets() > 0
             })
             .map(|entry| entry.partition())
             .collect::<HashSet<_>>();
-        if delta_entries.iter().any(|entry| {
+        if active_entries.iter().any(|entry| {
             *entry.kind() == FileKind::Add
                 && entry.bucket() == POSTPONE_BUCKET
                 && fixed_partitions.contains(entry.partition())
         }) {
             return Err(crate::Error::DataInvalid {
-                message:
-                    "Cannot commit bucket=-2 files for a partition that already uses fixed buckets"
-                        .to_string(),
+                message: "Cannot mix bucket=-2 files and fixed buckets in the same partition; use a complete overwrite to migrate the partition"
+                    .to_string(),
                 source: None,
             });
         }
