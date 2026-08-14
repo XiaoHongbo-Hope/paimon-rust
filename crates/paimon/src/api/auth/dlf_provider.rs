@@ -167,18 +167,24 @@ impl DLFECSTokenLoader {
     /// Get the token from ECS metadata service.
     async fn get_token(&self, url: &str) -> Result<DLFToken> {
         let token_json = self.http_client.get(url).await?;
-        let token: DLFToken =
+        let mut token: DLFToken =
             serde_json::from_str(&token_json).map_err(|e| Error::DataInvalid {
                 message: format!("Failed to parse token JSON: {e}"),
                 source: None,
             })?;
-        Ok(DLFToken::new(
-            token.access_key_id,
-            token.access_key_secret,
-            token.security_token,
-            token.expiration_at_millis,
-            token.expiration,
-        ))
+        if token.expiration_at_millis.is_none() {
+            if let Some(expiration) = token.expiration.as_deref() {
+                token.expiration_at_millis = Some(
+                    DLFToken::parse_expiration_to_millis(expiration).ok_or_else(|| {
+                        Error::DataInvalid {
+                            message: format!("Failed to parse token Expiration: {expiration}"),
+                            source: None,
+                        }
+                    })?,
+                );
+            }
+        }
+        Ok(token)
     }
 
     /// Build the token URL from base URL and role name.

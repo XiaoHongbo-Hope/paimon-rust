@@ -689,4 +689,16 @@ async fn test_ecs_loader_token() {
         Some("AQoDYXdzEJr...<remainder of security token>".to_string())
     );
     assert_eq!(token.expiration, Some("2023-12-01T12:00:00Z".to_string()));
+
+    let invalid_token_json = json!({
+        "AccessKeyId": "AccessKeyId",
+        "AccessKeySecret": "AccessKeySecret",
+        "SecurityToken": "token",
+        "Expiration": "invalid-expiration"
+    });
+    server.set_ecs_metadata(role_name, invalid_token_json);
+    let error = loader_with_role.load_token().await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Failed to parse token Expiration"));
 }
