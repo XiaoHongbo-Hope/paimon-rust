@@ -673,6 +673,10 @@ async fn test_ecs_loader_token() {
         load_token.expiration,
         Some("2023-12-01T12:00:00Z".to_string())
     );
+    assert_eq!(
+        load_token.expiration_at_millis,
+        DLFToken::parse_expiration_to_millis("2023-12-01T12:00:00Z")
+    );
 
     // Test with role name
     let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name.to_string()));

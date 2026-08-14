@@ -167,10 +167,18 @@ impl DLFECSTokenLoader {
     /// Get the token from ECS metadata service.
     async fn get_token(&self, url: &str) -> Result<DLFToken> {
         let token_json = self.http_client.get(url).await?;
-        serde_json::from_str(&token_json).map_err(|e| Error::DataInvalid {
-            message: format!("Failed to parse token JSON: {e}"),
-            source: None,
-        })
+        let token: DLFToken =
+            serde_json::from_str(&token_json).map_err(|e| Error::DataInvalid {
+                message: format!("Failed to parse token JSON: {e}"),
+                source: None,
+            })?;
+        Ok(DLFToken::new(
+            token.access_key_id,
+            token.access_key_secret,
+            token.security_token,
+            token.expiration_at_millis,
+            token.expiration,
+        ))
     }
 
     /// Build the token URL from base URL and role name.
@@ -472,5 +480,65 @@ mod tests {
         let expiration = "2024-12-31T23:59:59Z";
         let millis = DLFToken::parse_expiration_to_millis(expiration);
         assert!(millis.is_some());
+    }
+
+    struct RotatingTokenLoader {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DLFTokenLoader for RotatingTokenLoader {
+        async fn load_token(&self) -> Result<DLFToken> {
+            use std::sync::atomic::Ordering;
+
+            let request = self.requests.fetch_add(1, Ordering::SeqCst);
+            let lifetime = if request == 0 {
+                TOKEN_EXPIRATION_SAFE_TIME_MILLIS / 2
+            } else {
+                TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2
+            };
+            Ok(DLFToken::new(
+                format!("key-{request}"),
+                "secret",
+                None,
+                Some(Utc::now().timestamp_millis() + lifetime),
+                None,
+            ))
+        }
+
+        fn description(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_refreshes_expiring_loaded_token() {
+        use std::sync::atomic::Ordering;
+
+        let loader = Arc::new(RotatingTokenLoader {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let provider = DLFAuthProvider::new(
+            "https://dlf.cn-hangzhou.aliyuncs.com",
+            "cn-hangzhou",
+            "default",
+            None,
+            Some(loader.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider.get_or_refresh_token().await.unwrap().access_key_id,
+            "key-0"
+        );
+        assert_eq!(
+            provider.get_or_refresh_token().await.unwrap().access_key_id,
+            "key-1"
+        );
+        assert_eq!(
+            provider.get_or_refresh_token().await.unwrap().access_key_id,
+            "key-1"
+        );
+        assert_eq!(loader.requests.load(Ordering::SeqCst), 2);
     }
 }
