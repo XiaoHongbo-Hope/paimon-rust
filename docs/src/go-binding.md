@@ -117,9 +117,13 @@ if err := commit.Commit(messages); err != nil {
 ```
 
 `TableWrite` accepts multiple batches before `PrepareCommit`. For distributed
-writes, create every builder with `NewWriteBuilderWithCommitUser` and the same
-commit user, then merge their `CommitMessages`. Identifier-based methods
-support idempotent retries. Overwrite, truncate, and abort are also available.
+append-only writes, create every builder with `NewWriteBuilderWithCommitUser`
+and the same commit user, then merge their `CommitMessages`. Distributed
+fixed-bucket primary-key writes must also assign each `(partition, bucket)` to
+one writer before writing; sharing a commit user and merging messages does not
+establish bucket ownership. Identifier-based methods support idempotent retries.
+`WithOverwrite` makes `Commit` use overwrite mode. Truncate and abort are also
+available.
 
 ### Postpone Fixed-Bucket Writes
 

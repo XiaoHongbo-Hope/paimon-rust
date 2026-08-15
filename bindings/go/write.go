@@ -34,6 +34,7 @@ type WriteBuilder struct {
 	ctx       context.Context
 	lib       *libRef
 	inner     *paimonWriteBuilder
+	overwrite bool
 	closeOnce sync.Once
 }
 
@@ -53,7 +54,8 @@ func (t *Table) NewWriteBuilder() (*WriteBuilder, error) {
 
 // NewWriteBuilderWithCommitUser creates a write builder with a stable commit
 // identity. Use the same commitUser for distributed writers whose messages will
-// be merged into one commit, or when retrying a commit with an identifier.
+// be merged into one commit, or when retrying a commit with an identifier. For
+// fixed-bucket primary-key tables, assign each partition and bucket to one writer.
 func (t *Table) NewWriteBuilderWithCommitUser(commitUser string) (*WriteBuilder, error) {
 	if t.inner == nil {
 		return nil, ErrClosed
@@ -75,13 +77,17 @@ func (wb *WriteBuilder) Close() {
 	})
 }
 
-// WithOverwrite enables overwrite mode for writers created by this builder.
-// Commit their messages with TableCommit.Overwrite rather than Commit.
+// WithOverwrite enables overwrite mode for writers and committers created by
+// this builder.
 func (wb *WriteBuilder) WithOverwrite() error {
 	if wb.inner == nil {
 		return ErrClosed
 	}
-	return ffiWriteBuilderWithOverwrite.symbol(wb.ctx)(wb.inner)
+	if err := ffiWriteBuilderWithOverwrite.symbol(wb.ctx)(wb.inner); err != nil {
+		return err
+	}
+	wb.overwrite = true
+	return nil
 }
 
 // NewWrite creates a writer that accumulates Arrow record batches.
@@ -97,7 +103,7 @@ func (wb *WriteBuilder) NewWrite() (*TableWrite, error) {
 	return &TableWrite{ctx: wb.ctx, lib: wb.lib, inner: inner}, nil
 }
 
-// NewCommit creates a committer that shares this builder's commit identity.
+// NewCommit creates a committer that shares this builder's identity and mode.
 func (wb *WriteBuilder) NewCommit() (*TableCommit, error) {
 	if wb.inner == nil {
 		return nil, ErrClosed
@@ -107,7 +113,7 @@ func (wb *WriteBuilder) NewCommit() (*TableCommit, error) {
 		return nil, err
 	}
 	wb.lib.acquire()
-	return &TableCommit{ctx: wb.ctx, lib: wb.lib, inner: inner}, nil
+	return &TableCommit{ctx: wb.ctx, lib: wb.lib, inner: inner, overwrite: wb.overwrite}, nil
 }
 
 // TableWrite accumulates Arrow record batches until PrepareCommit is called.
@@ -176,6 +182,7 @@ func (m *CommitMessages) Close() {
 
 // Merge appends a copy of source's messages to this handle. Both handles remain
 // valid and must be closed separately. They must share a table and commit user.
+// Merging does not establish fixed-bucket primary-key ownership.
 func (m *CommitMessages) Merge(source *CommitMessages) error {
 	if m.inner == nil {
 		return ErrClosed
@@ -191,6 +198,7 @@ type TableCommit struct {
 	ctx       context.Context
 	lib       *libRef
 	inner     *paimonTableCommit
+	overwrite bool
 	closeOnce sync.Once
 }
 
@@ -230,49 +238,42 @@ func (tc *TableCommit) withMessagesAndIdentifier(
 	return operation(tc.inner, messages.inner, commitIdentifier)
 }
 
-// Commit appends the prepared data to the table.
+// Commit persists messages using the builder's append or overwrite mode.
 func (tc *TableCommit) Commit(messages *CommitMessages) error {
-	return tc.withMessages(messages, ffiTableCommitCommit.symbol(tc.ctx))
+	operation := ffiTableCommitCommit.symbol(tc.ctx)
+	if tc.overwrite {
+		operation = ffiTableCommitOverwrite.symbol(tc.ctx)
+	}
+	return tc.withMessages(messages, operation)
 }
 
-// CommitWithIdentifier appends data with a caller-provided monotonically
-// increasing identifier.
+// CommitWithIdentifier commits with a caller-provided monotonically increasing
+// identifier.
 func (tc *TableCommit) CommitWithIdentifier(messages *CommitMessages, commitIdentifier int64) error {
+	operation := ffiTableCommitCommitWithIdentifier.symbol(tc.ctx)
+	if tc.overwrite {
+		operation = ffiTableCommitOverwriteWithIdentifier.symbol(tc.ctx)
+	}
 	return tc.withMessagesAndIdentifier(
 		messages,
 		commitIdentifier,
-		ffiTableCommitCommitWithIdentifier.symbol(tc.ctx),
+		operation,
 	)
 }
 
-// FilterAndCommitWithIdentifier makes a retry idempotent by filtering a
-// previously committed identifier before committing it if it is new.
+// FilterAndCommitWithIdentifier makes a retry idempotent.
 func (tc *TableCommit) FilterAndCommitWithIdentifier(
 	messages *CommitMessages,
 	commitIdentifier int64,
 ) error {
+	operation := ffiTableCommitFilterAndCommitWithIdentifier.symbol(tc.ctx)
+	if tc.overwrite {
+		operation = ffiTableCommitOverwriteWithIdentifier.symbol(tc.ctx)
+	}
 	return tc.withMessagesAndIdentifier(
 		messages,
 		commitIdentifier,
-		ffiTableCommitFilterAndCommitWithIdentifier.symbol(tc.ctx),
-	)
-}
-
-// Overwrite replaces data in the partitions written by an overwrite-enabled
-// WriteBuilder.
-func (tc *TableCommit) Overwrite(messages *CommitMessages) error {
-	return tc.withMessages(messages, ffiTableCommitOverwrite.symbol(tc.ctx))
-}
-
-// OverwriteWithIdentifier overwrites data with a stable commit identifier.
-func (tc *TableCommit) OverwriteWithIdentifier(
-	messages *CommitMessages,
-	commitIdentifier int64,
-) error {
-	return tc.withMessagesAndIdentifier(
-		messages,
-		commitIdentifier,
-		ffiTableCommitOverwriteWithIdentifier.symbol(tc.ctx),
+		operation,
 	)
 }
 
