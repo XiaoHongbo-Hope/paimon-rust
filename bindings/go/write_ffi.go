@@ -246,38 +246,40 @@ func newCommitMessagesIdentifierFFI(
 	})
 }
 
-var ffiTableCommitTruncateTable = newCommitIdentifierFFI(
-	"paimon_table_commit_truncate_table",
-	false,
-)
-var ffiTableCommitTruncateTableWithIdentifier = newCommitIdentifierFFI(
+var ffiTableCommitTruncateTable = newCommitFFI("paimon_table_commit_truncate_table")
+var ffiTableCommitTruncateTableWithIdentifier = newCommitWithIdentifierFFI(
 	"paimon_table_commit_truncate_table_with_identifier",
-	true,
 )
 
-// newCommitIdentifierFFI registers truncate operations, whose ABI differs only
-// by the optional identifier. The returned function always accepts an int64;
-// the no-identifier variant ignores it.
-func newCommitIdentifierFFI(
-	symbol contextKey,
-	withIdentifier bool,
-) *FFI[func(*paimonTableCommit, ...int64) error] {
-	aTypes := []*ffi.Type{&ffi.TypePointer}
-	if withIdentifier {
-		aTypes = append(aTypes, &ffi.TypeSint64)
-	}
+func newCommitFFI(symbol contextKey) *FFI[func(*paimonTableCommit) error] {
 	return newFFI(ffiOpts{
 		sym:    symbol,
 		rType:  &ffi.TypePointer,
-		aTypes: aTypes,
-	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTableCommit, ...int64) error {
-		return func(commit *paimonTableCommit, identifiers ...int64) error {
+		aTypes: []*ffi.Type{&ffi.TypePointer},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTableCommit) error {
+		return func(commit *paimonTableCommit) error {
 			var ffiError *paimonError
-			args := []unsafe.Pointer{unsafe.Pointer(&commit)}
-			if withIdentifier {
-				args = append(args, unsafe.Pointer(&identifiers[0]))
-			}
-			ffiCall(unsafe.Pointer(&ffiError), args...)
+			ffiCall(unsafe.Pointer(&ffiError), unsafe.Pointer(&commit))
+			return parseError(ctx, ffiError)
+		}
+	})
+}
+
+func newCommitWithIdentifierFFI(
+	symbol contextKey,
+) *FFI[func(*paimonTableCommit, int64) error] {
+	return newFFI(ffiOpts{
+		sym:    symbol,
+		rType:  &ffi.TypePointer,
+		aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypeSint64},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTableCommit, int64) error {
+		return func(commit *paimonTableCommit, identifier int64) error {
+			var ffiError *paimonError
+			ffiCall(
+				unsafe.Pointer(&ffiError),
+				unsafe.Pointer(&commit),
+				unsafe.Pointer(&identifier),
+			)
 			return parseError(ctx, ffiError)
 		}
 	})
