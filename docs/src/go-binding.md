@@ -72,6 +72,82 @@ catalog, err := paimon.NewCatalog(map[string]string{
 })
 ```
 
+## Writing a Table
+
+Use `NewWriteBuilder` for ordinary tables, including fixed-bucket tables. For
+`bucket = -2` tables, it retains postpone semantics and writes bucket `-2`
+files. Input `arrow.Record` batches must match the table schema. Create the
+writer and committer from the same builder.
+
+```go
+builder, err := table.NewWriteBuilder()
+if err != nil {
+    log.Fatal(err)
+}
+defer builder.Close()
+
+writer, err := builder.NewWrite()
+if err != nil {
+    log.Fatal(err)
+}
+defer writer.Close()
+
+if err := writer.WriteArrowBatch(record); err != nil {
+    log.Fatal(err)
+}
+messages, err := writer.PrepareCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer messages.Close()
+
+commit, err := builder.NewCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer commit.Close()
+
+if err := commit.Commit(messages); err != nil {
+    log.Fatal(err)
+}
+```
+
+`TableWrite` accepts multiple batches before `PrepareCommit`. For distributed
+writes, create every builder with `NewWriteBuilderWithCommitUser` and the same
+commit user, then merge their `CommitMessages`. Identifier-based methods
+support idempotent retries. Overwrite, truncate, and abort are also available.
+
+### Postpone Fixed-Bucket Writes
+
+`NewPostponeFixedBucketWriteBuilder` writes real buckets for a `bucket = -2`
+table. Before `NewWrite`, provide a resolved Arrow plan containing the
+partition columns in table-schema order followed by a non-null Int32
+`total_buckets` column. An unpartitioned plan contains only `total_buckets`.
+
+```go
+builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser(commitUser)
+if err != nil {
+    log.Fatal(err)
+}
+defer builder.Close()
+
+if err := builder.WithBucketPlan(bucketPlan); err != nil {
+    log.Fatal(err)
+}
+
+writer, err := builder.NewWrite()
+if err != nil {
+    log.Fatal(err)
+}
+defer writer.Close()
+
+```
+
+Writing, preparing, and committing use the same flow as above, but return
+dedicated fixed-bucket types. The Go binding does not create the plan or shuffle
+rows. Distributed integrations must share one plan and commit user, and assign
+each `(partition, bucket)` to one writer before writing.
+
 ## Reading a Table
 
 Paimon Go uses a **scan-then-read** pattern: first scan the table to produce splits, then read data from those splits as Arrow RecordBatches.
@@ -284,7 +360,8 @@ pred, _ := pb.Eq("ts", paimon.Timestamp{Millis: 1700000000000, Nanos: 0})
 
 ## Resource Management
 
-All Paimon objects (`Catalog`, `Table`, `ReadBuilder`, `TableScan`, `Plan`, `TableRead`, `RecordBatchReader`) hold native resources and must be closed when no longer needed. Use `defer` to ensure cleanup:
+Paimon objects with a `Close` method hold native resources and must be closed.
+Use `defer` immediately after creation:
 
 ```go
 catalog, err := paimon.NewCatalog(opts)

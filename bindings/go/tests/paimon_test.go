@@ -23,16 +23,188 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	paimon "github.com/apache/paimon-rust/bindings/go"
 )
 
 type row struct {
 	id   int32
 	name string
+}
+
+type partitionedRow struct {
+	id   int32
+	name string
+	dt   string
+}
+
+func testWarehouse() string {
+	warehouse := os.Getenv("PAIMON_TEST_WAREHOUSE")
+	if warehouse == "" {
+		return "/tmp/paimon-warehouse"
+	}
+	return warehouse
+}
+
+func copyDirectory(source, target string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(target, info.Mode()); err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if entry.IsDir() {
+			if err := copyDirectory(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		input, err := os.Open(sourcePath)
+		if err != nil {
+			return err
+		}
+		output, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, entryInfo.Mode())
+		if err != nil {
+			input.Close()
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		inputCloseErr := input.Close()
+		outputCloseErr := output.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if inputCloseErr != nil {
+			return inputCloseErr
+		}
+		if outputCloseErr != nil {
+			return outputCloseErr
+		}
+	}
+	return nil
+}
+
+func openTableAt(t *testing.T, warehouse, tableName string) *paimon.Table {
+	t.Helper()
+
+	catalog, err := paimon.NewCatalog(map[string]string{
+		"warehouse": warehouse,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create catalog: %v", err)
+	}
+	t.Cleanup(func() { catalog.Close() })
+
+	table, err := catalog.GetTable(paimon.NewIdentifier("default", tableName))
+	if err != nil {
+		t.Fatalf("Failed to get table: %v", err)
+	}
+	t.Cleanup(func() { table.Close() })
+	return table
+}
+
+func openCopiedTestTable(t *testing.T) *paimon.Table {
+	return openCopiedTable(t, "simple_pk_table")
+}
+
+func openCopiedTable(t *testing.T, tableName string) *paimon.Table {
+	t.Helper()
+
+	warehouse := testWarehouse()
+	source := filepath.Join(warehouse, "default.db", tableName)
+	if _, err := os.Stat(source); os.IsNotExist(err) {
+		t.Skipf("Skipping: table %s does not exist (run 'make docker-up' first)", source)
+	}
+
+	targetWarehouse := t.TempDir()
+	target := filepath.Join(targetWarehouse, "default.db", tableName)
+	if err := copyDirectory(source, target); err != nil {
+		t.Fatalf("Failed to copy test table: %v", err)
+	}
+	return openTableAt(t, targetWarehouse, tableName)
+}
+
+func makeRecord(t *testing.T, rows []row) arrow.Record {
+	t.Helper()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+	idBuilder := builder.Field(0).(*array.Int32Builder)
+	nameBuilder := builder.Field(1).(*array.StringBuilder)
+	for _, value := range rows {
+		idBuilder.Append(value.id)
+		nameBuilder.Append(value.name)
+	}
+	return builder.NewRecord()
+}
+
+func makePartitionedRecord(t *testing.T, value partitionedRow) arrow.Record {
+	t.Helper()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+	builder.Field(0).(*array.Int32Builder).Append(value.id)
+	builder.Field(1).(*array.StringBuilder).Append(value.name)
+	builder.Field(2).(*array.StringBuilder).Append(value.dt)
+	return builder.NewRecord()
+}
+
+func makePartitionedBucketPlan(t *testing.T, partitions []string, totalBuckets int32) arrow.Record {
+	t.Helper()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "total_buckets", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+	}, nil)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+	partitionBuilder := builder.Field(0).(*array.StringBuilder)
+	countBuilder := builder.Field(1).(*array.Int32Builder)
+	for _, partition := range partitions {
+		partitionBuilder.Append(partition)
+		countBuilder.Append(totalBuckets)
+	}
+	return builder.NewRecord()
+}
+
+func readTableRows(t *testing.T, table *paimon.Table) []row {
+	t.Helper()
+	rb, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rb.Close()
+	return readRows(t, rb)
 }
 
 // readRows scans and reads all (id, name) rows from a ReadBuilder.
@@ -107,29 +279,218 @@ func readRows(t *testing.T, rb *paimon.ReadBuilder) []row {
 func openTestTable(t *testing.T) *paimon.Table {
 	t.Helper()
 
-	warehouse := os.Getenv("PAIMON_TEST_WAREHOUSE")
-	if warehouse == "" {
-		warehouse = "/tmp/paimon-warehouse"
-	}
+	warehouse := testWarehouse()
 	if _, err := os.Stat(warehouse); os.IsNotExist(err) {
 		t.Skipf("Skipping: warehouse %s does not exist (run 'make docker-up' first)", warehouse)
 	}
+	return openTableAt(t, warehouse, "simple_log_table")
+}
 
-	catalog, err := paimon.NewCatalog(map[string]string{
-		"warehouse": warehouse,
-	})
+func TestWriteCommitReadRoundTrip(t *testing.T) {
+	table := openCopiedTestTable(t)
+
+	builder, err := table.NewWriteBuilder()
 	if err != nil {
-		t.Fatalf("Failed to create catalog: %v", err)
+		t.Fatalf("Failed to create write builder: %v", err)
 	}
-	t.Cleanup(func() { catalog.Close() })
+	defer builder.Close()
 
-	table, err := catalog.GetTable(paimon.NewIdentifier("default", "simple_log_table"))
+	write, err := builder.NewWrite()
 	if err != nil {
-		t.Fatalf("Failed to get table: %v", err)
+		t.Fatalf("Failed to create table write: %v", err)
 	}
-	t.Cleanup(func() { table.Close() })
+	defer write.Close()
 
-	return table
+	record := makeRecord(t, []row{{4, "dave"}})
+	if err := write.WriteArrowBatch(record); err != nil {
+		record.Release()
+		t.Fatalf("Failed to write Arrow record batch: %v", err)
+	}
+	record.Release()
+
+	messages, err := write.PrepareCommit()
+	if err != nil {
+		t.Fatalf("Failed to prepare commit: %v", err)
+	}
+	defer messages.Close()
+
+	commit, err := builder.NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create table commit: %v", err)
+	}
+	defer commit.Close()
+	if err := commit.Commit(messages); err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	rows := readTableRows(t, table)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	expected := []row{{1, "alice"}, {2, "bob"}, {3, "carol"}, {4, "dave"}}
+	if len(rows) != len(expected) {
+		t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
+	}
+	for i := range expected {
+		if rows[i] != expected[i] {
+			t.Errorf("Row %d: expected %v, got %v", i, expected[i], rows[i])
+		}
+	}
+}
+
+func TestWriteMergeAndIdempotentCommit(t *testing.T) {
+	table := openCopiedTestTable(t)
+	const commitUser = "go-binding-distributed-write"
+
+	builder1, err := table.NewWriteBuilderWithCommitUser(commitUser)
+	if err != nil {
+		t.Fatalf("Failed to create first write builder: %v", err)
+	}
+	defer builder1.Close()
+	builder2, err := table.NewWriteBuilderWithCommitUser(commitUser)
+	if err != nil {
+		t.Fatalf("Failed to create second write builder: %v", err)
+	}
+	defer builder2.Close()
+
+	writeAndPrepare := func(builder *paimon.WriteBuilder, value row) *paimon.CommitMessages {
+		write, err := builder.NewWrite()
+		if err != nil {
+			t.Fatalf("Failed to create table write: %v", err)
+		}
+		defer write.Close()
+		record := makeRecord(t, []row{value})
+		if err := write.WriteArrowBatch(record); err != nil {
+			record.Release()
+			t.Fatalf("Failed to write Arrow record batch: %v", err)
+		}
+		record.Release()
+		messages, err := write.PrepareCommit()
+		if err != nil {
+			t.Fatalf("Failed to prepare commit: %v", err)
+		}
+		return messages
+	}
+
+	messages1 := writeAndPrepare(builder1, row{4, "dave"})
+	defer messages1.Close()
+	messages2 := writeAndPrepare(builder2, row{5, "eve"})
+	defer messages2.Close()
+	if err := messages1.Merge(messages2); err != nil {
+		t.Fatalf("Failed to merge commit messages: %v", err)
+	}
+
+	commit, err := builder1.NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create table commit: %v", err)
+	}
+	defer commit.Close()
+	if err := commit.CommitWithIdentifier(messages1, 7); err != nil {
+		t.Fatalf("Failed to commit with identifier: %v", err)
+	}
+
+	retryBuilder, err := table.NewWriteBuilderWithCommitUser(commitUser)
+	if err != nil {
+		t.Fatalf("Failed to create retry write builder: %v", err)
+	}
+	defer retryBuilder.Close()
+	retryCommit, err := retryBuilder.NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create retry table commit: %v", err)
+	}
+	defer retryCommit.Close()
+	if err := retryCommit.FilterAndCommitWithIdentifier(messages1, 7); err != nil {
+		t.Fatalf("Failed to retry commit idempotently: %v", err)
+	}
+
+	rows := readTableRows(t, table)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	expected := []row{{1, "alice"}, {2, "bob"}, {3, "carol"}, {4, "dave"}, {5, "eve"}}
+	if len(rows) != len(expected) {
+		t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
+	}
+	for i := range expected {
+		if rows[i] != expected[i] {
+			t.Errorf("Row %d: expected %v, got %v", i, expected[i], rows[i])
+		}
+	}
+}
+
+func TestDistributedPostponeFixedBucketWritersSharePlan(t *testing.T) {
+	table := openCopiedTable(t, "postpone_fixed_bucket_pk_table")
+	const commitUser = "go-postpone-fixed-bucket-write"
+
+	builders := make([]*paimon.PostponeFixedBucketWriteBuilder, 2)
+	for index := range builders {
+		builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser(commitUser)
+		if err != nil {
+			t.Fatalf("Failed to create fixed-bucket builder %d: %v", index, err)
+		}
+		builders[index] = builder
+		defer builder.Close()
+	}
+
+	if _, err := builders[0].NewWrite(); err == nil || !strings.Contains(err.Error(), "bucket plan is required") {
+		t.Fatalf("Expected missing bucket plan error, got: %v", err)
+	}
+	plan := makePartitionedBucketPlan(t, []string{"2026-08-14", "2026-08-15"}, 1)
+	for index, builder := range builders {
+		if err := builder.WithBucketPlan(plan); err != nil {
+			plan.Release()
+			t.Fatalf("Failed to set shared bucket plan on builder %d: %v", index, err)
+		}
+	}
+	plan.Release()
+
+	writeAndPrepare := func(
+		builder *paimon.PostponeFixedBucketWriteBuilder,
+		value partitionedRow,
+	) *paimon.PostponeFixedBucketCommitMessages {
+		write, err := builder.NewWrite()
+		if err != nil {
+			t.Fatalf("Failed to create fixed-bucket writer: %v", err)
+		}
+		defer write.Close()
+
+		record := makePartitionedRecord(t, value)
+		if err := write.WriteArrowBatch(record); err != nil {
+			record.Release()
+			t.Fatalf("Failed to write Arrow record batch: %v", err)
+		}
+		record.Release()
+		messages, err := write.PrepareCommit()
+		if err != nil {
+			t.Fatalf("Failed to prepare fixed-bucket commit: %v", err)
+		}
+		return messages
+	}
+
+	messages1 := writeAndPrepare(builders[0], partitionedRow{4, "dave", "2026-08-14"})
+	defer messages1.Close()
+	messages2 := writeAndPrepare(builders[1], partitionedRow{5, "eve", "2026-08-15"})
+	defer messages2.Close()
+	if err := messages1.Merge(messages2); err != nil {
+		t.Fatalf("Failed to merge fixed-bucket commit messages: %v", err)
+	}
+
+	commit, err := builders[0].NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create fixed-bucket table commit: %v", err)
+	}
+	defer commit.Close()
+	if err := commit.Commit(messages1); err != nil {
+		t.Fatalf("Failed to commit fixed-bucket write: %v", err)
+	}
+
+	rows := readTableRows(t, table)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	expected := []row{{4, "dave"}, {5, "eve"}}
+	if len(rows) != len(expected) {
+		t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
+	}
+	for index := range expected {
+		if rows[index] != expected[index] {
+			t.Errorf("Row %d: expected %v, got %v", index, expected[index], rows[index])
+		}
+	}
 }
 
 // TestReadLogTable reads the test table and verifies the data matches expected values.
