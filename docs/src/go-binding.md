@@ -19,7 +19,11 @@ under the License.
 
 # Go Integration
 
-The Go integration is a binding built on top of Apache Paimon Rust, allowing you to access Paimon tables from Go programs. It uses the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) for zero-copy data transfer.
+The Go integration is a binding built on top of Apache Paimon Rust, allowing you
+to access Paimon tables from Go programs. It uses the
+[Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)
+for data transfer. Writes copy Arrow buffers into C-owned memory because native
+writers may retain batches after the Go call returns.
 
 ## Prerequisites
 
@@ -121,8 +125,9 @@ support idempotent retries. Overwrite, truncate, and abort are also available.
 
 `NewPostponeFixedBucketWriteBuilder` writes real buckets for a `bucket = -2`
 table. Before `NewWrite`, provide a resolved Arrow plan containing the
-partition columns in table-schema order followed by a non-null Int32
-`total_buckets` column. An unpartitioned plan contains only `total_buckets`.
+partition columns in the table's partition-key order followed by a non-null
+Int32 `total_buckets` column. An unpartitioned plan contains only
+`total_buckets`.
 
 ```go
 builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser(commitUser)
@@ -147,6 +152,9 @@ Writing, preparing, and committing use the same flow as above, but return
 dedicated fixed-bucket types. The Go binding does not create the plan or shuffle
 rows. Distributed integrations must share one plan and commit user, and assign
 each `(partition, bucket)` to one writer before writing.
+
+`PostponeFixedBucketTableWrite` is single-use. After calling `PrepareCommit`,
+create a new writer with `builder.NewWrite()` for the next batch.
 
 ## Reading a Table
 

@@ -169,6 +169,7 @@ func (tw *PostponeFixedBucketTableWrite) WriteArrowBatch(record arrow.Record) er
 }
 
 // PrepareCommit closes current writers and returns fixed-bucket messages.
+// The writer is single-use; create a new writer for the next batch.
 func (tw *PostponeFixedBucketTableWrite) PrepareCommit() (*PostponeFixedBucketCommitMessages, error) {
 	if tw.inner == nil {
 		return nil, ErrClosed
