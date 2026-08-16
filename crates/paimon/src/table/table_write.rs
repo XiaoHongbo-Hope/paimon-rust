@@ -1083,6 +1083,7 @@ pub(in crate::table) mod tests {
             .column("id", DataType::Int(IntType::new()))
             .column("payload", DataType::Blob(BlobType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
