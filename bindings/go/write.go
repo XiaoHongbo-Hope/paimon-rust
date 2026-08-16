@@ -21,7 +21,6 @@ package paimon
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"unsafe"
 
@@ -255,18 +254,20 @@ func (tc *TableCommit) CommitWithIdentifier(messages *CommitMessages, commitIden
 }
 
 // FilterAndCommitWithIdentifier skips messages already committed under
-// commitIdentifier, making retries idempotent. Unsupported in overwrite mode.
+// commitIdentifier, making retries idempotent. Identifier commits always
+// filter in overwrite mode.
 func (tc *TableCommit) FilterAndCommitWithIdentifier(
 	messages *CommitMessages,
 	commitIdentifier int64,
 ) error {
+	operation := ffiTableCommitFilterAndCommitWithIdentifier.symbol(tc.ctx)
 	if tc.overwrite {
-		return errors.New("paimon: filtered retry is not supported in overwrite mode")
+		operation = ffiTableCommitOverwriteWithIdentifier.symbol(tc.ctx)
 	}
 	return tc.withMessagesAndIdentifier(
 		messages,
 		commitIdentifier,
-		ffiTableCommitFilterAndCommitWithIdentifier.symbol(tc.ctx),
+		operation,
 	)
 }
 

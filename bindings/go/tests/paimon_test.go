@@ -341,53 +341,133 @@ func TestWriteOverwriteUsesBuilderMode(t *testing.T) {
 	}
 }
 
-func TestOverwriteRejectsFilteredRetry(t *testing.T) {
-	table := openCopiedTestTable(t)
+func TestOverwriteRetrySameIdentifierIsIdempotent(t *testing.T) {
+	warehouse := testWarehouse()
+	source := filepath.Join(warehouse, "default.db", "simple_pk_table")
+	if _, err := os.Stat(source); os.IsNotExist(err) {
+		t.Skipf("Skipping: table %s does not exist (run 'make docker-up' first)", source)
+	}
+	targetWarehouse := t.TempDir()
+	target := filepath.Join(targetWarehouse, "default.db", "simple_pk_table")
+	if err := copyDirectory(source, target); err != nil {
+		t.Fatalf("Failed to copy test table: %v", err)
+	}
+	table := openTableAt(t, targetWarehouse, "simple_pk_table")
 
-	builder, err := table.NewWriteBuilder()
-	if err != nil {
-		t.Fatalf("Failed to create write builder: %v", err)
-	}
-	defer builder.Close()
-	if err := builder.WithOverwrite(); err != nil {
-		t.Fatalf("Failed to enable overwrite: %v", err)
+	countSnapshots := func() int {
+		entries, err := os.ReadDir(filepath.Join(target, "snapshot"))
+		if err != nil {
+			t.Fatalf("Failed to list snapshots: %v", err)
+		}
+		count := 0
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "snapshot-") {
+				count++
+			}
+		}
+		return count
 	}
 
-	write, err := builder.NewWrite()
-	if err != nil {
-		t.Fatalf("Failed to create table write: %v", err)
-	}
-	defer write.Close()
-	record := makeRecord(t, []row{{4, "dave"}})
-	if err := write.WriteArrowBatch(record); err != nil {
+	const commitUser = "go-binding-overwrite-retry"
+	overwriteAndPrepare := func() (*paimon.WriteBuilder, *paimon.CommitMessages) {
+		builder, err := table.NewWriteBuilderWithCommitUser(commitUser)
+		if err != nil {
+			t.Fatalf("Failed to create write builder: %v", err)
+		}
+		t.Cleanup(builder.Close)
+		if err := builder.WithOverwrite(); err != nil {
+			t.Fatalf("Failed to enable overwrite: %v", err)
+		}
+		write, err := builder.NewWrite()
+		if err != nil {
+			t.Fatalf("Failed to create table write: %v", err)
+		}
+		defer write.Close()
+		record := makeRecord(t, []row{{4, "dave"}})
+		if err := write.WriteArrowBatch(record); err != nil {
+			record.Release()
+			t.Fatalf("Failed to write Arrow record batch: %v", err)
+		}
 		record.Release()
-		t.Fatalf("Failed to write Arrow record batch: %v", err)
+		messages, err := write.PrepareCommit()
+		if err != nil {
+			t.Fatalf("Failed to prepare commit: %v", err)
+		}
+		t.Cleanup(messages.Close)
+		return builder, messages
 	}
-	record.Release()
 
-	messages, err := write.PrepareCommit()
-	if err != nil {
-		t.Fatalf("Failed to prepare commit: %v", err)
-	}
-	defer messages.Close()
+	builder, messages := overwriteAndPrepare()
 	commit, err := builder.NewCommit()
 	if err != nil {
 		t.Fatalf("Failed to create table commit: %v", err)
 	}
 	defer commit.Close()
-
-	err = commit.FilterAndCommitWithIdentifier(messages, 7)
-	if err == nil || !strings.Contains(err.Error(), "overwrite") {
-		t.Fatalf("Expected overwrite filtered-retry rejection, got %v", err)
-	}
 	if err := commit.CommitWithIdentifier(messages, 7); err != nil {
 		t.Fatalf("Failed to overwrite with identifier: %v", err)
 	}
 
+	appendBuilder, err := table.NewWriteBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create append write builder: %v", err)
+	}
+	defer appendBuilder.Close()
+	appendWrite, err := appendBuilder.NewWrite()
+	if err != nil {
+		t.Fatalf("Failed to create append table write: %v", err)
+	}
+	defer appendWrite.Close()
+	record := makeRecord(t, []row{{5, "eve"}})
+	if err := appendWrite.WriteArrowBatch(record); err != nil {
+		record.Release()
+		t.Fatalf("Failed to write append batch: %v", err)
+	}
+	record.Release()
+	appendMessages, err := appendWrite.PrepareCommit()
+	if err != nil {
+		t.Fatalf("Failed to prepare append commit: %v", err)
+	}
+	defer appendMessages.Close()
+	appendCommit, err := appendBuilder.NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create append table commit: %v", err)
+	}
+	defer appendCommit.Close()
+	if err := appendCommit.Commit(appendMessages); err != nil {
+		t.Fatalf("Failed to append: %v", err)
+	}
+	snapshotsBeforeRetry := countSnapshots()
+
+	retryBuilder, err := table.NewWriteBuilderWithCommitUser(commitUser)
+	if err != nil {
+		t.Fatalf("Failed to create retry write builder: %v", err)
+	}
+	defer retryBuilder.Close()
+	if err := retryBuilder.WithOverwrite(); err != nil {
+		t.Fatalf("Failed to enable overwrite on retry builder: %v", err)
+	}
+	retryCommit, err := retryBuilder.NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create retry table commit: %v", err)
+	}
+	defer retryCommit.Close()
+	if err := retryCommit.FilterAndCommitWithIdentifier(messages, 7); err != nil {
+		t.Fatalf("Failed to retry overwrite idempotently: %v", err)
+	}
+
+	if got := countSnapshots(); got != snapshotsBeforeRetry {
+		t.Fatalf("Retry added snapshots: %d != %d", got, snapshotsBeforeRetry)
+	}
 	rows := readTableRows(t, table)
-	expected := []row{{4, "dave"}}
-	if len(rows) != len(expected) || rows[0] != expected[0] {
-		t.Fatalf("Expected %v after overwrite, got %v", expected, rows)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	expected := []row{{4, "dave"}, {5, "eve"}}
+	if len(rows) != len(expected) {
+		t.Fatalf("Expected %v after retry, got %v", expected, rows)
+	}
+	for i := range expected {
+		if rows[i] != expected[i] {
+			t.Errorf("Row %d: expected %v, got %v", i, expected[i], rows[i])
+		}
 	}
 }
 
