@@ -31,10 +31,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory/mallocator"
 )
 
-// cloneRecordToCMemory makes the Arrow buffers safe for the native writer to
-// retain after the FFI call returns. Arrow's default Go allocator may move or
-// reclaim its buffers once a cgo call ends, while postpone writes deliberately
-// hold record batches until PrepareCommit.
+// cloneRecordToCMemory copies Arrow buffers into C-owned memory so native
+// writers can retain record batches until PrepareCommit.
 func cloneRecordToCMemory(record arrow.Record) (arrow.Record, error) {
 	allocator := mallocator.NewMallocator()
 	columns := make([]arrow.Array, record.NumCols())
