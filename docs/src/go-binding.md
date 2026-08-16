@@ -116,7 +116,8 @@ if err := commit.Commit(messages); err != nil {
 ```
 
 Call `WriteArrowBatch` multiple times before `PrepareCommit`. `WithOverwrite`
-replaces the partitions touched by the batch. Multiple writers in one process
+replaces the partitions touched by the batch; filtered identifier retries are
+append-only and return an error in overwrite mode. Multiple writers in one process
 must share a commit user and merge their messages. Commit messages are
 process-local and cannot be sent to another process. For primary-key
 fixed-bucket tables, assign each `(partition, bucket)` to one writer before

@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -331,6 +332,56 @@ func TestWriteOverwriteUsesBuilderMode(t *testing.T) {
 	defer commit.Close()
 	if err := commit.Commit(messages); err != nil {
 		t.Fatalf("Failed to overwrite: %v", err)
+	}
+
+	rows := readTableRows(t, table)
+	expected := []row{{4, "dave"}}
+	if len(rows) != len(expected) || rows[0] != expected[0] {
+		t.Fatalf("Expected %v after overwrite, got %v", expected, rows)
+	}
+}
+
+func TestOverwriteRejectsFilteredRetry(t *testing.T) {
+	table := openCopiedTestTable(t)
+
+	builder, err := table.NewWriteBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create write builder: %v", err)
+	}
+	defer builder.Close()
+	if err := builder.WithOverwrite(); err != nil {
+		t.Fatalf("Failed to enable overwrite: %v", err)
+	}
+
+	write, err := builder.NewWrite()
+	if err != nil {
+		t.Fatalf("Failed to create table write: %v", err)
+	}
+	defer write.Close()
+	record := makeRecord(t, []row{{4, "dave"}})
+	if err := write.WriteArrowBatch(record); err != nil {
+		record.Release()
+		t.Fatalf("Failed to write Arrow record batch: %v", err)
+	}
+	record.Release()
+
+	messages, err := write.PrepareCommit()
+	if err != nil {
+		t.Fatalf("Failed to prepare commit: %v", err)
+	}
+	defer messages.Close()
+	commit, err := builder.NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create table commit: %v", err)
+	}
+	defer commit.Close()
+
+	err = commit.FilterAndCommitWithIdentifier(messages, 7)
+	if err == nil || !strings.Contains(err.Error(), "overwrite") {
+		t.Fatalf("Expected overwrite filtered-retry rejection, got %v", err)
+	}
+	if err := commit.CommitWithIdentifier(messages, 7); err != nil {
+		t.Fatalf("Failed to overwrite with identifier: %v", err)
 	}
 
 	rows := readTableRows(t, table)

@@ -21,6 +21,7 @@ package paimon
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"unsafe"
 
@@ -28,8 +29,6 @@ import (
 )
 
 // WriteBuilder creates writers and committers that share one commit identity.
-// Writers whose messages are combined into one logical commit must use builders
-// created with the same caller-provided commit user.
 type WriteBuilder struct {
 	ctx       context.Context
 	lib       *libRef
@@ -38,8 +37,7 @@ type WriteBuilder struct {
 	closeOnce sync.Once
 }
 
-// NewWriteBuilder creates a write builder with an automatically generated
-// commit identity.
+// NewWriteBuilder creates a write builder with a generated commit identity.
 func (t *Table) NewWriteBuilder() (*WriteBuilder, error) {
 	if t.inner == nil {
 		return nil, ErrClosed
@@ -53,9 +51,7 @@ func (t *Table) NewWriteBuilder() (*WriteBuilder, error) {
 }
 
 // NewWriteBuilderWithCommitUser creates a write builder with a stable commit
-// identity. Use the same commitUser for multiple writers in one process whose
-// messages will be merged, or when retrying a commit with an identifier. For
-// fixed-bucket primary-key tables, assign each partition and bucket to one writer.
+// identity for merging messages across writers and for identifier retries.
 func (t *Table) NewWriteBuilderWithCommitUser(commitUser string) (*WriteBuilder, error) {
 	if t.inner == nil {
 		return nil, ErrClosed
@@ -77,8 +73,7 @@ func (wb *WriteBuilder) Close() {
 	})
 }
 
-// WithOverwrite enables overwrite mode for writers and committers created by
-// this builder.
+// WithOverwrite enables overwrite mode for this builder's writers and committers.
 func (wb *WriteBuilder) WithOverwrite() error {
 	if wb.inner == nil {
 		return ErrClosed
@@ -134,8 +129,8 @@ func (tw *TableWrite) Close() {
 	})
 }
 
-// WriteArrowBatch writes one Arrow record batch. Its field count, order, names,
-// and types must match the table schema. The record remains owned by the caller.
+// WriteArrowBatch writes one record batch whose schema must match the table
+// schema. The record remains owned by the caller.
 func (tw *TableWrite) WriteArrowBatch(record arrow.Record) error {
 	if tw.inner == nil {
 		return ErrClosed
@@ -149,8 +144,7 @@ func (tw *TableWrite) WriteArrowBatch(record arrow.Record) error {
 	)
 }
 
-// PrepareCommit closes the current file writers and returns opaque commit
-// messages. The writer can be reused for another round of writes afterwards.
+// PrepareCommit returns pending writes as commit messages; the writer can be reused.
 func (tw *TableWrite) PrepareCommit() (*CommitMessages, error) {
 	if tw.inner == nil {
 		return nil, ErrClosed
@@ -181,10 +175,8 @@ func (m *CommitMessages) Close() {
 	})
 }
 
-// Merge appends a copy of source's messages to this handle. Both handles must
-// belong to the same process, remain valid, and be closed separately. They must
-// share a table and commit user. Merging does not establish fixed-bucket
-// primary-key ownership.
+// Merge appends a copy of source's messages; both handles stay valid and must
+// share a table and commit user. It does not establish fixed-bucket ownership.
 func (m *CommitMessages) Merge(source *CommitMessages) error {
 	if m.inner == nil {
 		return ErrClosed
@@ -249,8 +241,7 @@ func (tc *TableCommit) Commit(messages *CommitMessages) error {
 	return tc.withMessages(messages, operation)
 }
 
-// CommitWithIdentifier commits with a caller-provided monotonically increasing
-// identifier.
+// CommitWithIdentifier commits with a monotonically increasing identifier.
 func (tc *TableCommit) CommitWithIdentifier(messages *CommitMessages, commitIdentifier int64) error {
 	operation := ffiTableCommitCommitWithIdentifier.symbol(tc.ctx)
 	if tc.overwrite {
@@ -263,19 +254,19 @@ func (tc *TableCommit) CommitWithIdentifier(messages *CommitMessages, commitIden
 	)
 }
 
-// FilterAndCommitWithIdentifier makes a retry idempotent.
+// FilterAndCommitWithIdentifier skips messages already committed under
+// commitIdentifier, making retries idempotent. Unsupported in overwrite mode.
 func (tc *TableCommit) FilterAndCommitWithIdentifier(
 	messages *CommitMessages,
 	commitIdentifier int64,
 ) error {
-	operation := ffiTableCommitFilterAndCommitWithIdentifier.symbol(tc.ctx)
 	if tc.overwrite {
-		operation = ffiTableCommitOverwriteWithIdentifier.symbol(tc.ctx)
+		return errors.New("paimon: filtered retry is not supported in overwrite mode")
 	}
 	return tc.withMessagesAndIdentifier(
 		messages,
 		commitIdentifier,
-		operation,
+		ffiTableCommitFilterAndCommitWithIdentifier.symbol(tc.ctx),
 	)
 }
 
@@ -287,8 +278,7 @@ func (tc *TableCommit) TruncateTable() error {
 	return ffiTableCommitTruncateTable.symbol(tc.ctx)(tc.inner)
 }
 
-// TruncateTableWithIdentifier removes all table data with a stable commit
-// identifier.
+// TruncateTableWithIdentifier truncates with a stable commit identifier.
 func (tc *TableCommit) TruncateTableWithIdentifier(commitIdentifier int64) error {
 	if tc.inner == nil {
 		return ErrClosed
