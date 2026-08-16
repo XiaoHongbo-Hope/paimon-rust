@@ -70,6 +70,8 @@ func withOwnedArrowRecord(
 	var array cdata.CArrowArray
 	var schema cdata.CArrowSchema
 	cdata.ExportArrowRecordBatch(owned, &array, &schema)
+	// The native side imports via from_raw, marking these released
+	// (release = NULL); the defers only fire if an error skips the import.
 	defer cdata.ReleaseCArrowArray(&array)
 	defer cdata.ReleaseCArrowSchema(&schema)
 
