@@ -383,7 +383,7 @@ func TestWriteOverwriteUsesBuilderMode(t *testing.T) {
 
 func TestAppendOnlyWriteMergeAndIdempotentCommit(t *testing.T) {
 	table := openCopiedTable(t, "simple_log_table")
-	const commitUser = "go-binding-distributed-write"
+	const commitUser = "go-binding-multiple-writers"
 
 	builder1, err := table.NewWriteBuilderWithCommitUser(commitUser)
 	if err != nil {
@@ -459,7 +459,7 @@ func TestAppendOnlyWriteMergeAndIdempotentCommit(t *testing.T) {
 	}
 }
 
-func TestDistributedPostponeFixedBucketWritersSharePlan(t *testing.T) {
+func TestMultiplePostponeFixedBucketWritersSharePlan(t *testing.T) {
 	table := openCopiedTable(t, "postpone_fixed_bucket_pk_table")
 	const commitUser = "go-postpone-fixed-bucket-write"
 

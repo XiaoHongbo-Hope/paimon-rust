@@ -126,10 +126,12 @@ if err := commit.Commit(messages); err != nil {
 ```
 
 Call `WriteArrowBatch` multiple times before `PrepareCommit` to write multiple
-batches. Use `WithOverwrite` before `NewWrite` for overwrite mode. Distributed
-writers must use the same commit user and merge their messages. For
-primary-key fixed-bucket tables, route each `(partition, bucket)` to one writer;
-merging messages does not establish ownership.
+batches. Use `WithOverwrite` before `NewWrite` for overwrite mode. Multiple
+writers in one process must use the same commit user and merge their messages.
+`CommitMessages` are process-local native handles and cannot be serialized or
+transferred to another process for coordinator aggregation. For primary-key
+fixed-bucket tables, route each `(partition, bucket)` to one writer; merging
+messages does not establish ownership.
 
 ### Postpone Fixed-Bucket Writes
 
@@ -207,10 +209,10 @@ func writePostponeFixedBuckets(table *paimon.Table, record arrow.Record) {
 
 Plan columns are the table partition keys in partition-key order, followed by a
 non-null Int32 `total_buckets`; an unpartitioned plan contains only
-`total_buckets`. The Go binding does not calculate this plan. Distributed
-writers must share the plan and commit user, and route each `(partition,
-bucket)` to one writer. After `PrepareCommit`, call `builder.NewWrite()` for the
-next batch.
+`total_buckets`. The Go binding does not calculate this plan. Multiple writers
+in one process must share the plan and commit user, and route each `(partition,
+bucket)` to one writer. Cross-process commit-message aggregation is not
+supported. After `PrepareCommit`, call `builder.NewWrite()` for the next batch.
 
 ## Reading a Table
 

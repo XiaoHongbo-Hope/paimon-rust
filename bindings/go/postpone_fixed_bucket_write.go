@@ -183,7 +183,8 @@ func (tw *PostponeFixedBucketTableWrite) PrepareCommit() (*PostponeFixedBucketCo
 }
 
 // PostponeFixedBucketCommitMessages contains files produced by fixed-bucket
-// writers. It cannot be passed to a standard TableCommit.
+// writers. It is a process-local native handle and cannot be transferred
+// between processes or passed to a standard TableCommit.
 type PostponeFixedBucketCommitMessages struct {
 	ctx       context.Context
 	lib       *libRef
@@ -200,8 +201,9 @@ func (m *PostponeFixedBucketCommitMessages) Close() {
 	})
 }
 
-// Merge appends a copy of source's messages. Both builders must use the same
-// table, commit user, and overwrite mode.
+// Merge appends a copy of source's messages. Both handles must belong to the
+// same process, and both builders must use the same table, commit user, and
+// overwrite mode.
 func (m *PostponeFixedBucketCommitMessages) Merge(
 	source *PostponeFixedBucketCommitMessages,
 ) error {

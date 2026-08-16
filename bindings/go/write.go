@@ -53,8 +53,8 @@ func (t *Table) NewWriteBuilder() (*WriteBuilder, error) {
 }
 
 // NewWriteBuilderWithCommitUser creates a write builder with a stable commit
-// identity. Use the same commitUser for distributed writers whose messages will
-// be merged into one commit, or when retrying a commit with an identifier. For
+// identity. Use the same commitUser for multiple writers in one process whose
+// messages will be merged, or when retrying a commit with an identifier. For
 // fixed-bucket primary-key tables, assign each partition and bucket to one writer.
 func (t *Table) NewWriteBuilderWithCommitUser(commitUser string) (*WriteBuilder, error) {
 	if t.inner == nil {
@@ -163,7 +163,8 @@ func (tw *TableWrite) PrepareCommit() (*CommitMessages, error) {
 	return &CommitMessages{ctx: tw.ctx, lib: tw.lib, inner: inner}, nil
 }
 
-// CommitMessages contains the files produced by one or more writers.
+// CommitMessages contains the files produced by one or more writers. It is a
+// process-local native handle and cannot be transferred between processes.
 type CommitMessages struct {
 	ctx       context.Context
 	lib       *libRef
@@ -180,9 +181,10 @@ func (m *CommitMessages) Close() {
 	})
 }
 
-// Merge appends a copy of source's messages to this handle. Both handles remain
-// valid and must be closed separately. They must share a table and commit user.
-// Merging does not establish fixed-bucket primary-key ownership.
+// Merge appends a copy of source's messages to this handle. Both handles must
+// belong to the same process, remain valid, and be closed separately. They must
+// share a table and commit user. Merging does not establish fixed-bucket
+// primary-key ownership.
 func (m *CommitMessages) Merge(source *CommitMessages) error {
 	if m.inner == nil {
 		return ErrClosed
