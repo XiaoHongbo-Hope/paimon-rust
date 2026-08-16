@@ -2239,6 +2239,7 @@ pub(in crate::table) mod tests {
             .column("a", DataType::Int(IntType::new()))
             .column("b", DataType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         let table = Table::new(
