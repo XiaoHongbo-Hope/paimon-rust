@@ -28,6 +28,7 @@ writers may retain batches after the Go call returns.
 ## Prerequisites
 
 - Go 1.22.4 or later
+- CGO enabled with a C toolchain
 - Supported platforms: Linux (amd64, arm64), macOS (amd64, arm64)
 
 ## Installation
@@ -36,7 +37,17 @@ writers may retain batches after the Go call returns.
 go get github.com/apache/paimon-rust/bindings/go
 ```
 
-The pre-built native library is embedded in the package and automatically loaded at runtime — no manual build step is needed.
+The native library is embedded and loaded automatically. Build with
+`CGO_ENABLED=1`.
+
+For an unpacked offline package, keep the whole directory inside the project
+build context and point `go.mod` to it:
+
+```mod
+require github.com/apache/paimon-rust/bindings/go v0.0.0
+
+replace github.com/apache/paimon-rust/bindings/go => ./third_party/paimon-go
+```
 
 ## Creating a Catalog
 
@@ -78,10 +89,8 @@ catalog, err := paimon.NewCatalog(map[string]string{
 
 ## Writing a Table
 
-Use `NewWriteBuilder` for ordinary tables, including fixed-bucket tables. For
-`bucket = -2` tables, it retains postpone semantics and writes bucket `-2`
-files. Input `arrow.Record` batches must match the table schema. Create the
-writer and committer from the same builder.
+Use `NewWriteBuilder` for ordinary and fixed-bucket tables. The `arrow.Record`
+schema must match the table schema.
 
 ```go
 builder, err := table.NewWriteBuilder()
@@ -116,49 +125,92 @@ if err := commit.Commit(messages); err != nil {
 }
 ```
 
-`TableWrite` accepts multiple batches before `PrepareCommit`. For distributed
-append-only writes, create every builder with `NewWriteBuilderWithCommitUser`
-and the same commit user, then merge their `CommitMessages`. Distributed
-fixed-bucket primary-key writes must also assign each `(partition, bucket)` to
-one writer before writing; sharing a commit user and merging messages does not
-establish bucket ownership. Identifier-based methods support idempotent retries.
-`WithOverwrite` makes `Commit` use overwrite mode. Truncate and abort are also
-available.
+Call `WriteArrowBatch` multiple times before `PrepareCommit` to write multiple
+batches. Use `WithOverwrite` before `NewWrite` for overwrite mode. Distributed
+writers must use the same commit user and merge their messages. For
+primary-key fixed-bucket tables, route each `(partition, bucket)` to one writer;
+merging messages does not establish ownership.
 
 ### Postpone Fixed-Bucket Writes
 
-`NewPostponeFixedBucketWriteBuilder` writes real buckets for a `bucket = -2`
-table. Before `NewWrite`, provide a resolved Arrow plan containing the
-partition columns in the table's partition-key order followed by a non-null
-Int32 `total_buckets` column. An unpartitioned plan contains only
-`total_buckets`.
+For a `bucket = -2` table, the ordinary builder writes postpone files. To write
+real buckets directly, use the dedicated builder and provide a plan mapping
+each partition to its bucket count. This example plans two `dt` partitions with
+one bucket each:
 
 ```go
-builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser(commitUser)
-if err != nil {
-    log.Fatal(err)
-}
-defer builder.Close()
+import (
+    "log"
 
-if err := builder.WithBucketPlan(bucketPlan); err != nil {
-    log.Fatal(err)
+    "github.com/apache/arrow-go/v18/arrow"
+    "github.com/apache/arrow-go/v18/arrow/array"
+    "github.com/apache/arrow-go/v18/arrow/memory"
+    paimon "github.com/apache/paimon-rust/bindings/go"
+)
+
+func newBucketPlan(partitions []string, totalBuckets int32) arrow.Record {
+    schema := arrow.NewSchema([]arrow.Field{
+        {Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+        {Name: "total_buckets", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+    }, nil)
+    builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+    defer builder.Release()
+
+    partitionBuilder := builder.Field(0).(*array.StringBuilder)
+    bucketBuilder := builder.Field(1).(*array.Int32Builder)
+    for _, partition := range partitions {
+        partitionBuilder.Append(partition)
+        bucketBuilder.Append(totalBuckets)
+    }
+    return builder.NewRecord()
 }
 
-writer, err := builder.NewWrite()
-if err != nil {
-    log.Fatal(err)
-}
-defer writer.Close()
+func writePostponeFixedBuckets(table *paimon.Table, record arrow.Record) {
+    const commitUser = "my-fixed-bucket-job"
+    builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser(commitUser)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer builder.Close()
 
+    plan := newBucketPlan([]string{"2026-08-14", "2026-08-15"}, 1)
+    defer plan.Release()
+    if err := builder.WithBucketPlan(plan); err != nil {
+        log.Fatal(err)
+    }
+
+    writer, err := builder.NewWrite()
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer writer.Close()
+
+    if err := writer.WriteArrowBatch(record); err != nil {
+        log.Fatal(err)
+    }
+    messages, err := writer.PrepareCommit()
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer messages.Close()
+
+    commit, err := builder.NewCommit()
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer commit.Close()
+    if err := commit.Commit(messages); err != nil {
+        log.Fatal(err)
+    }
+}
 ```
 
-Writing, preparing, and committing use the same flow as above, but return
-dedicated fixed-bucket types. The Go binding does not create the plan or shuffle
-rows. Distributed integrations must share one plan and commit user, and assign
-each `(partition, bucket)` to one writer before writing.
-
-`PostponeFixedBucketTableWrite` is single-use. After calling `PrepareCommit`,
-create a new writer with `builder.NewWrite()` for the next batch.
+Plan columns are the table partition keys in partition-key order, followed by a
+non-null Int32 `total_buckets`; an unpartitioned plan contains only
+`total_buckets`. The Go binding does not calculate this plan. Distributed
+writers must share the plan and commit user, and route each `(partition,
+bucket)` to one writer. After `PrepareCommit`, call `builder.NewWrite()` for the
+next batch.
 
 ## Reading a Table
 
