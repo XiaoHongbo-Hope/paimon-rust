@@ -575,7 +575,7 @@ fn data_evolution_predicate_must_match(
 /// the same group while preserving their input order. Files without `first_row_id` become
 /// their own group.
 ///
-/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
+/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/DataEvolutionSplitGenerator.java)
 pub(crate) fn group_by_overlapping_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
     let mut indexed_files: Vec<(usize, DataFileMeta)> = files.into_iter().enumerate().collect();
     indexed_files.sort_by(|(a_index, a), (b_index, b)| {
