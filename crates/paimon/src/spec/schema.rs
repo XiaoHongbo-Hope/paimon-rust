@@ -1157,7 +1157,7 @@ impl Schema {
     ) -> crate::Result<()> {
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, primary_keys, options)?;
-        Self::validate_row_tracking(options)?;
+        Self::validate_row_tracking(primary_keys, options)?;
         Self::validate_blob_fields(fields, partition_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
         PartialUpdateConfig::new(options).validate_create_mode(!primary_keys.is_empty())?;
@@ -1176,12 +1176,38 @@ impl Schema {
         Ok(())
     }
 
-    fn validate_row_tracking(options: &HashMap<String, String>) -> crate::Result<()> {
+    fn validate_row_tracking(
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
         let core_options = CoreOptions::new(options);
-        if core_options.data_evolution_enabled() && !core_options.row_tracking_enabled() {
-            return Err(crate::Error::ConfigInvalid {
-                message: "Data evolution config must enabled with row-tracking.enabled".to_string(),
-            });
+        if core_options.row_tracking_enabled() {
+            if !primary_keys.is_empty() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "Cannot define primary-key for row tracking table.".to_string(),
+                });
+            }
+            if core_options.bucket() != -1 {
+                return Err(crate::Error::ConfigInvalid {
+                    message:
+                        "Cannot define bucket for row tracking table, it only support bucket = -1"
+                            .to_string(),
+                });
+            }
+        }
+        if core_options.data_evolution_enabled() {
+            if !core_options.row_tracking_enabled() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "Data evolution config must enabled with row-tracking.enabled"
+                        .to_string(),
+                });
+            }
+            if core_options.clustering_incremental_enabled() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "Data evolution config must disabled with clustering.incremental"
+                        .to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -2527,6 +2553,52 @@ mod tests {
             .unwrap();
         assert_eq!(schema.partition_keys(), &["a"]);
         assert_eq!(schema.primary_keys(), &["a", "b"]);
+    }
+
+    #[test]
+    fn test_row_tracking_rejects_primary_key_and_bucket() {
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(vec!["id".to_string()])
+                .option("row-tracking.enabled", "true")
+                .build(),
+            "primary-key",
+        );
+
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("bucket", "1")
+                .build(),
+            "bucket = -1",
+        );
+
+        // Combination reported in review: PK + bucket=1 + row tracking + DE.
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(vec!["id".to_string()])
+                .option("bucket", "1")
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build(),
+            "row tracking",
+        );
+    }
+
+    #[test]
+    fn test_data_evolution_rejects_incremental_clustering() {
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .option("clustering.incremental", "true")
+                .build(),
+            "clustering.incremental",
+        );
     }
 
     #[test]
