@@ -223,10 +223,6 @@ type paimonWriteBuilder struct{}
 type paimonTableWrite struct{}
 type paimonTableCommit struct{}
 type paimonCommitMessages struct{}
-type paimonPostponeFixedBucketWriteBuilder struct{}
-type paimonPostponeFixedBucketTableWrite struct{}
-type paimonPostponeFixedBucketTableCommit struct{}
-type paimonPostponeFixedBucketCommitMessages struct{}
 
 // Result types matching the C repr structs
 type resultCatalogNew struct {
@@ -291,26 +287,6 @@ type resultTableCommit struct {
 
 type resultPrepareCommit struct {
 	messages *paimonCommitMessages
-	error    *paimonError
-}
-
-type resultPostponeFixedBucketWriteBuilder struct {
-	writeBuilder *paimonPostponeFixedBucketWriteBuilder
-	error        *paimonError
-}
-
-type resultPostponeFixedBucketTableWrite struct {
-	write *paimonPostponeFixedBucketTableWrite
-	error *paimonError
-}
-
-type resultPostponeFixedBucketTableCommit struct {
-	commit *paimonPostponeFixedBucketTableCommit
-	error  *paimonError
-}
-
-type resultPostponeFixedBucketPrepareCommit struct {
-	messages *paimonPostponeFixedBucketCommitMessages
 	error    *paimonError
 }
 
