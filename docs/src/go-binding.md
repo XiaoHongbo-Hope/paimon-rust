@@ -157,10 +157,27 @@ if err != nil {
     log.Fatal(err)
 }
 defer writer.Close()
+
+if err := writer.WriteArrowBatch(record); err != nil {
+    log.Fatal(err)
+}
+messages, err := writer.PrepareCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer messages.Close()
+
+commit, err := builder.NewCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer commit.Close()
+if err := commit.Commit(messages); err != nil {
+    log.Fatal(err)
+}
 ```
 
-Write, prepare, and commit follow the lifecycle above. An unpartitioned plan
-holds only `total_buckets`. Multiple writers in one process must share the plan
+An unpartitioned plan holds only `total_buckets`. Multiple writers in one process must share the plan
 and commit user and assign each `(partition, bucket)` to one writer. Commit
 messages are process-local. A fixed-bucket writer is single-use; create a new
 writer after `PrepareCommit`.
