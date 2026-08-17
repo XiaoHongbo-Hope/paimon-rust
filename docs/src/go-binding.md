@@ -128,29 +128,20 @@ writing; merging messages does not establish ownership.
 ### Postpone Fixed-Bucket Writes
 
 For a `bucket = -2` table, the ordinary builder writes postpone files. To write
-real buckets directly, use the dedicated builder and provide a plan mapping
-each partition to its bucket count. This example plans two `dt` partitions with
-one bucket each:
+real buckets directly, use the dedicated builder with a plan mapping each
+partition to its bucket count:
 
 ```go
-func newBucketPlan(partitions []string, totalBuckets int32) arrow.Record {
-    schema := arrow.NewSchema([]arrow.Field{
-        {Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
-        {Name: "total_buckets", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
-    }, nil)
-    builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
-    defer builder.Release()
-
-    partitionBuilder := builder.Field(0).(*array.StringBuilder)
-    bucketBuilder := builder.Field(1).(*array.Int32Builder)
-    for _, partition := range partitions {
-        partitionBuilder.Append(partition)
-        bucketBuilder.Append(totalBuckets)
-    }
-    return builder.NewRecord()
-}
-
-plan := newBucketPlan([]string{"2026-08-14", "2026-08-15"}, 1)
+// Plan schema: partition keys in order, then a non-null Int32 total_buckets.
+schema := arrow.NewSchema([]arrow.Field{
+    {Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+    {Name: "total_buckets", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+}, nil)
+rb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+defer rb.Release()
+rb.Field(0).(*array.StringBuilder).AppendValues([]string{"2026-08-14", "2026-08-15"}, nil)
+rb.Field(1).(*array.Int32Builder).AppendValues([]int32{1, 1}, nil)
+plan := rb.NewRecord()
 defer plan.Release()
 
 builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser("job-1")
@@ -161,21 +152,18 @@ defer builder.Close()
 if err := builder.WithBucketPlan(plan); err != nil {
     log.Fatal(err)
 }
-
-writer, err := builder.NewWrite()
+writer, err := builder.NewWrite() // fails without a plan
 if err != nil {
     log.Fatal(err)
 }
 defer writer.Close()
 ```
 
-Write, prepare, and commit with the same lifecycle shown above. Plan columns
-are the partition keys in partition-key order, followed by a non-null Int32
-`total_buckets`; an unpartitioned plan contains only `total_buckets`. Multiple
-writers in one process must share the plan and commit user and assign each
-`(partition, bucket)` to one writer. Cross-process message aggregation is not
-supported. A fixed-bucket writer is single-use; create a new writer after
-`PrepareCommit`.
+Write, prepare, and commit follow the lifecycle above. An unpartitioned plan
+holds only `total_buckets`. Multiple writers in one process must share the plan
+and commit user and assign each `(partition, bucket)` to one writer. Commit
+messages are process-local. A fixed-bucket writer is single-use; create a new
+writer after `PrepareCommit`.
 
 ## Reading a Table
 
