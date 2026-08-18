@@ -167,6 +167,45 @@ var (
 		}[0],
 	}
 
+	// Postpone fixed-bucket write result types also contain an opaque pointer
+	// followed by *paimon_error. Keep dedicated descriptors so each Go result
+	// mirror is paired with the exact C result type returned by its symbol.
+	typeResultPostponeFixedBucketWriteBuilder = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultPostponeFixedBucketTableWrite = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultPostponeFixedBucketTableCommit = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultPostponeFixedBucketPrepareCommit = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	// paimon_datum { tag: i32, int_val: i64, double_val: f64, str_data: *u8, str_len: usize,
 	//                int_val2: i64, uint_val: u32, uint_val2: u32 }
 	typePaimonDatum = ffi.Type{

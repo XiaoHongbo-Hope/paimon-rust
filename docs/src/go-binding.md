@@ -152,7 +152,7 @@ defer builder.Close()
 if err := builder.WithBucketPlan(plan); err != nil {
     log.Fatal(err)
 }
-writer, err := builder.NewWrite() // fails without a plan
+writer, err := builder.NewWrite() // requires WithBucketPlan to be called first
 if err != nil {
     log.Fatal(err)
 }

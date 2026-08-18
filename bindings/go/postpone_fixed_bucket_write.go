@@ -21,6 +21,7 @@ package paimon
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"unsafe"
 
@@ -168,17 +169,19 @@ func (tw *PostponeFixedBucketTableWrite) WriteArrowBatch(record arrow.Record) er
 	)
 }
 
-// PrepareCommit closes current writers and returns fixed-bucket messages.
-// The writer is single-use; create a new writer for the next batch.
+// PrepareCommit finalizes pending writes and returns fixed-bucket messages.
+// It consumes the writer; subsequent operations return ErrClosed.
 func (tw *PostponeFixedBucketTableWrite) PrepareCommit() (*PostponeFixedBucketCommitMessages, error) {
 	if tw.inner == nil {
 		return nil, ErrClosed
 	}
 	inner, err := ffiPostponeFixedBucketTableWritePrepareCommit.symbol(tw.ctx)(tw.inner)
 	if err != nil {
+		tw.Close()
 		return nil, err
 	}
 	tw.lib.acquire()
+	tw.Close()
 	return &PostponeFixedBucketCommitMessages{ctx: tw.ctx, lib: tw.lib, inner: inner}, nil
 }
 
@@ -210,7 +213,10 @@ func (m *PostponeFixedBucketCommitMessages) Merge(
 	if m.inner == nil {
 		return ErrClosed
 	}
-	if source == nil || source.inner == nil {
+	if source == nil {
+		return errors.New("paimon: source messages must not be nil")
+	}
+	if source.inner == nil {
 		return ErrClosed
 	}
 	return ffiPostponeFixedBucketCommitMessagesMerge.symbol(m.ctx)(m.inner, source.inner)

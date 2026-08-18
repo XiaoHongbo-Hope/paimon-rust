@@ -662,6 +662,12 @@ func TestMultiplePostponeFixedBucketWritersSharePlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to prepare fixed-bucket commit: %v", err)
 		}
+		if err := write.WriteArrowBatch(nil); !errors.Is(err, paimon.ErrClosed) {
+			t.Fatalf("Expected consumed writer to reject writes with ErrClosed, got: %v", err)
+		}
+		if _, err := write.PrepareCommit(); !errors.Is(err, paimon.ErrClosed) {
+			t.Fatalf("Expected consumed writer to reject PrepareCommit with ErrClosed, got: %v", err)
+		}
 		return messages
 	}
 
@@ -669,6 +675,9 @@ func TestMultiplePostponeFixedBucketWritersSharePlan(t *testing.T) {
 	defer messages1.Close()
 	messages2 := writeAndPrepare(builders[1], partitionedRow{5, "eve", "2026-08-15"})
 	defer messages2.Close()
+	if err := messages1.Merge(nil); err == nil || err.Error() != "paimon: source messages must not be nil" {
+		t.Fatalf("Expected a specific nil source error, got: %v", err)
+	}
 	if err := messages1.Merge(messages2); err != nil {
 		t.Fatalf("Failed to merge fixed-bucket commit messages: %v", err)
 	}

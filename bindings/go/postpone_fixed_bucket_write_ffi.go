@@ -28,7 +28,7 @@ import (
 
 var ffiTableNewPostponeFixedBucketWriteBuilder = newFFI(ffiOpts{
 	sym:    "paimon_table_new_postpone_fixed_bucket_write_builder",
-	rType:  &typeResultWriteBuilder,
+	rType:  &typeResultPostponeFixedBucketWriteBuilder,
 	aTypes: []*ffi.Type{&ffi.TypePointer},
 }, func(
 	ctx context.Context,
@@ -46,7 +46,7 @@ var ffiTableNewPostponeFixedBucketWriteBuilder = newFFI(ffiOpts{
 
 var ffiTableNewPostponeFixedBucketWriteBuilderWithCommitUser = newFFI(ffiOpts{
 	sym:    "paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user",
-	rType:  &typeResultWriteBuilder,
+	rType:  &typeResultPostponeFixedBucketWriteBuilder,
 	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
 }, func(
 	ctx context.Context,
@@ -131,7 +131,7 @@ var ffiPostponeFixedBucketWriteBuilderWithBucketPlan = newFFI(ffiOpts{
 
 var ffiPostponeFixedBucketWriteBuilderNewWrite = newFFI(ffiOpts{
 	sym:    "paimon_postpone_fixed_bucket_write_builder_new_write",
-	rType:  &typeResultTableWrite,
+	rType:  &typeResultPostponeFixedBucketTableWrite,
 	aTypes: []*ffi.Type{&ffi.TypePointer},
 }, func(
 	ctx context.Context,
@@ -151,7 +151,7 @@ var ffiPostponeFixedBucketWriteBuilderNewWrite = newFFI(ffiOpts{
 
 var ffiPostponeFixedBucketWriteBuilderNewCommit = newFFI(ffiOpts{
 	sym:    "paimon_postpone_fixed_bucket_write_builder_new_commit",
-	rType:  &typeResultTableCommit,
+	rType:  &typeResultPostponeFixedBucketTableCommit,
 	aTypes: []*ffi.Type{&ffi.TypePointer},
 }, func(
 	ctx context.Context,
@@ -212,7 +212,7 @@ var ffiPostponeFixedBucketTableWriteWriteArrowBatch = newFFI(ffiOpts{
 
 var ffiPostponeFixedBucketTableWritePrepareCommit = newFFI(ffiOpts{
 	sym:    "paimon_postpone_fixed_bucket_table_write_prepare_commit",
-	rType:  &typeResultPrepareCommit,
+	rType:  &typeResultPostponeFixedBucketPrepareCommit,
 	aTypes: []*ffi.Type{&ffi.TypePointer},
 }, func(
 	ctx context.Context,
