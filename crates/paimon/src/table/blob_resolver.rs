@@ -23,7 +23,7 @@ use arrow_array::{Array, BinaryArray};
 use bytes::Bytes;
 use futures::{stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const BLOB_RANGE_MERGE_GAP: u64 = 64 * 1024;
@@ -31,6 +31,89 @@ const BLOB_RANGE_MERGE_MAX_SPAN: u64 = 8 * 1024 * 1024;
 pub(crate) const BLOB_DESCRIPTOR_READ_CONCURRENCY: usize = 8;
 const BLOB_DESCRIPTOR_READ_BYTE_UNIT: u64 = 1024 * 1024;
 const BLOB_DESCRIPTOR_READ_MAX_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Reads serialized [`BlobDescriptor`] values without requiring a table.
+#[derive(Clone, Debug, Default)]
+pub struct BlobReader {
+    storage_options: HashMap<String, String>,
+    file_ios: Arc<Mutex<HashMap<String, FileIO>>>,
+}
+
+impl BlobReader {
+    pub fn new(storage_options: HashMap<String, String>) -> Self {
+        Self {
+            storage_options,
+            file_ios: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Read a batch of serialized descriptors, preserving input order.
+    pub async fn read_blobs(&self, descriptors: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        if descriptors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut cells = Vec::with_capacity(descriptors.len());
+        let mut requests_by_uri: HashMap<String, Vec<BlobReadRequestSpec>> = HashMap::new();
+        let mut value_capacity = 0;
+        for (index, bytes) in descriptors.iter().enumerate() {
+            let descriptor = BlobDescriptor::deserialize(bytes)
+                .map_err(|e| blob_error_with_context(e, &[index], None))?;
+            let range = descriptor
+                .range_spec()
+                .map_err(|e| blob_error_with_context(e, &[index], Some(descriptor.uri())))?;
+            requests_by_uri
+                .entry(descriptor.uri().to_string())
+                .or_default()
+                .push(BlobReadRequestSpec {
+                    row: index,
+                    offset: range.offset(),
+                    length: range.length(),
+                });
+            cells.push(ResolvedBlobCell::Null);
+        }
+
+        resolve_blob_requests(
+            &mut cells,
+            requests_by_uri,
+            |uri| self.file_io(uri),
+            BlobReadLimiter::new(),
+            &mut value_capacity,
+        )
+        .await?;
+
+        cells
+            .into_iter()
+            .enumerate()
+            .map(|(index, cell)| match cell {
+                ResolvedBlobCell::Value(value) => Ok(value.to_vec()),
+                ResolvedBlobCell::Null => Err(crate::Error::UnexpectedError {
+                    message: format!("BlobDescriptor input index {index} was not resolved"),
+                    source: None,
+                }),
+            })
+            .collect()
+    }
+
+    fn file_io(&self, uri: &str) -> Result<FileIO> {
+        let (scheme, _, _) = FileIO::from_path(uri)?.into_parts();
+        let mut file_ios = self
+            .file_ios
+            .lock()
+            .map_err(|_| crate::Error::UnexpectedError {
+                message: "BlobReader FileIO cache lock is poisoned".to_string(),
+                source: None,
+            })?;
+        if let Some(file_io) = file_ios.get(&scheme) {
+            return Ok(file_io.clone());
+        }
+        let file_io = FileIO::from_path(uri)?
+            .with_props(self.storage_options.iter())
+            .build()?;
+        file_ios.insert(scheme, file_io.clone());
+        Ok(file_io)
+    }
+}
 
 /// Shared admission control for external descriptor metadata and range reads.
 ///
@@ -155,18 +238,52 @@ pub(crate) async fn resolve_blob_column(
         }
     }
 
+    resolve_blob_requests(
+        &mut cells,
+        requests_by_uri,
+        |_| Ok(file_io.clone()),
+        limiter,
+        &mut value_capacity,
+    )
+    .await?;
+
+    let mut builder = BinaryBuilder::with_capacity(col.len(), value_capacity);
+    for cell in cells {
+        match cell {
+            ResolvedBlobCell::Null => builder.append_null(),
+            ResolvedBlobCell::Value(value) => builder.append_value(value.as_ref()),
+        }
+    }
+    Ok(builder.finish())
+}
+
+async fn resolve_blob_requests<F>(
+    cells: &mut [ResolvedBlobCell],
+    requests_by_uri: HashMap<String, Vec<BlobReadRequestSpec>>,
+    file_io_for_uri: F,
+    limiter: BlobReadLimiter,
+    value_capacity: &mut usize,
+) -> Result<()>
+where
+    F: Fn(&str) -> Result<FileIO>,
+{
     let mut read_groups = Vec::with_capacity(requests_by_uri.len());
     for (uri, requests) in requests_by_uri {
-        let input = file_io.new_input(&uri)?;
+        let indices = requests
+            .iter()
+            .map(|request| request.row)
+            .collect::<Vec<_>>();
+        let file_io =
+            file_io_for_uri(&uri).map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?;
+        let input = file_io
+            .new_input(&uri)
+            .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?;
         let file_size = if requests.iter().any(|request| request.length.is_none()) {
             let _metadata_permit = limiter.acquire_request(&uri, "metadata").await?;
             input
                 .metadata()
                 .await
-                .map_err(|e| crate::Error::UnexpectedError {
-                    message: format!("Failed to read metadata for BlobDescriptor URI '{uri}': {e}"),
-                    source: Some(Box::new(e)),
-                })?
+                .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?
                 .size
         } else {
             0
@@ -186,7 +303,7 @@ pub(crate) async fn resolve_blob_column(
                     ),
                     source: None,
                 })?;
-            value_capacity = value_capacity.saturating_add(length as usize);
+            *value_capacity = value_capacity.saturating_add(length as usize);
             if length == 0 {
                 cells[request.row] = ResolvedBlobCell::Value(Bytes::new());
                 continue;
@@ -202,7 +319,12 @@ pub(crate) async fn resolve_blob_column(
             continue;
         }
 
-        let reader: Arc<dyn FileRead> = Arc::new(input.reader().await?);
+        let reader: Arc<dyn FileRead> = Arc::new(
+            input
+                .reader()
+                .await
+                .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?,
+        );
         read_groups.push(BlobReadGroup {
             uri,
             reader,
@@ -242,15 +364,67 @@ pub(crate) async fn resolve_blob_column(
             cells[request.row] = ResolvedBlobCell::Value(data.slice(start..end));
         }
     }
+    Ok(())
+}
 
-    let mut builder = BinaryBuilder::with_capacity(col.len(), value_capacity);
-    for cell in cells {
-        match cell {
-            ResolvedBlobCell::Null => builder.append_null(),
-            ResolvedBlobCell::Value(value) => builder.append_value(value.as_ref()),
+fn blob_error_with_context(
+    error: crate::Error,
+    indices: &[usize],
+    uri: Option<&str>,
+) -> crate::Error {
+    let location = match uri {
+        Some(uri) => format!(
+            "input indices {indices:?}, URI '{}'",
+            sanitize_blob_uri(uri)
+        ),
+        None => format!("input indices {indices:?}, URI unavailable"),
+    };
+    match error {
+        crate::Error::Unsupported { message } => crate::Error::Unsupported {
+            message: format!("BlobDescriptor {location}: {message}"),
+        },
+        crate::Error::IoUnsupported { message } => crate::Error::IoUnsupported {
+            message: format!("BlobDescriptor {location}: {message}"),
+        },
+        crate::Error::ConfigInvalid { .. } => crate::Error::ConfigInvalid {
+            message: format!("BlobDescriptor {location}: invalid storage URI or options"),
+        },
+        crate::Error::DataInvalid { message, .. } => crate::Error::DataInvalid {
+            message: format!("BlobDescriptor {location}: {message}"),
+            source: None,
+        },
+        crate::Error::IoUnexpected { source, .. }
+            if source.kind() == opendal::ErrorKind::NotFound =>
+        {
+            crate::Error::UnexpectedError {
+                message: format!("BlobDescriptor {location}: object not found"),
+                source: None,
+            }
         }
+        crate::Error::IoUnexpected { .. } => crate::Error::UnexpectedError {
+            message: format!("BlobDescriptor {location}: storage I/O failed"),
+            source: None,
+        },
+        crate::Error::UnexpectedError { message, .. } => crate::Error::UnexpectedError {
+            message: format!("BlobDescriptor {location}: {message}"),
+            source: None,
+        },
+        _ => crate::Error::UnexpectedError {
+            message: format!("BlobDescriptor {location}: operation failed"),
+            source: None,
+        },
     }
-    Ok(builder.finish())
+}
+
+fn sanitize_blob_uri(uri: &str) -> String {
+    if let Ok(mut url) = url::Url::parse(uri) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.to_string();
+    }
+    uri.split(['?', '#']).next().unwrap_or(uri).to_string()
 }
 
 #[derive(Debug)]
@@ -280,6 +454,7 @@ struct MergedBlobRead {
     requests: Vec<BlobReadRequest>,
 }
 
+#[derive(Debug)]
 struct ResolvedMergedBlobRead {
     merged: MergedBlobRead,
     data: Bytes,
@@ -321,26 +496,25 @@ async fn read_merged_blob_ranges(
             let reader = reader.clone();
             let limiter = limiter.clone();
             async move {
+                let indices = merged
+                    .requests
+                    .iter()
+                    .map(|request| request.row)
+                    .collect::<Vec<_>>();
                 let _permits = limiter
                     .acquire_read(merged.end - merged.start, &uri)
                     .await?;
                 let data = reader
                     .read(merged.start..merged.end)
                     .await
-                    .map_err(|e| crate::Error::UnexpectedError {
-                        message: format!(
-                            "Failed to read BlobDescriptor URI '{uri}' range {}..{}: {e}",
-                            merged.start, merged.end
-                        ),
-                        source: Some(Box::new(e)),
-                    })?;
+                    .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?;
                 let expected_len = merged.end - merged.start;
                 let actual_len = data.len() as u64;
                 if actual_len != expected_len {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
-                            "Failed to read BlobDescriptor URI '{uri}': short read for range {}..{}, expected={expected_len} bytes, actual={actual_len} bytes",
-                            merged.start, merged.end
+                            "BlobDescriptor input indices {indices:?}, URI '{}': short read for range {}..{}, expected={expected_len} bytes, actual={actual_len} bytes",
+                            sanitize_blob_uri(&uri), merged.start, merged.end
                         ),
                         source: None,
                     });
@@ -399,6 +573,7 @@ mod tests {
         bytes: Bytes,
         in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ranges: std::sync::Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
     }
 
     impl TrackingFileRead {
@@ -407,6 +582,7 @@ mod tests {
                 bytes,
                 in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 max_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ranges: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -419,17 +595,23 @@ mod tests {
                 bytes,
                 in_flight,
                 max_in_flight,
+                ranges: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
         fn max_in_flight(&self) -> usize {
             self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
         }
+
+        fn ranges(&self) -> Vec<std::ops::Range<u64>> {
+            self.ranges.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl FileRead for TrackingFileRead {
         async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            self.ranges.lock().unwrap().push(range.clone());
             let in_flight = self
                 .in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -440,6 +622,15 @@ mod tests {
             self.in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    struct ShortFileRead;
+
+    #[async_trait::async_trait]
+    impl FileRead for ShortFileRead {
+        async fn read(&self, _range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            Ok(Bytes::from_static(b"x"))
         }
     }
 
@@ -575,6 +766,65 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_merged_descriptors_issue_one_underlying_read() {
+        let reader = TrackingFileRead::new(Bytes::from_static(b"abcdefghijkl"));
+        let reads = merge_blob_read_requests(vec![
+            BlobReadRequest {
+                row: 0,
+                offset: 0,
+                length: 4,
+            },
+            BlobReadRequest {
+                row: 1,
+                offset: 4,
+                length: 4,
+            },
+            BlobReadRequest {
+                row: 2,
+                offset: 2,
+                length: 6,
+            },
+        ]);
+
+        let results = read_merged_blob_ranges(
+            "memory:/blob.bin",
+            Arc::new(reader.clone()),
+            reads,
+            BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(reader.ranges(), vec![0..8]);
+    }
+
+    #[tokio::test]
+    async fn test_blob_range_read_rejects_short_data() {
+        let error = read_merged_blob_ranges(
+            "memory:/blob.bin",
+            Arc::new(ShortFileRead),
+            vec![MergedBlobRead {
+                start: 4,
+                end: 8,
+                requests: vec![BlobReadRequest {
+                    row: 3,
+                    offset: 4,
+                    length: 4,
+                }],
+            }],
+            BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("input indices [3]"));
+        assert!(message.contains("memory:/blob.bin"));
+        assert!(message.contains("short read"));
+    }
+
     #[test]
     fn test_merge_blob_read_requests_merges_nearby_ranges() {
         let merged = merge_blob_read_requests(vec![
@@ -613,5 +863,141 @@ mod tests {
         );
         assert_eq!(merged[1].start, BLOB_RANGE_MERGE_MAX_SPAN + 1);
         assert_eq!(merged[1].end, BLOB_RANGE_MERGE_MAX_SPAN + 5);
+    }
+
+    #[test]
+    fn test_merge_blob_read_requests_respects_gap_and_span_limits() {
+        let separated = merge_blob_read_requests(vec![
+            BlobReadRequest {
+                row: 0,
+                offset: 0,
+                length: 1,
+            },
+            BlobReadRequest {
+                row: 1,
+                offset: BLOB_RANGE_MERGE_GAP + 2,
+                length: 1,
+            },
+        ]);
+        assert_eq!(separated.len(), 2);
+
+        let too_wide = merge_blob_read_requests(vec![
+            BlobReadRequest {
+                row: 0,
+                offset: 0,
+                length: BLOB_RANGE_MERGE_MAX_SPAN,
+            },
+            BlobReadRequest {
+                row: 1,
+                offset: BLOB_RANGE_MERGE_MAX_SPAN - 1,
+                length: 2,
+            },
+        ]);
+        assert_eq!(too_wide.len(), 2);
+    }
+
+    fn java_v2_descriptor(uri: &str, offset: i64, length: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(2);
+        bytes.extend_from_slice(&0x424C4F4244455343_u64.to_le_bytes());
+        bytes.extend_from_slice(&(uri.len() as i32).to_le_bytes());
+        bytes.extend_from_slice(uri.as_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes
+    }
+
+    fn file_uri(path: &std::path::Path) -> String {
+        url::Url::from_file_path(path).unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_standalone_blob_reader_reads_ranges_in_input_order() {
+        let first = tempfile::NamedTempFile::new().unwrap();
+        let second = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(first.path(), b"abcdefghij").unwrap();
+        std::fs::write(second.path(), b"UVWXYZ").unwrap();
+        let first_uri = file_uri(first.path());
+        let second_uri = file_uri(second.path());
+        let descriptors = vec![
+            java_v2_descriptor(&second_uri, 1, 3),
+            java_v2_descriptor(&first_uri, 3, -1),
+            java_v2_descriptor(&first_uri, 5, 0),
+            java_v2_descriptor(&first_uri, 2, 4),
+            java_v2_descriptor(&first_uri, 2, 4),
+        ];
+
+        let values = BlobReader::default()
+            .read_blobs(&descriptors)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                b"VWX".to_vec(),
+                b"defghij".to_vec(),
+                Vec::new(),
+                b"cdef".to_vec(),
+                b"cdef".to_vec(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_standalone_blob_reader_validates_descriptors_and_ranges() {
+        let reader = BlobReader::default();
+
+        let error = reader.read_blobs(&[Vec::new()]).await.unwrap_err();
+        assert!(error.to_string().contains("input indices [0]"));
+        assert!(error.to_string().contains("URI unavailable"));
+
+        let mut future = BlobDescriptor::new("file:///tmp/a".to_string(), 0, 1).serialize();
+        future[0] = 3;
+        let error = reader.read_blobs(&[future]).await.unwrap_err();
+        assert!(matches!(&error, crate::Error::Unsupported { .. }));
+        assert!(error.to_string().contains("input indices [0]"));
+
+        let error = reader
+            .read_blobs(&[BlobDescriptor::new("file:///tmp/a".to_string(), -1, 1).serialize()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("offset must be non-negative"));
+        assert!(error.to_string().contains("file:///tmp/a"));
+
+        let error = reader
+            .read_blobs(&[BlobDescriptor::new("file:///tmp/a".to_string(), 0, -2).serialize()])
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("length must be -1 or non-negative"));
+
+        let error = reader
+            .read_blobs(&[BlobDescriptor::new("ftp://example.com/a".to_string(), 0, 1).serialize()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("input indices [0]"));
+        assert!(error.to_string().contains("ftp://example.com/a"));
+
+        let secret_uri = "ftp://access-key:secret@example.com/a?token=sensitive";
+        let error = reader
+            .read_blobs(&[BlobDescriptor::new(secret_uri.to_string(), 0, 1).serialize()])
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ftp://example.com/a"));
+        assert!(!message.contains("access-key"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn test_standalone_blob_reader_empty_batch() {
+        assert!(BlobReader::default()
+            .read_blobs(&[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

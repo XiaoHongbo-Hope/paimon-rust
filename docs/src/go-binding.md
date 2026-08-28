@@ -39,6 +39,78 @@ go get github.com/apache/paimon-rust/bindings/go
 The native library is embedded and loaded automatically. Build with
 `CGO_ENABLED=1`.
 
+## Reading BlobDescriptor Values
+
+`BlobReader` reads serialized `BlobDescriptor` values directly; it does not scan a Paimon table.
+Use `ReadBlobs` to resolve a batch in one call. `ReadBlob` is a convenience
+method for one descriptor; local `file://` reads can use nil storage options.
+
+```go
+package main
+
+import (
+    "database/sql"
+    "log"
+    "os"
+
+    paimon "github.com/apache/paimon-rust/bindings/go"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+    db, err := sql.Open("mysql", os.Getenv("STARROCKS_DSN"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    rows, err := db.Query("SELECT blob_descriptor FROM catalog.db.my_table")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+
+    var descriptors [][]byte
+    for rows.Next() {
+        var descriptor []byte
+        if err := rows.Scan(&descriptor); err != nil {
+            log.Fatal(err)
+        }
+        descriptors = append(descriptors, append([]byte(nil), descriptor...))
+    }
+    if err := rows.Err(); err != nil {
+        log.Fatal(err)
+    }
+
+    reader, err := paimon.NewBlobReader(map[string]string{
+        "fs.oss.accessKeyId":     os.Getenv("OSS_ACCESS_KEY_ID"),
+        "fs.oss.accessKeySecret": os.Getenv("OSS_ACCESS_KEY_SECRET"),
+        "fs.oss.endpoint":        os.Getenv("OSS_ENDPOINT"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer reader.Close()
+
+    blobs, err := reader.ReadBlobs(descriptors)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, blob := range blobs {
+        log.Printf("read %d bytes", len(blob))
+    }
+}
+```
+
+The descriptor contains only URI, offset, and length. Pass OSS/S3 credentials
+with the same FileIO option names used by catalogs. If StarRocks returns a hex
+or base64 string, decode it to the original descriptor bytes before calling
+`ReadBlobs`.
+
+Reads are grouped by URI and nearby ranges are merged. The fixed limits are a
+64 KiB merge gap, 8 MiB merged span, 8 concurrent requests, and 64 MiB of
+in-flight range reads. Results retain descriptor input order.
+
 ## Creating a Catalog
 
 Use `NewCatalog` with a map of options to create a catalog. The catalog type is determined by the `metastore` option (default: `filesystem`).
