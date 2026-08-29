@@ -62,7 +62,6 @@ pub unsafe extern "C" fn paimon_bytes_free(bytes: paimon_bytes) {
     }
 }
 
-/// Borrowed byte slice used as FFI input.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct paimon_byte_slice {
@@ -70,7 +69,6 @@ pub struct paimon_byte_slice {
     pub len: usize,
 }
 
-/// Owned array of owned byte buffers.
 #[repr(C)]
 pub struct paimon_bytes_array {
     pub data: *mut paimon_bytes,
@@ -100,10 +98,8 @@ impl paimon_bytes_array {
     }
 }
 
-/// Free an array returned by `paimon_blob_reader_read_blobs`.
-///
 /// # Safety
-/// Only call with an array returned from a Paimon C function.
+/// `array` was returned by `paimon_blob_reader_read_blobs`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_bytes_array_free(array: paimon_bytes_array) {
     if array.data.is_null() {

@@ -29,7 +29,6 @@ import (
 
 // FFI type definitions mirroring C repr structs from paimon-c.
 var (
-	// paimon_result_blob_reader { reader: *paimon_blob_reader, error: *paimon_error }
 	typeResultBlobReader = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -39,7 +38,6 @@ var (
 		}[0],
 	}
 
-	// paimon_bytes_array { data: *paimon_bytes, len: usize }
 	typePaimonBytesArray = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -49,7 +47,6 @@ var (
 		}[0],
 	}
 
-	// paimon_result_read_blobs { blobs: paimon_bytes_array, error: *paimon_error }
 	typeResultReadBlobs = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{

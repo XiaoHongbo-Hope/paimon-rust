@@ -3315,10 +3315,6 @@ fn vector_search_projection_unknown_column_errors_at_execute_read() {
     }
 }
 
-// =========================================================================
-//  Standalone BlobDescriptor reader
-// =========================================================================
-
 #[test]
 fn blob_reader_reads_batch_and_owns_output_buffers() {
     let file = tempfile::NamedTempFile::new().unwrap();

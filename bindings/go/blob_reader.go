@@ -29,16 +29,15 @@ import (
 	"github.com/jupiterrider/ffi"
 )
 
-// BlobReader reads the objects referenced by serialized BlobDescriptors.
+// BlobReader resolves serialized BlobDescriptors.
 type BlobReader struct {
-	ctx       context.Context
-	lib       *libRef
-	inner     *paimonBlobReader
-	mu        sync.RWMutex
+	ctx   context.Context
+	lib   *libRef
+	inner *paimonBlobReader
+	mu    sync.RWMutex
 }
 
-// NewBlobReader creates a standalone descriptor reader. Object-store
-// credentials come from storageOptions, not from BlobDescriptor values.
+// NewBlobReader creates a descriptor reader with FileIO options.
 func NewBlobReader(storageOptions map[string]string) (*BlobReader, error) {
 	ctx, lib, err := ensureLoaded()
 	if err != nil {
@@ -52,7 +51,7 @@ func NewBlobReader(storageOptions map[string]string) (*BlobReader, error) {
 	return &BlobReader{ctx: ctx, lib: lib, inner: inner}, nil
 }
 
-// ReadBlob reads one serialized BlobDescriptor.
+// ReadBlob resolves one descriptor.
 func (r *BlobReader) ReadBlob(descriptor []byte) ([]byte, error) {
 	values, err := r.ReadBlobs([][]byte{descriptor})
 	if err != nil {
@@ -61,8 +60,7 @@ func (r *BlobReader) ReadBlob(descriptor []byte) ([]byte, error) {
 	return values[0], nil
 }
 
-// ReadBlobs reads a batch of serialized BlobDescriptors in one native call and
-// returns values in input order.
+// ReadBlobs resolves a batch in input order.
 func (r *BlobReader) ReadBlobs(descriptors [][]byte) ([][]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -72,7 +70,7 @@ func (r *BlobReader) ReadBlobs(descriptors [][]byte) ([][]byte, error) {
 	return ffiBlobReaderReadBlobs.symbol(r.ctx)(r.inner, descriptors)
 }
 
-// Close releases native resources. It is safe to call multiple times.
+// Close releases the reader and is idempotent.
 func (r *BlobReader) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()

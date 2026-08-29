@@ -30,8 +30,6 @@ import (
 	paimon "github.com/apache/paimon-rust/bindings/go"
 )
 
-// blobDescriptorV2 builds a Java-compatible wire fixture for binding tests.
-// Production callers receive these bytes from Paimon-compatible query engines.
 func blobDescriptorV2(uri string, offset, length int64) []byte {
 	result := make([]byte, 0, 29+len(uri))
 	result = append(result, 2)

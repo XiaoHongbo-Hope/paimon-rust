@@ -32,11 +32,8 @@ fn read_error(error: *mut paimon_error) -> paimon_result_read_blobs {
     }
 }
 
-/// Create a standalone BlobDescriptor reader.
-///
 /// # Safety
-/// `options` must point to `options_len` valid `paimon_option` values. Keys and
-/// values must be null-terminated UTF-8 strings and are borrowed for this call.
+/// `options` is null for zero length or points to valid UTF-8 C-string pairs.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_blob_reader_new(
     options: *const paimon_option,
@@ -87,15 +84,9 @@ pub unsafe extern "C" fn paimon_blob_reader_new(
     }
 }
 
-/// Read serialized BlobDescriptors in one batch, preserving input order.
-///
-/// Input buffers are borrowed for this call. The returned buffers remain owned
-/// by the caller until released with `paimon_bytes_array_free`.
-///
 /// # Safety
-/// `reader` must be returned by `paimon_blob_reader_new`. `descriptors` must
-/// point to `descriptors_len` valid byte slices whose data remains alive for
-/// this call.
+/// The handle and input slices are valid for this call. Free the output with
+/// `paimon_bytes_array_free`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_blob_reader_read_blobs(
     reader: *const paimon_blob_reader,
@@ -145,10 +136,8 @@ pub unsafe extern "C" fn paimon_blob_reader_read_blobs(
     }
 }
 
-/// Free a standalone BlobDescriptor reader.
-///
 /// # Safety
-/// Only call with a reader returned by `paimon_blob_reader_new`.
+/// `reader` is null or was returned by `paimon_blob_reader_new`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_blob_reader_free(reader: *mut paimon_blob_reader) {
     if reader.is_null() {
