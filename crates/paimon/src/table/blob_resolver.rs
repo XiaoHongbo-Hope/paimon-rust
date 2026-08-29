@@ -36,11 +36,23 @@ const BLOB_DESCRIPTOR_READ_MAX_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Default)]
 pub struct BlobReader {
     storage_options: HashMap<String, String>,
+    file_io: Option<FileIO>,
 }
 
 impl BlobReader {
     pub fn new(storage_options: HashMap<String, String>) -> Self {
-        Self { storage_options }
+        Self {
+            storage_options,
+            file_io: None,
+        }
+    }
+
+    /// Create a reader that reuses an existing FileIO.
+    pub fn from_file_io(file_io: FileIO) -> Self {
+        Self {
+            storage_options: HashMap::new(),
+            file_io: Some(file_io),
+        }
     }
 
     /// Read a descriptor batch in input order.
@@ -64,9 +76,16 @@ impl BlobReader {
                 let limiter = limiter.clone();
                 async move {
                     let indices = entries.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-                    let file_io = FileIO::from_path(&uri)
-                        .and_then(|builder| builder.with_props(self.storage_options.iter()).build())
-                        .map_err(|error| blob_error_with_context(error, &indices, Some(&uri)))?;
+                    let file_io = match &self.file_io {
+                        Some(file_io) => file_io.clone(),
+                        None => FileIO::from_path(&uri)
+                            .and_then(|builder| {
+                                builder.with_props(self.storage_options.iter()).build()
+                            })
+                            .map_err(|error| {
+                                blob_error_with_context(error, &indices, Some(&uri))
+                            })?,
+                    };
                     let mut builder = BinaryBuilder::with_capacity(entries.len(), 0);
                     for (_, descriptor) in &entries {
                         builder.append_value(descriptor);
