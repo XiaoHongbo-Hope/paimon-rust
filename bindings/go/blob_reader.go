@@ -35,7 +35,6 @@ type BlobReader struct {
 	lib       *libRef
 	inner     *paimonBlobReader
 	mu        sync.RWMutex
-	closeOnce sync.Once
 }
 
 // NewBlobReader creates a standalone descriptor reader. Object-store
@@ -75,13 +74,14 @@ func (r *BlobReader) ReadBlobs(descriptors [][]byte) ([][]byte, error) {
 
 // Close releases native resources. It is safe to call multiple times.
 func (r *BlobReader) Close() {
-	r.closeOnce.Do(func() {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		ffiBlobReaderFree.symbol(r.ctx)(r.inner)
-		r.inner = nil
-		r.lib.release()
-	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inner == nil {
+		return
+	}
+	ffiBlobReaderFree.symbol(r.ctx)(r.inner)
+	r.inner = nil
+	r.lib.release()
 }
 
 var ffiBlobReaderNew = newFFI(ffiOpts{
