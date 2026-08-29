@@ -57,7 +57,7 @@ impl BlobReader {
 
     /// Read a descriptor batch in input order.
     pub async fn read_blobs(&self, descriptors: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
-        let mut by_uri = HashMap::<String, Vec<(usize, &[u8])>>::new();
+        let mut by_uri = HashMap::<String, Vec<(usize, BlobDescriptor)>>::new();
         for (index, bytes) in descriptors.iter().enumerate() {
             let descriptor = BlobDescriptor::deserialize(bytes)
                 .map_err(|error| blob_error_with_context(error, &[index], None))?;
@@ -67,7 +67,7 @@ impl BlobReader {
             by_uri
                 .entry(descriptor.uri().to_string())
                 .or_default()
-                .push((index, bytes));
+                .push((index, descriptor));
         }
 
         let limiter = BlobReadLimiter::new();
@@ -88,7 +88,14 @@ impl BlobReader {
                     };
                     let mut builder = BinaryBuilder::with_capacity(entries.len(), 0);
                     for (_, descriptor) in &entries {
-                        builder.append_value(descriptor);
+                        builder.append_value(
+                            BlobDescriptor::new(
+                                descriptor.uri().to_string(),
+                                descriptor.offset(),
+                                descriptor.length(),
+                            )
+                            .serialize(),
+                        );
                     }
                     let resolved = resolve_blob_column(&builder.finish(), &file_io, limiter)
                         .await
@@ -846,6 +853,15 @@ mod tests {
         bytes
     }
 
+    fn java_v1_descriptor(uri: &str, offset: i64, length: i64) -> Vec<u8> {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&(uri.len() as i32).to_le_bytes());
+        bytes.extend_from_slice(uri.as_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes
+    }
+
     fn file_uri(path: &std::path::Path) -> String {
         url::Url::from_file_path(path).unwrap().to_string()
     }
@@ -881,6 +897,20 @@ mod tests {
                 b"cdef".to_vec(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_standalone_blob_reader_reads_java_v1_descriptor() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"abcdefghij").unwrap();
+        let descriptor = java_v1_descriptor(&file_uri(file.path()), 2, 4);
+
+        let values = BlobReader::default()
+            .read_blobs(&[descriptor])
+            .await
+            .unwrap();
+
+        assert_eq!(values, vec![b"cdef".to_vec()]);
     }
 
     #[tokio::test]
