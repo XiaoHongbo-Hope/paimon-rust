@@ -107,6 +107,38 @@ with the same FileIO option names used by catalogs. If StarRocks returns a hex
 or base64 string, decode it to the original descriptor bytes before calling
 `ReadBlobs`.
 
+For DLF temporary data tokens, reuse a table's refreshing FileIO:
+
+```go
+catalog, err := paimon.NewCatalog(map[string]string{
+    "metastore":                  "rest",
+    "uri":                        os.Getenv("DLF_ENDPOINT"),
+    "warehouse":                  os.Getenv("DLF_CATALOG"),
+    "token.provider":             "dlf",
+    "dlf.region":                 os.Getenv("DLF_REGION"),
+    "dlf.token-loader":           "ecs",
+    "dlf.token-ecs-role-name":    os.Getenv("DLF_ECS_ROLE"),
+    "data-token.enabled":         "true",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer catalog.Close()
+table, err := catalog.GetTable(paimon.NewIdentifier("db", "descriptor_table"))
+if err != nil {
+    log.Fatal(err)
+}
+defer table.Close()
+reader, err := table.NewBlobReader()
+if err != nil {
+    log.Fatal(err)
+}
+defer reader.Close()
+```
+
+The reader keeps the table FileIO and refreshes DLF data tokens before expiry.
+Static options passed to `paimon.NewBlobReader` are not refreshed.
+
 Reads are grouped by URI and nearby ranges are merged. The fixed limits are a
 64 KiB merge gap, 8 MiB merged span, 8 concurrent requests, and 64 MiB of
 in-flight range reads. Results retain descriptor input order.

@@ -3357,8 +3357,58 @@ fn blob_reader_reads_batch_and_owns_output_buffers() {
 }
 
 #[test]
+fn blob_reader_from_table_keeps_file_io_alive() {
+    let file_io = memory_file_io();
+    let uri = "memory:/blob_reader_from_table";
+    crate::runtime().block_on(async {
+        file_io
+            .new_output(uri)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"abcdefghij"))
+            .await
+            .unwrap();
+    });
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "blob_table"),
+        "memory:/blob_table".to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let table = unsafe { wrap_table(table) };
+    let descriptor = BlobDescriptor::new(uri.to_string(), 2, 4).serialize();
+    let descriptor_slice = paimon_byte_slice {
+        data: descriptor.as_ptr(),
+        len: descriptor.len(),
+    };
+
+    unsafe {
+        let created = paimon_table_new_blob_reader(table);
+        assert!(created.error.is_null());
+        assert!(!created.reader.is_null());
+        unwrap_table(table);
+
+        let result = paimon_blob_reader_read_blobs(created.reader, &descriptor_slice, 1);
+        assert!(result.error.is_null());
+        let values = std::slice::from_raw_parts(result.blobs.data, result.blobs.len);
+        assert_eq!(
+            std::slice::from_raw_parts(values[0].data, values[0].len),
+            b"cdef"
+        );
+
+        paimon_bytes_array_free(result.blobs);
+        paimon_blob_reader_free(created.reader);
+    }
+}
+
+#[test]
 fn blob_reader_handles_empty_and_error_batches() {
     unsafe {
+        let null_table = paimon_table_new_blob_reader(ptr::null());
+        assert!(null_table.reader.is_null());
+        assert!(!null_table.error.is_null());
+        paimon_error_free(null_table.error);
+
         let created = paimon_blob_reader_new(ptr::null(), 0);
         assert!(created.error.is_null());
 
