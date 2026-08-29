@@ -17,13 +17,14 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::io::SeekFrom;
 
 use paimon::{BlobReader, BlobStream};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
     paimon_result_blob_reader, paimon_result_blob_stream, paimon_result_blob_stream_read,
-    paimon_result_read_blobs,
+    paimon_result_blob_stream_seek, paimon_result_read_blobs,
 };
 use crate::runtime;
 use crate::types::{
@@ -253,6 +254,46 @@ pub unsafe extern "C" fn paimon_blob_stream_read(
         }
         Err(error) => paimon_result_blob_stream_read {
             bytes_read: 0,
+            error: paimon_error::from_paimon(error),
+        },
+    }
+}
+
+/// Seek within the descriptor's range. `whence` uses the standard 0, 1, 2 values.
+///
+/// # Safety
+/// `stream` is valid.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_blob_stream_seek(
+    stream: *mut paimon_blob_stream,
+    offset: i64,
+    whence: i32,
+) -> paimon_result_blob_stream_seek {
+    if let Err(error) = check_non_null(stream, "blob stream") {
+        return paimon_result_blob_stream_seek { position: 0, error };
+    }
+    let from = match whence {
+        0 if offset >= 0 => SeekFrom::Start(offset as u64),
+        1 => SeekFrom::Current(offset),
+        2 => SeekFrom::End(offset),
+        _ => {
+            return paimon_result_blob_stream_seek {
+                position: 0,
+                error: paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    "invalid blob stream seek".to_string(),
+                ),
+            };
+        }
+    };
+    let stream = &mut *((*stream).inner as *mut BlobStream);
+    match runtime().block_on(stream.seek(from)) {
+        Ok(position) => paimon_result_blob_stream_seek {
+            position,
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_blob_stream_seek {
+            position: 0,
             error: paimon_error::from_paimon(error),
         },
     }

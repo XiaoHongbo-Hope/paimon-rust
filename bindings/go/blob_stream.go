@@ -38,7 +38,7 @@ type BlobStream struct {
 	mu    sync.Mutex
 }
 
-var _ io.ReadCloser = (*BlobStream)(nil)
+var _ io.ReadSeekCloser = (*BlobStream)(nil)
 
 // OpenBlob opens one descriptor without reading its contents.
 func (r *BlobReader) OpenBlob(descriptor []byte) (*BlobStream, error) {
@@ -77,6 +77,26 @@ func (s *BlobStream) Read(buffer []byte) (int, error) {
 		return 0, io.EOF
 	}
 	return read, nil
+}
+
+// Seek implements io.Seeker within the descriptor's range.
+func (s *BlobStream) Seek(offset int64, whence int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inner == nil {
+		return 0, ErrClosed
+	}
+	if whence != io.SeekStart && whence != io.SeekCurrent && whence != io.SeekEnd {
+		return 0, fmt.Errorf("paimon: invalid BlobStream whence %d", whence)
+	}
+	position, err := ffiBlobStreamSeek.symbol(s.ctx)(s.inner, offset, int32(whence))
+	if err != nil {
+		return 0, err
+	}
+	if position > uint64(^uint64(0)>>1) {
+		return 0, fmt.Errorf("paimon: BlobStream position exceeds int64")
+	}
+	return int64(position), nil
 }
 
 // Close releases the stream and is idempotent.
@@ -146,6 +166,30 @@ var ffiBlobStreamRead = newFFI(ffiOpts{
 			return 0, parseError(ctx, result.error)
 		}
 		return int(result.bytesRead), nil
+	}
+})
+
+var ffiBlobStreamSeek = newFFI(ffiOpts{
+	sym:   "paimon_blob_stream_seek",
+	rType: &typeResultBlobStreamSeek,
+	aTypes: []*ffi.Type{
+		&ffi.TypePointer,
+		&ffi.TypeSint64,
+		&ffi.TypeSint32,
+	},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonBlobStream, int64, int32) (uint64, error) {
+	return func(stream *paimonBlobStream, offset int64, whence int32) (uint64, error) {
+		var result resultBlobStreamSeek
+		ffiCall(
+			unsafe.Pointer(&result),
+			unsafe.Pointer(&stream),
+			unsafe.Pointer(&offset),
+			unsafe.Pointer(&whence),
+		)
+		if result.error != nil {
+			return 0, parseError(ctx, result.error)
+		}
+		return result.position, nil
 	}
 })
 

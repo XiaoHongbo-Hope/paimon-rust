@@ -120,7 +120,15 @@ if _, err := io.Copy(destination, stream); err != nil {
 }
 ```
 
-`OpenBlob` is lazy and returns an `io.ReadCloser`. `ReadBlobs` remains the batch
+For an HTTP byte range, seek relative to the descriptor and copy only that range:
+
+```go
+size, err := stream.Seek(0, io.SeekEnd)
+_, err = stream.Seek(start, io.SeekStart)
+_, err = io.CopyN(w, stream, end-start+1)
+```
+
+`OpenBlob` is lazy and returns an `io.ReadSeekCloser`. `ReadBlobs` remains the batch
 API that groups and merges ranges; separate streams are not merged together.
 
 For DLF temporary data tokens, reuse a table's refreshing FileIO:

@@ -20,6 +20,7 @@
 package paimon_test
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -189,6 +190,22 @@ func TestBlobStreamReadsIncrementally(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader.Close()
+	if size, err := stream.Seek(0, io.SeekEnd); err != nil || size != 5 {
+		t.Fatalf("SeekEnd returned (%d, %v), want (5, nil)", size, err)
+	}
+	if position, err := stream.Seek(1, io.SeekStart); err != nil || position != 1 {
+		t.Fatalf("SeekStart returned (%d, %v), want (1, nil)", position, err)
+	}
+	var ranged bytes.Buffer
+	if _, err := io.CopyN(&ranged, stream, 3); err != nil {
+		t.Fatal(err)
+	}
+	if ranged.String() != "def" {
+		t.Fatalf("range returned %q, want %q", ranged.String(), "def")
+	}
+	if _, err := stream.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
 
 	buffer := make([]byte, 2)
 	var value []byte
@@ -213,6 +230,9 @@ func TestBlobStreamReadsIncrementally(t *testing.T) {
 	}
 	if _, err := stream.Read(buffer); !errors.Is(err, paimon.ErrClosed) {
 		t.Fatalf("Read after Close returned %v, want ErrClosed", err)
+	}
+	if _, err := stream.Seek(0, io.SeekStart); !errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("Seek after Close returned %v, want ErrClosed", err)
 	}
 }
 

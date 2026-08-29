@@ -23,6 +23,7 @@ use arrow_array::{Array, BinaryArray};
 use bytes::Bytes;
 use futures::{stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -166,21 +167,43 @@ impl BlobStream {
             .map_err(|error| blob_error_with_context(error, &[0], Some(&self.uri)))
     }
 
+    /// Seek within the descriptor's range.
+    pub async fn seek(&mut self, from: SeekFrom) -> Result<u64> {
+        self.seek_inner(from)
+            .await
+            .map_err(|error| blob_error_with_context(error, &[0], Some(&self.uri)))
+    }
+
+    async fn seek_inner(&mut self, from: SeekFrom) -> Result<u64> {
+        let position = match from {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.length().await?) + i128::from(offset),
+        };
+        self.position = u64::try_from(position).map_err(|_| crate::Error::DataInvalid {
+            message: "invalid BlobDescriptor stream seek".to_string(),
+            source: None,
+        })?;
+        Ok(self.position)
+    }
+
+    async fn length(&mut self) -> Result<u64> {
+        if let Some(length) = self.resolved_length {
+            return Ok(length);
+        }
+        let input = self.file_io.new_input(&self.uri)?;
+        let _permit = self.limiter.acquire_request(&self.uri, "metadata").await?;
+        let length = input.metadata().await?.size.saturating_sub(self.offset);
+        self.resolved_length = Some(length);
+        Ok(length)
+    }
+
     async fn read_inner(&mut self, max_bytes: usize) -> Result<Vec<u8>> {
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
 
-        let length = match self.resolved_length {
-            Some(length) => length,
-            None => {
-                let input = self.file_io.new_input(&self.uri)?;
-                let _permit = self.limiter.acquire_request(&self.uri, "metadata").await?;
-                let size = input.metadata().await?.size.saturating_sub(self.offset);
-                self.resolved_length = Some(size);
-                size
-            }
-        };
+        let length = self.length().await?;
         let remaining = length.saturating_sub(self.position);
         if remaining == 0 {
             return Ok(Vec::new());
@@ -1029,12 +1052,20 @@ mod tests {
 
         let mut fixed = reader.open_blob(&java_v2_descriptor(&uri, 2, 5)).unwrap();
         assert_eq!(fixed.read(2).await.unwrap(), b"cd");
-        assert_eq!(fixed.read(8).await.unwrap(), b"efg");
+        assert_eq!(fixed.seek(SeekFrom::Start(1)).await.unwrap(), 1);
+        assert_eq!(fixed.read(2).await.unwrap(), b"de");
+        assert_eq!(fixed.seek(SeekFrom::Current(-1)).await.unwrap(), 2);
+        assert_eq!(fixed.read(2).await.unwrap(), b"ef");
+        assert_eq!(fixed.seek(SeekFrom::End(-2)).await.unwrap(), 3);
+        assert_eq!(fixed.read(8).await.unwrap(), b"fg");
         assert!(fixed.read(1).await.unwrap().is_empty());
+        assert!(fixed.seek(SeekFrom::Current(-6)).await.is_err());
 
         let mut to_end = reader.open_blob(&java_v2_descriptor(&uri, 4, -1)).unwrap();
-        assert_eq!(to_end.read(3).await.unwrap(), b"efg");
-        assert_eq!(to_end.read(8).await.unwrap(), b"hij");
+        assert_eq!(to_end.seek(SeekFrom::End(-3)).await.unwrap(), 3);
+        assert_eq!(to_end.read(3).await.unwrap(), b"hij");
+        assert_eq!(to_end.seek(SeekFrom::Start(0)).await.unwrap(), 0);
+        assert_eq!(to_end.read(8).await.unwrap(), b"efghij");
         assert!(to_end.read(1).await.unwrap().is_empty());
 
         let mut empty = reader.open_blob(&java_v2_descriptor(&uri, 3, 0)).unwrap();

@@ -56,6 +56,15 @@ var (
 		}[0],
 	}
 
+	typeResultBlobStreamSeek = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypeUint64,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	typePaimonBytesArray = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -344,6 +353,11 @@ type resultBlobStream struct {
 type resultBlobStreamRead struct {
 	bytesRead uintptr
 	error     *paimonError
+}
+
+type resultBlobStreamSeek struct {
+	position uint64
+	error    *paimonError
 }
 
 type resultReadBlobs struct {

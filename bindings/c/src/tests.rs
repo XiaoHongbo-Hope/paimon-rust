@@ -3464,6 +3464,10 @@ fn blob_stream_reads_chunks_and_outlives_reader() {
         assert_eq!(first.bytes_read, 3);
         assert_eq!(&buffer, b"cde");
 
+        let seek = paimon_blob_stream_seek(opened.stream, -2, 2);
+        assert!(seek.error.is_null());
+        assert_eq!(seek.position, 3);
+
         buffer.fill(0xFF);
         let second = paimon_blob_stream_read(opened.stream, buffer.as_mut_ptr(), buffer.len());
         assert!(second.error.is_null());
@@ -3512,6 +3516,14 @@ fn blob_stream_validates_handles_and_buffers() {
         let null_stream = paimon_blob_stream_read(ptr::null_mut(), ptr::null_mut(), 0);
         assert!(!null_stream.error.is_null());
         paimon_error_free(null_stream.error);
+
+        let invalid_seek = paimon_blob_stream_seek(opened.stream, -1, 0);
+        assert!(!invalid_seek.error.is_null());
+        paimon_error_free(invalid_seek.error);
+
+        let null_seek = paimon_blob_stream_seek(ptr::null_mut(), 0, 0);
+        assert!(!null_seek.error.is_null());
+        paimon_error_free(null_seek.error);
 
         paimon_blob_stream_free(opened.stream);
         paimon_blob_reader_free(created.reader);
