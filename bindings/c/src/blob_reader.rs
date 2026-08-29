@@ -23,7 +23,20 @@ use paimon::BlobReader;
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{paimon_result_blob_reader, paimon_result_read_blobs};
 use crate::runtime;
-use crate::types::{paimon_blob_reader, paimon_byte_slice, paimon_bytes_array, paimon_option};
+use crate::types::{
+    paimon_blob_reader, paimon_byte_slice, paimon_bytes_array, paimon_option, paimon_table,
+};
+
+fn new_reader(reader: BlobReader) -> paimon_result_blob_reader {
+    let reader = Box::new(reader);
+    let wrapper = Box::new(paimon_blob_reader {
+        inner: Box::into_raw(reader) as *mut c_void,
+    });
+    paimon_result_blob_reader {
+        reader: Box::into_raw(wrapper),
+        error: std::ptr::null_mut(),
+    }
+}
 
 fn read_error(error: *mut paimon_error) -> paimon_result_read_blobs {
     paimon_result_read_blobs {
@@ -74,14 +87,26 @@ pub unsafe extern "C" fn paimon_blob_reader_new(
         }
     }
 
-    let reader = Box::new(BlobReader::new(storage_options));
-    let wrapper = Box::new(paimon_blob_reader {
-        inner: Box::into_raw(reader) as *mut c_void,
-    });
-    paimon_result_blob_reader {
-        reader: Box::into_raw(wrapper),
-        error: std::ptr::null_mut(),
+    new_reader(BlobReader::new(storage_options))
+}
+
+/// Create a reader using a table's FileIO.
+///
+/// # Safety
+/// `table` is a valid handle returned by the Paimon C API.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_new_blob_reader(
+    table: *const paimon_table,
+) -> paimon_result_blob_reader {
+    if let Err(error) = check_non_null(table, "table") {
+        return paimon_result_blob_reader {
+            reader: std::ptr::null_mut(),
+            error,
+        };
     }
+
+    let table = &*((*table).inner as *const paimon::Table);
+    new_reader(BlobReader::from_file_io(table.file_io().clone()))
 }
 
 /// # Safety

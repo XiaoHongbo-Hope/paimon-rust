@@ -107,6 +107,35 @@ func TestBlobReaderReadBlobAndBatch(t *testing.T) {
 	}
 }
 
+func TestBlobReaderFromTableOutlivesTable(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "blob-table-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("abcdefghij"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	table := openCopiedTestTable(t)
+	reader, err := table.NewBlobReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	table.Close()
+	defer reader.Close()
+
+	value, err := reader.ReadBlob(blobDescriptorV2(localFileURI(file.Name()), 2, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(value) != "cdef" {
+		t.Fatalf("ReadBlob returned %q, want %q", value, "cdef")
+	}
+}
+
 func TestBlobReaderErrorsAndClose(t *testing.T) {
 	reader, err := paimon.NewBlobReader(map[string]string{})
 	if err != nil {

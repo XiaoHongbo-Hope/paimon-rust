@@ -51,6 +51,19 @@ func NewBlobReader(storageOptions map[string]string) (*BlobReader, error) {
 	return &BlobReader{ctx: ctx, lib: lib, inner: inner}, nil
 }
 
+// NewBlobReader creates a descriptor reader using this table's FileIO.
+func (t *Table) NewBlobReader() (*BlobReader, error) {
+	if t.inner == nil {
+		return nil, ErrClosed
+	}
+	inner, err := ffiTableNewBlobReader.symbol(t.ctx)(t.inner)
+	if err != nil {
+		return nil, err
+	}
+	t.lib.acquire()
+	return &BlobReader{ctx: t.ctx, lib: t.lib, inner: inner}, nil
+}
+
 // ReadBlob resolves one descriptor.
 func (r *BlobReader) ReadBlob(descriptor []byte) ([]byte, error) {
 	values, err := r.ReadBlobs([][]byte{descriptor})
@@ -117,6 +130,24 @@ var ffiBlobReaderNew = newFFI(ffiOpts{
 			unsafe.Pointer(&optsLen),
 		)
 		runtime.KeepAlive(opts)
+		if result.error != nil {
+			return nil, parseError(ctx, result.error)
+		}
+		return result.reader, nil
+	}
+})
+
+var ffiTableNewBlobReader = newFFI(ffiOpts{
+	sym:    "paimon_table_new_blob_reader",
+	rType:  &typeResultBlobReader,
+	aTypes: []*ffi.Type{&ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable) (*paimonBlobReader, error) {
+	return func(table *paimonTable) (*paimonBlobReader, error) {
+		var result resultBlobReader
+		ffiCall(
+			unsafe.Pointer(&result),
+			unsafe.Pointer(&table),
+		)
 		if result.error != nil {
 			return nil, parseError(ctx, result.error)
 		}
