@@ -123,6 +123,11 @@ pub struct paimon_blob_reader {
 }
 
 #[repr(C)]
+pub struct paimon_blob_stream {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
 pub struct paimon_identifier {
     pub inner: *mut c_void,
 }

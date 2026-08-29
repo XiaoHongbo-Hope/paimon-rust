@@ -38,6 +38,24 @@ var (
 		}[0],
 	}
 
+	typeResultBlobStream = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultBlobStreamRead = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	typePaimonBytesArray = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -289,6 +307,7 @@ type paimonError struct {
 // Opaque pointer wrappers
 type paimonCatalog struct{}
 type paimonBlobReader struct{}
+type paimonBlobStream struct{}
 type paimonIdentifier struct{}
 type paimonTable struct{}
 type paimonReadBuilder struct{}
@@ -315,6 +334,16 @@ type resultCatalogNew struct {
 type resultBlobReader struct {
 	reader *paimonBlobReader
 	error  *paimonError
+}
+
+type resultBlobStream struct {
+	stream *paimonBlobStream
+	error  *paimonError
+}
+
+type resultBlobStreamRead struct {
+	bytesRead uintptr
+	error     *paimonError
 }
 
 type resultReadBlobs struct {

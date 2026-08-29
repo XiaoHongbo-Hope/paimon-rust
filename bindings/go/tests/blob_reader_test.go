@@ -22,6 +22,7 @@ package paimon_test
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -164,5 +165,112 @@ func TestBlobReaderErrorsAndClose(t *testing.T) {
 	}
 	if _, err := reader.ReadBlobs(nil); !errors.Is(err, paimon.ErrClosed) {
 		t.Fatalf("ReadBlobs after Close returned %v, want ErrClosed", err)
+	}
+}
+
+func TestBlobStreamReadsIncrementally(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "blob-stream-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("abcdefghij"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := paimon.NewBlobReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := reader.OpenBlob(blobDescriptorV2(localFileURI(file.Name()), 2, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.Close()
+
+	buffer := make([]byte, 2)
+	var value []byte
+	for {
+		read, err := stream.Read(buffer)
+		value = append(value, buffer[:read]...)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if string(value) != "cdefg" {
+		t.Fatalf("stream returned %q, want %q", value, "cdefg")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Read(buffer); !errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("Read after Close returned %v, want ErrClosed", err)
+	}
+}
+
+func TestBlobStreamToEndEmptyAndLazyErrors(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "blob-stream-tail-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("abcdefghij"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := paimon.NewBlobReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	stream, err := reader.OpenBlob(blobDescriptorV2(localFileURI(file.Name()), 4, -1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.Close()
+	if string(value) != "efghij" {
+		t.Fatalf("stream returned %q, want %q", value, "efghij")
+	}
+
+	empty, err := reader.OpenBlob(blobDescriptorV2(localFileURI(file.Name()), 3, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err = io.ReadAll(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty.Close()
+	if len(value) != 0 {
+		t.Fatalf("empty stream returned %q", value)
+	}
+
+	missing := localFileURI(t.TempDir() + "/missing.blob")
+	lazy, err := reader.OpenBlob(blobDescriptorV2(missing, 0, -1))
+	if err != nil {
+		t.Fatalf("OpenBlob performed eager I/O: %v", err)
+	}
+	defer lazy.Close()
+	if _, err := lazy.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected missing object error on first Read")
+	}
+
+	if _, err := reader.OpenBlob(nil); err == nil {
+		t.Fatal("expected invalid descriptor error")
 	}
 }

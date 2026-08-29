@@ -18,13 +18,17 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use paimon::BlobReader;
+use paimon::{BlobReader, BlobStream};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
-use crate::result::{paimon_result_blob_reader, paimon_result_read_blobs};
+use crate::result::{
+    paimon_result_blob_reader, paimon_result_blob_stream, paimon_result_blob_stream_read,
+    paimon_result_read_blobs,
+};
 use crate::runtime;
 use crate::types::{
-    paimon_blob_reader, paimon_byte_slice, paimon_bytes_array, paimon_option, paimon_table,
+    paimon_blob_reader, paimon_blob_stream, paimon_byte_slice, paimon_bytes_array, paimon_option,
+    paimon_table,
 };
 
 fn new_reader(reader: BlobReader) -> paimon_result_blob_reader {
@@ -41,6 +45,13 @@ fn new_reader(reader: BlobReader) -> paimon_result_blob_reader {
 fn read_error(error: *mut paimon_error) -> paimon_result_read_blobs {
     paimon_result_read_blobs {
         blobs: paimon_bytes_array::empty(),
+        error,
+    }
+}
+
+fn stream_error(error: *mut paimon_error) -> paimon_result_blob_stream {
+    paimon_result_blob_stream {
+        stream: std::ptr::null_mut(),
         error,
     }
 }
@@ -158,6 +169,105 @@ pub unsafe extern "C" fn paimon_blob_reader_read_blobs(
             error: std::ptr::null_mut(),
         },
         Err(error) => read_error(paimon_error::from_paimon(error)),
+    }
+}
+
+/// Open one descriptor for incremental reads.
+///
+/// # Safety
+/// `reader` is valid and `descriptor` points to `descriptor_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_blob_reader_open_blob(
+    reader: *const paimon_blob_reader,
+    descriptor: *const u8,
+    descriptor_len: usize,
+) -> paimon_result_blob_stream {
+    if let Err(error) = check_non_null(reader, "blob reader") {
+        return stream_error(error);
+    }
+    if descriptor_len > 0 && descriptor.is_null() {
+        return stream_error(paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            "null pointer passed for `descriptor`".to_string(),
+        ));
+    }
+    let bytes = if descriptor_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(descriptor, descriptor_len)
+    };
+    let reader = &*((*reader).inner as *const BlobReader);
+    match reader.open_blob(bytes) {
+        Ok(stream) => {
+            let stream = Box::new(stream);
+            let wrapper = Box::new(paimon_blob_stream {
+                inner: Box::into_raw(stream) as *mut c_void,
+            });
+            paimon_result_blob_stream {
+                stream: Box::into_raw(wrapper),
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(error) => stream_error(paimon_error::from_paimon(error)),
+    }
+}
+
+/// Read at most `buffer_len` bytes into caller-owned memory.
+///
+/// A zero `bytes_read` result means end of stream when `buffer_len` is nonzero.
+///
+/// # Safety
+/// `stream` is valid and `buffer` points to `buffer_len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_blob_stream_read(
+    stream: *mut paimon_blob_stream,
+    buffer: *mut u8,
+    buffer_len: usize,
+) -> paimon_result_blob_stream_read {
+    if let Err(error) = check_non_null(stream, "blob stream") {
+        return paimon_result_blob_stream_read {
+            bytes_read: 0,
+            error,
+        };
+    }
+    if buffer_len > 0 && buffer.is_null() {
+        return paimon_result_blob_stream_read {
+            bytes_read: 0,
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                "null pointer passed for `buffer`".to_string(),
+            ),
+        };
+    }
+
+    let stream = &mut *((*stream).inner as *mut BlobStream);
+    match runtime().block_on(stream.read(buffer_len)) {
+        Ok(bytes) => {
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+            }
+            paimon_result_blob_stream_read {
+                bytes_read: bytes.len(),
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(error) => paimon_result_blob_stream_read {
+            bytes_read: 0,
+            error: paimon_error::from_paimon(error),
+        },
+    }
+}
+
+/// # Safety
+/// `stream` is null or was returned by `paimon_blob_reader_open_blob`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_blob_stream_free(stream: *mut paimon_blob_stream) {
+    if stream.is_null() {
+        return;
+    }
+    let stream = Box::from_raw(stream);
+    if !stream.inner.is_null() {
+        drop(Box::from_raw(stream.inner as *mut BlobStream));
     }
 }
 

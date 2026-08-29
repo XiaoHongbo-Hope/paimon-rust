@@ -107,6 +107,22 @@ with the same FileIO option names used by catalogs. If StarRocks returns a hex
 or base64 string, decode it to the original descriptor bytes before calling
 `ReadBlobs`.
 
+Stream a large value without holding it all in memory:
+
+```go
+stream, err := reader.OpenBlob(descriptor)
+if err != nil {
+    log.Fatal(err)
+}
+defer stream.Close()
+if _, err := io.Copy(destination, stream); err != nil {
+    log.Fatal(err)
+}
+```
+
+`OpenBlob` is lazy and returns an `io.ReadCloser`. `ReadBlobs` remains the batch
+API that groups and merges ranges; separate streams are not merged together.
+
 For DLF temporary data tokens, reuse a table's refreshing FileIO:
 
 ```go
@@ -116,6 +132,7 @@ catalog, err := paimon.NewCatalog(map[string]string{
     "warehouse":                  os.Getenv("DLF_CATALOG"),
     "token.provider":             "dlf",
     "dlf.region":                 os.Getenv("DLF_REGION"),
+    "dlf.oss-endpoint":           os.Getenv("DLF_OSS_ENDPOINT"),
     "dlf.token-loader":           "ecs",
     "dlf.token-ecs-role-name":    os.Getenv("DLF_ECS_ROLE"),
     "data-token.enabled":         "true",
@@ -136,8 +153,10 @@ if err != nil {
 defer reader.Close()
 ```
 
-The reader keeps the table FileIO and refreshes DLF data tokens before expiry.
-Static options passed to `paimon.NewBlobReader` are not refreshed.
+The reader and its streams keep the table FileIO and refresh DLF data tokens
+before expiry. Set `dlf.oss-endpoint` when the server-provided endpoint is not
+reachable from the application. Static options passed to
+`paimon.NewBlobReader` are not refreshed.
 
 Reads are grouped by URI and nearby ranges are merged. The fixed limits are a
 64 KiB merge gap, 8 MiB merged span, 8 concurrent requests, and 64 MiB of
