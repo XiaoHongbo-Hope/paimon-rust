@@ -29,6 +29,34 @@ import (
 
 // FFI type definitions mirroring C repr structs from paimon-c.
 var (
+	typeResultBlobReader = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typePaimonBytesArray = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultReadBlobs = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	// Result types: { value, *error }
 	// paimon_result_catalog_new { catalog: paimon_catalog, error: *paimon_error }
 	typeResultCatalogNew = ffi.Type{
@@ -243,6 +271,16 @@ type paimonBytes struct {
 	len  uintptr
 }
 
+type paimonByteSlice struct {
+	data *byte
+	len  uintptr
+}
+
+type paimonBytesArray struct {
+	data *paimonBytes
+	len  uintptr
+}
+
 type paimonError struct {
 	code    int32
 	message paimonBytes
@@ -250,6 +288,7 @@ type paimonError struct {
 
 // Opaque pointer wrappers
 type paimonCatalog struct{}
+type paimonBlobReader struct{}
 type paimonIdentifier struct{}
 type paimonTable struct{}
 type paimonReadBuilder struct{}
@@ -271,6 +310,16 @@ type paimonPostponeFixedBucketCommitMessages struct{}
 type resultCatalogNew struct {
 	catalog *paimonCatalog
 	error   *paimonError
+}
+
+type resultBlobReader struct {
+	reader *paimonBlobReader
+	error  *paimonError
+}
+
+type resultReadBlobs struct {
+	blobs paimonBytesArray
+	error *paimonError
 }
 
 type resultGetTable struct {

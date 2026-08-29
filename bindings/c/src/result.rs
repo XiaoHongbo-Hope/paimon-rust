@@ -19,6 +19,18 @@ use crate::error::paimon_error;
 use crate::types::*;
 
 #[repr(C)]
+pub struct paimon_result_blob_reader {
+    pub reader: *mut paimon_blob_reader,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_read_blobs {
+    pub blobs: paimon_bytes_array,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_catalog_new {
     pub catalog: *mut paimon_catalog,
     pub error: *mut paimon_error,

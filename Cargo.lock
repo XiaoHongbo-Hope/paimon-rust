@@ -4644,7 +4644,9 @@ dependencies = [
  "paimon",
  "paimon-vindex-core",
  "serde_json",
+ "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
