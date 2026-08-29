@@ -79,6 +79,7 @@ impl BlobReader {
             |uri| self.file_io(uri),
             BlobReadLimiter::new(),
             &mut value_capacity,
+            BlobResolutionMode::Standalone,
         )
         .await?;
 
@@ -112,6 +113,93 @@ impl BlobReader {
             .build()?;
         file_ios.insert(scheme, file_io.clone());
         Ok(file_io)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BlobResolutionMode {
+    Managed,
+    Standalone,
+}
+
+impl BlobResolutionMode {
+    fn contextualize(
+        self,
+        error: crate::Error,
+        indices: &[usize],
+        uri: Option<&str>,
+    ) -> crate::Error {
+        match self {
+            Self::Managed => error,
+            Self::Standalone => blob_error_with_context(error, indices, uri),
+        }
+    }
+
+    fn display_uri(self, uri: &str) -> String {
+        match self {
+            Self::Managed => uri.to_string(),
+            Self::Standalone => sanitize_blob_uri(uri),
+        }
+    }
+
+    fn metadata_error(self, error: crate::Error, indices: &[usize], uri: &str) -> crate::Error {
+        match self {
+            Self::Managed => {
+                let message =
+                    format!("Failed to read metadata for BlobDescriptor URI '{uri}': {error}");
+                crate::Error::UnexpectedError {
+                    message,
+                    source: Some(Box::new(error)),
+                }
+            }
+            Self::Standalone => blob_error_with_context(error, indices, Some(uri)),
+        }
+    }
+
+    fn range_read_error(
+        self,
+        error: crate::Error,
+        indices: &[usize],
+        uri: &str,
+        start: u64,
+        end: u64,
+    ) -> crate::Error {
+        match self {
+            Self::Managed => {
+                let message = format!(
+                    "Failed to read BlobDescriptor URI '{uri}' range {start}..{end}: {error}"
+                );
+                crate::Error::UnexpectedError {
+                    message,
+                    source: Some(Box::new(error)),
+                }
+            }
+            Self::Standalone => blob_error_with_context(error, indices, Some(uri)),
+        }
+    }
+
+    fn short_read_error(
+        self,
+        indices: &[usize],
+        uri: &str,
+        start: u64,
+        end: u64,
+        expected_len: u64,
+        actual_len: u64,
+    ) -> crate::Error {
+        let message = match self {
+            Self::Managed => format!(
+                "Failed to read BlobDescriptor URI '{uri}': short read for range {start}..{end}, expected={expected_len} bytes, actual={actual_len} bytes"
+            ),
+            Self::Standalone => format!(
+                "BlobDescriptor input indices {indices:?}, URI '{}': short read for range {start}..{end}, expected={expected_len} bytes, actual={actual_len} bytes",
+                sanitize_blob_uri(uri)
+            ),
+        };
+        crate::Error::DataInvalid {
+            message,
+            source: None,
+        }
     }
 }
 
@@ -244,6 +332,7 @@ pub(crate) async fn resolve_blob_column(
         |_| Ok(file_io.clone()),
         limiter,
         &mut value_capacity,
+        BlobResolutionMode::Managed,
     )
     .await?;
 
@@ -263,6 +352,7 @@ async fn resolve_blob_requests<F>(
     file_io_for_uri: F,
     limiter: BlobReadLimiter,
     value_capacity: &mut usize,
+    mode: BlobResolutionMode,
 ) -> Result<()>
 where
     F: Fn(&str) -> Result<FileIO>,
@@ -274,16 +364,17 @@ where
             .map(|request| request.row)
             .collect::<Vec<_>>();
         let file_io =
-            file_io_for_uri(&uri).map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?;
+            file_io_for_uri(&uri).map_err(|e| mode.contextualize(e, &indices, Some(&uri)))?;
         let input = file_io
             .new_input(&uri)
-            .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?;
+            .map_err(|e| mode.contextualize(e, &indices, Some(&uri)))?;
         let file_size = if requests.iter().any(|request| request.length.is_none()) {
-            let _metadata_permit = limiter.acquire_request(&uri, "metadata").await?;
+            let display_uri = mode.display_uri(&uri);
+            let _metadata_permit = limiter.acquire_request(&display_uri, "metadata").await?;
             input
                 .metadata()
                 .await
-                .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?
+                .map_err(|e| mode.metadata_error(e, &indices, &uri))?
                 .size
         } else {
             0
@@ -293,16 +384,16 @@ where
             let length = request
                 .length
                 .unwrap_or_else(|| file_size.saturating_sub(request.offset));
-            request
-                .offset
-                .checked_add(length)
-                .ok_or_else(|| crate::Error::DataInvalid {
+            if request.offset.checked_add(length).is_none() {
+                let error = crate::Error::DataInvalid {
                     message: format!(
                         "BlobDescriptor range overflows u64: offset={}, length={length}",
                         request.offset
                     ),
                     source: None,
-                })?;
+                };
+                return Err(mode.contextualize(error, &[request.row], Some(&uri)));
+            }
             *value_capacity = value_capacity.saturating_add(length as usize);
             if length == 0 {
                 cells[request.row] = ResolvedBlobCell::Value(Bytes::new());
@@ -323,7 +414,7 @@ where
             input
                 .reader()
                 .await
-                .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?,
+                .map_err(|e| mode.contextualize(e, &indices, Some(&uri)))?,
         );
         read_groups.push(BlobReadGroup {
             uri,
@@ -332,7 +423,9 @@ where
         });
     }
 
-    for ResolvedMergedBlobRead { merged, data } in read_blob_groups(read_groups, limiter).await? {
+    for ResolvedMergedBlobRead { merged, data } in
+        read_blob_groups(read_groups, limiter, mode).await?
+    {
         for request in merged.requests {
             let start = usize::try_from(request.offset - merged.start).map_err(|e| {
                 crate::Error::DataInvalid {
@@ -469,18 +562,18 @@ struct BlobReadGroup {
 async fn read_blob_groups(
     groups: Vec<BlobReadGroup>,
     limiter: BlobReadLimiter,
+    mode: BlobResolutionMode,
 ) -> Result<Vec<ResolvedMergedBlobRead>> {
-    let grouped_results: Vec<Vec<ResolvedMergedBlobRead>> =
-        stream::iter(groups)
-            .map(|group| {
-                let limiter = limiter.clone();
-                async move {
-                    read_merged_blob_ranges(&group.uri, group.reader, group.reads, limiter).await
-                }
-            })
-            .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
-            .try_collect()
-            .await?;
+    let grouped_results: Vec<Vec<ResolvedMergedBlobRead>> = stream::iter(groups)
+        .map(|group| {
+            let limiter = limiter.clone();
+            async move {
+                read_merged_blob_ranges(&group.uri, group.reader, group.reads, limiter, mode).await
+            }
+        })
+        .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
+        .try_collect()
+        .await?;
     Ok(grouped_results.into_iter().flatten().collect())
 }
 
@@ -489,6 +582,7 @@ async fn read_merged_blob_ranges(
     reader: Arc<dyn FileRead>,
     reads: Vec<MergedBlobRead>,
     limiter: BlobReadLimiter,
+    mode: BlobResolutionMode,
 ) -> Result<Vec<ResolvedMergedBlobRead>> {
     stream::iter(reads)
         .map(|merged| {
@@ -501,23 +595,24 @@ async fn read_merged_blob_ranges(
                     .iter()
                     .map(|request| request.row)
                     .collect::<Vec<_>>();
+                let display_uri = mode.display_uri(&uri);
                 let _permits = limiter
-                    .acquire_read(merged.end - merged.start, &uri)
+                    .acquire_read(merged.end - merged.start, &display_uri)
                     .await?;
-                let data = reader
-                    .read(merged.start..merged.end)
-                    .await
-                    .map_err(|e| blob_error_with_context(e, &indices, Some(&uri)))?;
+                let data = reader.read(merged.start..merged.end).await.map_err(|e| {
+                    mode.range_read_error(e, &indices, &uri, merged.start, merged.end)
+                })?;
                 let expected_len = merged.end - merged.start;
                 let actual_len = data.len() as u64;
                 if actual_len != expected_len {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "BlobDescriptor input indices {indices:?}, URI '{}': short read for range {}..{}, expected={expected_len} bytes, actual={actual_len} bytes",
-                            sanitize_blob_uri(&uri), merged.start, merged.end
-                        ),
-                        source: None,
-                    });
+                    return Err(mode.short_read_error(
+                        &indices,
+                        &uri,
+                        merged.start,
+                        merged.end,
+                        expected_len,
+                        actual_len,
+                    ));
                 }
                 Ok(ResolvedMergedBlobRead { merged, data })
             }
@@ -654,6 +749,7 @@ mod tests {
             std::sync::Arc::new(reader.clone()),
             reads,
             BlobReadLimiter::new(),
+            BlobResolutionMode::Standalone,
         )
         .await
         .unwrap();
@@ -692,6 +788,7 @@ mod tests {
             std::sync::Arc::new(reader.clone()),
             reads,
             BlobReadLimiter::with_limits(8, 4, 1),
+            BlobResolutionMode::Standalone,
         )
         .await
         .unwrap();
@@ -733,9 +830,13 @@ mod tests {
             })
             .collect();
 
-        let results = read_blob_groups(groups, BlobReadLimiter::new())
-            .await
-            .unwrap();
+        let results = read_blob_groups(
+            groups,
+            BlobReadLimiter::new(),
+            BlobResolutionMode::Standalone,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -792,6 +893,7 @@ mod tests {
             Arc::new(reader.clone()),
             reads,
             BlobReadLimiter::new(),
+            BlobResolutionMode::Standalone,
         )
         .await
         .unwrap();
@@ -815,6 +917,7 @@ mod tests {
                 }],
             }],
             BlobReadLimiter::new(),
+            BlobResolutionMode::Standalone,
         )
         .await
         .unwrap_err();
