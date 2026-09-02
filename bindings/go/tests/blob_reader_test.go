@@ -30,6 +30,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	paimon "github.com/apache/paimon-rust/bindings/go"
 )
 
@@ -98,6 +101,61 @@ func TestBlobReaderReadBlobAndBatch(t *testing.T) {
 	}
 	if empty == nil || len(empty) != 0 {
 		t.Fatalf("empty batch returned %#v", empty)
+	}
+}
+
+func TestStringBlobMapDescriptors(t *testing.T) {
+	file := writeBlobFile(t, "map", "abcdefghij")
+	b := array.NewMapBuilder(
+		memory.DefaultAllocator,
+		arrow.BinaryTypes.String,
+		arrow.BinaryTypes.Binary,
+		false,
+	)
+	defer b.Release()
+	keys := b.KeyBuilder().(*array.StringBuilder)
+	values := b.ItemBuilder().(*array.BinaryBuilder)
+	b.Append(true)
+	keys.Append("first")
+	values.Append(blobDescriptorV2(localFileURI(file), 0, 3))
+	keys.Append("tail")
+	values.Append(blobDescriptorV2(localFileURI(file), 6, -1))
+	b.AppendNull()
+	column := b.NewMapArray()
+
+	descriptors, err := paimon.StringBlobMapDescriptors(column, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nullMap, err := paimon.StringBlobMapDescriptors(column, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	column.Release()
+	if len(descriptors["first"]) == 0 || len(descriptors["tail"]) == 0 {
+		t.Fatalf("descriptor map is invalid after Arrow release: %#v", descriptors)
+	}
+	seen := make(map[string]bool)
+	for key := range descriptors {
+		seen[key] = true
+	}
+	if !seen["first"] || !seen["tail"] {
+		t.Fatalf("descriptor map traversal missed keys: %#v", seen)
+	}
+	reader, err := paimon.NewBlobReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	resolved, err := reader.ReadBlobs([][]byte{descriptors["tail"], descriptors["first"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resolved[0]) != "ghij" || string(resolved[1]) != "abc" {
+		t.Fatalf("unexpected values: %q", resolved)
+	}
+	if nullMap != nil {
+		t.Fatalf("null map returned %#v", nullMap)
 	}
 }
 
