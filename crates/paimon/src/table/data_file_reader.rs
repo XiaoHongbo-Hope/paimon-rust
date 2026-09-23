@@ -107,6 +107,10 @@ impl FileRead for TimedFileRead {
         self.timing.add_file_read(start.elapsed());
         result
     }
+
+    fn cache_key(&self) -> Option<&str> {
+        self.inner.cache_key()
+    }
 }
 
 /// Reads data files through their format-specific readers.
