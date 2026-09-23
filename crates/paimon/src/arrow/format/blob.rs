@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
 use crate::io::{FileRead, FileWrite};
@@ -33,12 +34,9 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lru::LruCache;
 use std::mem::size_of;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use tokio::sync::OnceCell;
+use std::sync::{Arc, LazyLock};
 
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
@@ -1711,31 +1709,23 @@ struct BlobFileIndexCacheKey {
     size: u64,
 }
 
-struct BlobFileIndexCacheEntry {
-    index: OnceCell<Arc<BlobFileIndex>>,
-    base_weight: usize,
-    weight: AtomicUsize,
-}
-
-struct BlobFileIndexCacheState {
-    entries: LruCache<BlobFileIndexCacheKey, Arc<BlobFileIndexCacheEntry>>,
-    weight: usize,
-}
-
 struct BlobFileIndexCache {
-    max_bytes: usize,
-    state: Mutex<BlobFileIndexCacheState>,
+    inner: FileMetadataCache<BlobFileIndexCacheKey, BlobFileIndex>,
 }
 
 impl BlobFileIndexCache {
     fn new(max_bytes: usize) -> Self {
         Self {
-            max_bytes,
-            state: Mutex::new(BlobFileIndexCacheState {
-                entries: LruCache::unbounded(),
-                weight: 0,
-            }),
+            inner: FileMetadataCache::new(max_bytes),
         }
+    }
+
+    #[cfg(test)]
+    fn entry_weight(key: &str, index: &BlobFileIndex) -> usize {
+        FileMetadataCache::<BlobFileIndexCacheKey, BlobFileIndex>::entry_weight(
+            key.len(),
+            index.estimated_memory_size(),
+        )
     }
 
     async fn load(
@@ -1744,90 +1734,24 @@ impl BlobFileIndexCache {
         file_size: u64,
         enabled: bool,
     ) -> crate::Result<Arc<BlobFileIndex>> {
-        let Some(file) = enabled
+        let key = enabled
             .then(|| reader.cache_key())
             .flatten()
             .filter(|key| !key.is_empty())
-        else {
-            return BlobFileIndex::load(reader, file_size).await.map(Arc::new);
-        };
-        let key = BlobFileIndexCacheKey {
-            file: file.to_string(),
-            // Paimon data files are immutable; size also separates supported replacements.
-            size: file_size,
-        };
-        let base_weight = size_of::<BlobFileIndexCacheKey>()
-            .saturating_add(key.file.capacity())
-            .saturating_add(size_of::<BlobFileIndexCacheEntry>());
-        if self.max_bytes == 0 || base_weight > self.max_bytes {
-            return BlobFileIndex::load(reader, file_size).await.map(Arc::new);
-        }
-
-        let entry = {
-            let mut state = self.state.lock().unwrap();
-            if let Some(entry) = state.entries.get(&key) {
-                Arc::clone(entry)
-            } else {
-                let entry = Arc::new(BlobFileIndexCacheEntry {
-                    index: OnceCell::new(),
-                    base_weight,
-                    weight: AtomicUsize::new(base_weight),
-                });
-                state.weight = state.weight.saturating_add(base_weight);
-                state.entries.put(key.clone(), Arc::clone(&entry));
-                self.evict(&mut state);
-                entry
-            }
-        };
-
-        let index = Arc::clone(
-            entry
-                .index
-                .get_or_try_init(|| async {
-                    BlobFileIndex::load(reader, file_size).await.map(Arc::new)
-                })
-                .await?,
-        );
-        self.record_loaded(&key, &entry, &index);
-        Ok(index)
-    }
-
-    fn record_loaded(
-        &self,
-        key: &BlobFileIndexCacheKey,
-        entry: &Arc<BlobFileIndexCacheEntry>,
-        index: &BlobFileIndex,
-    ) {
-        let loaded = entry
-            .base_weight
-            .saturating_add(index.estimated_memory_size());
-        let mut state = self.state.lock().unwrap();
-        if state
-            .entries
-            .peek(key)
-            .is_some_and(|cached| Arc::ptr_eq(cached, entry))
-            && entry.weight.load(Ordering::Relaxed) == entry.base_weight
-        {
-            entry.weight.store(loaded, Ordering::Relaxed);
-            state.weight = state
-                .weight
-                .saturating_sub(entry.base_weight)
-                .saturating_add(loaded);
-            state.entries.promote(key);
-            self.evict(&mut state);
-        }
-    }
-
-    fn evict(&self, state: &mut BlobFileIndexCacheState) {
-        while state.weight > self.max_bytes {
-            let Some((_key, entry)) = state.entries.pop_lru() else {
-                state.weight = 0;
-                break;
-            };
-            state.weight = state
-                .weight
-                .saturating_sub(entry.weight.load(Ordering::Relaxed));
-        }
+            .map(|file| BlobFileIndexCacheKey {
+                file: file.to_string(),
+                // Paimon data files are immutable; size separates supported replacements.
+                size: file_size,
+            });
+        let key_heap_bytes = key.as_ref().map_or(0, |key| key.file.capacity());
+        self.inner
+            .get_or_try_insert_with(
+                key,
+                key_heap_bytes,
+                || async { BlobFileIndex::load(reader, file_size).await.map(Arc::new) },
+                BlobFileIndex::estimated_memory_size,
+            )
+            .await
     }
 }
 
@@ -2641,10 +2565,7 @@ mod tests {
         let index = BlobFileIndex::load(&BytesFileRead(bytes.clone()), bytes.len() as u64)
             .await
             .unwrap();
-        let max_bytes = size_of::<BlobFileIndexCacheKey>()
-            + first_key.len()
-            + size_of::<BlobFileIndexCacheEntry>()
-            + index.estimated_memory_size();
+        let max_bytes = BlobFileIndexCache::entry_weight(first_key, &index);
         let cache = BlobFileIndexCache::new(max_bytes);
         let first = TrackingFileRead::new(bytes.clone()).with_cache_key(first_key);
         let second = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0other.blob");

@@ -17,6 +17,7 @@
 
 mod avro;
 pub(crate) mod blob;
+mod metadata_cache;
 mod mosaic;
 mod orc;
 pub(crate) mod parquet;
