@@ -34,7 +34,8 @@ struct State<K, V> {
 }
 
 pub(super) struct FileMetadataCache<K, V> {
-    max_bytes: usize,
+    max_bytes: AtomicUsize,
+    max_entries: usize,
     state: Mutex<State<K, V>>,
 }
 
@@ -42,9 +43,10 @@ impl<K, V> FileMetadataCache<K, V>
 where
     K: Clone + Eq + Hash,
 {
-    pub(super) fn new(max_bytes: usize) -> Self {
+    pub(super) fn new(max_bytes: usize, max_entries: usize) -> Self {
         Self {
-            max_bytes,
+            max_bytes: AtomicUsize::new(max_bytes),
+            max_entries,
             state: Mutex::new(State {
                 entries: LruCache::unbounded(),
                 weight: 0,
@@ -57,6 +59,11 @@ where
             .saturating_add(std::mem::size_of::<Entry<V>>())
             .saturating_add(key_heap_bytes)
             .saturating_add(value_weight)
+    }
+
+    pub(super) fn resize(&self, max_bytes: usize) {
+        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+        self.evict(&mut self.state.lock().unwrap());
     }
 
     pub(super) async fn get_or_try_insert_with<E, F, Fut, W>(
@@ -75,7 +82,8 @@ where
             return load().await;
         };
         let base_weight = Self::entry_weight(key_heap_bytes, 0);
-        if self.max_bytes == 0 || base_weight > self.max_bytes {
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        if max_bytes == 0 || base_weight > max_bytes {
             return load().await;
         }
 
@@ -133,21 +141,54 @@ where
     }
 
     fn evict(&self, state: &mut State<K, V>) {
-        while state.weight > self.max_bytes {
-            let Some((_key, entry)) = state.entries.peek_lru() else {
-                state.weight = 0;
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        while state.weight > max_bytes || state.entries.len() > self.max_entries {
+            let Some(key) = state
+                .entries
+                .iter()
+                .rev()
+                .find(|(_, entry)| entry.weight.load(Ordering::Relaxed) != entry.base_weight)
+                .map(|(key, _)| key.clone())
+            else {
+                // In-flight loads remain addressable so callers still coalesce.
                 break;
             };
-            // Keep in-flight loads addressable so concurrent callers still coalesce.
-            if entry.weight.load(Ordering::Relaxed) == entry.base_weight {
-                break;
-            }
-            let Some((_key, entry)) = state.entries.pop_lru() else {
+            let Some(entry) = state.entries.pop(&key) else {
+                state.weight = 0;
                 break;
             };
             state.weight = state
                 .weight
                 .saturating_sub(entry.weight.load(Ordering::Relaxed));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    #[tokio::test]
+    async fn evicts_least_recently_used_entry_by_count() {
+        let cache = FileMetadataCache::<String, usize>::new(usize::MAX, 2);
+        let loads = AtomicUsize::new(0);
+
+        for key in ["first", "second", "third", "first"] {
+            cache
+                .get_or_try_insert_with(
+                    Some(key.to_string()),
+                    key.len(),
+                    || async {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(1))
+                    },
+                    |_| 1,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(loads.load(Ordering::Relaxed), 4);
     }
 }

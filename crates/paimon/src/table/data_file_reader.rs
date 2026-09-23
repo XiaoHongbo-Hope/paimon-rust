@@ -111,6 +111,10 @@ impl FileRead for TimedFileRead {
     fn cache_key(&self) -> Option<&str> {
         self.inner.cache_key()
     }
+
+    fn file_format_metadata_cache_max_bytes(&self) -> usize {
+        self.inner.file_format_metadata_cache_max_bytes()
+    }
 }
 
 /// Reads data files through their format-specific readers.

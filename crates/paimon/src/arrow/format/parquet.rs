@@ -2427,10 +2427,11 @@ fn build_row_ranges_selection(
 // ArrowFileReader — async Parquet IO adapter
 // ---------------------------------------------------------------------------
 
-const PARQUET_METADATA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PARQUET_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
+const PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES: usize = 8 * 1024;
 
 static PARQUET_METADATA_CACHE: LazyLock<ParquetMetadataCache> =
-    LazyLock::new(|| ParquetMetadataCache::new(PARQUET_METADATA_CACHE_MAX_BYTES));
+    LazyLock::new(ParquetMetadataCache::new);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ParquetMetadataCacheKey {
@@ -2445,9 +2446,12 @@ struct ParquetMetadataCache {
 }
 
 impl ParquetMetadataCache {
-    fn new(max_bytes: usize) -> Self {
+    fn new() -> Self {
         Self {
-            inner: FileMetadataCache::new(max_bytes),
+            inner: FileMetadataCache::new(
+                crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
+                PARQUET_METADATA_CACHE_MAX_ENTRIES,
+            ),
         }
     }
 
@@ -2457,6 +2461,8 @@ impl ParquetMetadataCache {
         options: Option<&ArrowReaderOptions>,
         enabled: bool,
     ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
+        self.inner
+            .resize(reader.r.file_format_metadata_cache_max_bytes());
         let column_index = options.map_or(PageIndexPolicy::Skip, |o| o.column_index_policy());
         let offset_index = options.map_or(PageIndexPolicy::Skip, |o| o.offset_index_policy());
         let key = enabled
@@ -2476,7 +2482,11 @@ impl ParquetMetadataCache {
                 key,
                 key_heap_bytes,
                 || reader.load_metadata(options),
-                ParquetMetaData::memory_size,
+                |metadata| {
+                    metadata
+                        .memory_size()
+                        .max(PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES)
+                },
             )
             .await
     }
@@ -4621,6 +4631,7 @@ mod tests {
         resident_bytes: Arc<AtomicUsize>,
         peak_resident_bytes: Arc<AtomicUsize>,
         cache_key: Option<Arc<str>>,
+        metadata_cache_max_bytes: usize,
     }
 
     struct TrackedReadBuffer {
@@ -4649,11 +4660,17 @@ mod tests {
                 resident_bytes: Arc::new(AtomicUsize::new(0)),
                 peak_resident_bytes: Arc::new(AtomicUsize::new(0)),
                 cache_key: None,
+                metadata_cache_max_bytes: crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
             }
         }
 
         fn with_cache_key(mut self, cache_key: &str) -> Self {
             self.cache_key = Some(Arc::from(cache_key));
+            self
+        }
+
+        fn with_metadata_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+            self.metadata_cache_max_bytes = max_bytes;
             self
         }
 
@@ -4698,6 +4715,10 @@ mod tests {
         fn cache_key(&self) -> Option<&str> {
             self.cache_key.as_deref()
         }
+
+        fn file_format_metadata_cache_max_bytes(&self) -> usize {
+            self.metadata_cache_max_bytes
+        }
     }
 
     #[tokio::test]
@@ -4706,7 +4727,7 @@ mod tests {
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let cache = super::ParquetMetadataCache::new(1024 * 1024);
+        let cache = super::ParquetMetadataCache::new();
 
         for _ in 0..10 {
             let mut reader =
@@ -4724,7 +4745,7 @@ mod tests {
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
         let unidentified = TrackingFileRead::new(data.clone());
-        let cache = super::ParquetMetadataCache::new(1024 * 1024);
+        let cache = super::ParquetMetadataCache::new();
 
         for _ in 0..2 {
             let mut reader =
@@ -4740,12 +4761,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parquet_metadata_cache_zero_disables_and_clears_cache() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
+        let cache = super::ParquetMetadataCache::new();
+
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        let disabled = tracker.clone().with_metadata_cache_max_bytes(0);
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(disabled));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        assert_eq!(tracker.read_count(), 3);
+    }
+
+    #[tokio::test]
     async fn parquet_metadata_cache_coalesces_concurrent_loads() {
         let data = Bytes::from(
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let cache = super::ParquetMetadataCache::new(1024 * 1024);
+        let cache = super::ParquetMetadataCache::new();
         let loads = (0..10).map(|_| {
             let tracker = tracker.clone();
             let data = data.clone();
@@ -4768,7 +4810,7 @@ mod tests {
         );
         let first = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
         let second = TrackingFileRead::new(data.clone()).with_cache_key("storage-b\0data.parquet");
-        let cache = super::ParquetMetadataCache::new(1024 * 1024);
+        let cache = super::ParquetMetadataCache::new();
 
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(first.clone()));
         cache.load(&mut reader, None, true).await.unwrap();

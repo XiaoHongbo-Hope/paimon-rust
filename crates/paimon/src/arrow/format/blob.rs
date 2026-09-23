@@ -1699,6 +1699,7 @@ struct BlobArrayLayout {
 }
 
 const BLOB_FILE_INDEX_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const BLOB_FILE_INDEX_CACHE_MAX_ENTRIES: usize = 4096;
 
 static BLOB_FILE_INDEX_CACHE: LazyLock<BlobFileIndexCache> =
     LazyLock::new(|| BlobFileIndexCache::new(BLOB_FILE_INDEX_CACHE_MAX_BYTES));
@@ -1716,7 +1717,7 @@ struct BlobFileIndexCache {
 impl BlobFileIndexCache {
     fn new(max_bytes: usize) -> Self {
         Self {
-            inner: FileMetadataCache::new(max_bytes),
+            inner: FileMetadataCache::new(max_bytes, BLOB_FILE_INDEX_CACHE_MAX_ENTRIES),
         }
     }
 

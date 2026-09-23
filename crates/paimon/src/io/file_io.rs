@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::common::options::{parse_memory_size, CatalogOptions};
 use crate::error::*;
 use std::collections::HashMap;
 use std::future::Future;
@@ -92,7 +93,10 @@ pub struct FileIO {
     backend: FileIOBackend,
     cache: Option<Arc<LocalCache>>,
     context_id: u64,
+    file_format_metadata_cache_max_bytes: usize,
 }
+
+pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
 
 static NEXT_FILE_IO_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -106,6 +110,10 @@ impl std::fmt::Debug for FileIO {
             .field("backend", &self.backend)
             .field("cache", &self.cache)
             .field("context_id", &self.context_id)
+            .field(
+                "file_format_metadata_cache_max_bytes",
+                &self.file_format_metadata_cache_max_bytes,
+            )
             .finish()
     }
 }
@@ -222,6 +230,7 @@ impl FileIO {
             source: self.file_source(path)?,
             path: path.to_string(),
             context_id: self.context_id,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             cache: self
                 .cache
                 .as_ref()
@@ -239,6 +248,7 @@ impl FileIO {
             source: self.file_source(path)?,
             path: path.to_string(),
             context_id: self.context_id,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             cache: self
                 .cache
                 .as_ref()
@@ -653,6 +663,22 @@ impl FileIOBuilder {
 
     pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = self.cache.clone();
+        let file_format_metadata_cache_max_bytes = self
+            .props
+            .get(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE)
+            .map(|value| {
+                parse_memory_size(value)
+                    .ok()
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .ok_or_else(|| Error::ConfigInvalid {
+                        message: format!(
+                            "Invalid value for {}: {value}",
+                            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE
+                        ),
+                    })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
         let backend = if let Some(provider) = self.provider.take() {
             if self.operator.is_some() {
                 return Err(Error::ConfigInvalid {
@@ -667,6 +693,7 @@ impl FileIOBuilder {
             backend,
             cache,
             context_id: next_file_io_context_id(),
+            file_format_metadata_cache_max_bytes,
         })
     }
 }
@@ -678,6 +705,10 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
     /// Stable identity of an immutable file within one storage context.
     fn cache_key(&self) -> Option<&str> {
         None
+    }
+
+    fn file_format_metadata_cache_max_bytes(&self) -> usize {
+        DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES
     }
 }
 
@@ -692,10 +723,12 @@ enum InputFileReader {
     Direct {
         reader: opendal::Reader,
         cache_key: String,
+        file_format_metadata_cache_max_bytes: usize,
     },
     Cached {
         reader: CachedFileReader,
         cache_key: String,
+        file_format_metadata_cache_max_bytes: usize,
     },
 }
 
@@ -711,6 +744,19 @@ impl FileRead for InputFileReader {
     fn cache_key(&self) -> Option<&str> {
         match self {
             Self::Direct { cache_key, .. } | Self::Cached { cache_key, .. } => Some(cache_key),
+        }
+    }
+
+    fn file_format_metadata_cache_max_bytes(&self) -> usize {
+        match self {
+            Self::Direct {
+                file_format_metadata_cache_max_bytes,
+                ..
+            }
+            | Self::Cached {
+                file_format_metadata_cache_max_bytes,
+                ..
+            } => *file_format_metadata_cache_max_bytes,
         }
     }
 }
@@ -850,6 +896,7 @@ pub struct InputFile {
     source: FileSource,
     path: String,
     context_id: u64,
+    file_format_metadata_cache_max_bytes: usize,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -904,6 +951,7 @@ impl InputFile {
             return Ok(InputFileReader::Direct {
                 reader,
                 cache_key: blob_cache_key,
+                file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             });
         };
         let read_token = cache.read_token(&cache_path);
@@ -923,6 +971,7 @@ impl InputFile {
                 read_token,
             ),
             cache_key: blob_cache_key,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
         })
     }
 }
@@ -932,6 +981,7 @@ pub struct OutputFile {
     source: FileSource,
     path: String,
     context_id: u64,
+    file_format_metadata_cache_max_bytes: usize,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -951,6 +1001,7 @@ impl OutputFile {
             source: self.source,
             path: self.path,
             context_id: self.context_id,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             cache,
         }
     }
@@ -1765,6 +1816,63 @@ mod input_output_test {
 
         assert_eq!(first_key, clone_key);
         assert_ne!(first_key, second_key);
+    }
+
+    #[tokio::test]
+    async fn test_file_format_metadata_cache_size_reaches_file_reader() {
+        let path = "memory:/metadata-cache-size.parquet";
+        let default = setup_memory_file_io();
+        default
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            default
+                .new_input(path)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .file_format_metadata_cache_max_bytes(),
+            DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES
+        );
+
+        let configured = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "1 mb")
+            .build()
+            .unwrap();
+        configured
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            configured
+                .new_input(path)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .file_format_metadata_cache_max_bytes(),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_file_format_metadata_cache_size_rejects_invalid_value() {
+        let error = FileIOBuilder::new("memory")
+            .with_prop(
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE,
+                "invalid",
+            )
+            .build()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE));
     }
 
     #[tokio::test]
