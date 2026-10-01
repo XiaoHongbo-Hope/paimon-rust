@@ -32,6 +32,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use opendal::raw::{normalize_path, normalize_root};
 use opendal::Operator;
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
@@ -80,6 +81,15 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Object paths that OpenDAL would trim or collapse are rejected by FileIO.
     /// Rename requires both paths to resolve to the same shared service instance.
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
+
+    #[doc(hidden)]
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        let (op, relative_path) = self.create(path).await?;
+        Ok((op, relative_path, None))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +101,7 @@ enum FileIOBackend {
 #[derive(Clone)]
 pub struct FileIO {
     backend: FileIOBackend,
+    cache_namespace: Arc<str>,
     cache: Option<Arc<LocalCache>>,
     file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     blob_index_cache: Arc<BlobIndexCacheContext>,
@@ -284,6 +295,10 @@ impl FileIO {
         }
     }
 
+    pub(crate) fn cache_namespace(&self) -> &str {
+        &self.cache_namespace
+    }
+
     pub(crate) fn create_static(&self, path: &str) -> crate::Result<(Operator, String)> {
         let FileIOBackend::Storage(storage) = &self.backend else {
             return Err(Error::IoUnsupported {
@@ -301,12 +316,35 @@ impl FileIO {
         }
     }
 
-    fn file_source(&self, path: &str) -> crate::Result<FileSource> {
-        match &self.backend {
-            FileIOBackend::Provider(provider) => Ok(FileSource::Provider(provider.clone())),
+    async fn create_with_cache_path(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, String)> {
+        let (op, relative_path, namespace) = match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                (op, relative_path, namespace)
+            }
             FileIOBackend::Storage(_) => {
                 let (op, relative_path) = self.create_static(path)?;
-                let cache_path = cache_object_path(&op, &relative_path);
+                (op, relative_path, None)
+            }
+        };
+        let namespace = namespace.as_deref().unwrap_or(&self.cache_namespace);
+        let cache_path = cache_object_path(namespace, &op, &relative_path);
+        Ok((op, relative_path, cache_path))
+    }
+
+    fn file_source(&self, path: &str) -> crate::Result<FileSource> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => Ok(FileSource::Provider {
+                provider: provider.clone(),
+                cache_namespace: Arc::clone(&self.cache_namespace),
+            }),
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                let cache_path = cache_object_path(&self.cache_namespace, &op, &relative_path);
                 Ok(FileSource::Static {
                     op,
                     relative_path,
@@ -556,8 +594,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.create(path).await?;
-        let cache_path = cache_object_path(&op, relative_path.as_ref());
+        let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
 
         op.delete(relative_path.as_ref())
             .await
@@ -575,8 +612,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.create(path).await?;
-        let cache_path = cache_object_path(&op, relative_path.as_ref());
+        let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
 
         op.delete_with(relative_path.as_ref())
             .recursive(true)
@@ -653,8 +689,8 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
-        let (op_src, relative_path_src) = self.create(src).await?;
-        let (op_dst, relative_path_dst) = self.create(dst).await?;
+        let (op_src, relative_path_src, cache_path_src) = self.create_with_cache_path(src).await?;
+        let (op_dst, relative_path_dst, cache_path_dst) = self.create_with_cache_path(dst).await?;
         if matches!(self.backend, FileIOBackend::Provider(_))
             && !Arc::ptr_eq(op_src.service(), op_dst.service())
         {
@@ -663,9 +699,6 @@ impl FileIO {
                     .to_string(),
             });
         }
-        let cache_path_src = cache_object_path(&op_src, relative_path_src.as_ref());
-        let cache_path_dst = cache_object_path(&op_dst, relative_path_dst.as_ref());
-
         op_src
             .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
             .await
@@ -688,6 +721,15 @@ async fn resolve_provider(
     let (op, relative_path) = provider.create(path).await?;
     validate_provider_path(path, &relative_path)?;
     Ok((op, relative_path))
+}
+
+async fn resolve_provider_with_cache_namespace(
+    provider: &dyn FileIOProvider,
+    path: &str,
+) -> crate::Result<(Operator, String, Option<String>)> {
+    let (op, relative_path, cache_namespace) = provider.create_with_cache_namespace(path).await?;
+    validate_provider_path(path, &relative_path)?;
+    Ok((op, relative_path, cache_namespace))
 }
 
 fn validate_provider_path(path: &str, relative_path: &str) -> Result<()> {
@@ -740,15 +782,38 @@ fn status_path(base_path: &str, entry_path: &str) -> String {
     }
 }
 
-fn cache_object_path(op: &Operator, relative_path: &str) -> String {
+fn cache_object_path(namespace: &str, op: &Operator, relative_path: &str) -> String {
     let info = op.info();
     format!(
-        "{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}",
+        namespace,
         info.scheme(),
         info.name(),
         info.root(),
         relative_path.trim_start_matches('/')
     )
+}
+
+fn storage_cache_namespace(scheme: &str, props: &HashMap<String, String>) -> Arc<str> {
+    // Credentials may rotate while the storage namespace stays unchanged.
+    // Endpoints identify storage without coupling cache reuse to credentials.
+    let mut endpoints = props
+        .iter()
+        .filter(|(key, _)| key.to_ascii_lowercase().ends_with("endpoint"))
+        .collect::<Vec<_>>();
+    endpoints.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut digest = Sha256::new();
+    digest.update(scheme.to_ascii_lowercase());
+    for (key, value) in endpoints {
+        let key = key.to_ascii_lowercase();
+        let value = value.trim_end_matches('/');
+        digest.update((key.len() as u64).to_le_bytes());
+        digest.update(key);
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    Arc::from(hex::encode(digest.finalize()))
 }
 
 /// Whether `path` begins with a Windows drive specifier such as `C:\` or `C:/`.
@@ -850,6 +915,8 @@ impl FileIOBuilder {
 
     pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = self.cache.clone();
+        let cache_namespace =
+            storage_cache_namespace(self.scheme_str.as_deref().unwrap_or_default(), &self.props);
         let file_format_metadata_cache = self
             .file_format_metadata_cache
             .clone()
@@ -872,6 +939,7 @@ impl FileIOBuilder {
         };
         Ok(FileIO {
             backend,
+            cache_namespace,
             cache,
             file_format_metadata_cache,
             blob_index_cache,
@@ -1077,15 +1145,23 @@ enum FileSource {
         relative_path: String,
         cache_path: String,
     },
-    Provider(Arc<dyn FileIOProvider>),
+    Provider {
+        provider: Arc<dyn FileIOProvider>,
+        cache_namespace: Arc<str>,
+    },
 }
 
 impl FileSource {
     async fn resolve(&self, path: &str) -> crate::Result<(Operator, String, String)> {
         match self {
-            Self::Provider(provider) => {
-                let (op, relative_path) = resolve_provider(provider.as_ref(), path).await?;
-                let cache_path = cache_object_path(&op, &relative_path);
+            Self::Provider {
+                provider,
+                cache_namespace,
+            } => {
+                let (op, relative_path, resolved_namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                let namespace = resolved_namespace.as_deref().unwrap_or(cache_namespace);
+                let cache_path = cache_object_path(namespace, &op, &relative_path);
                 Ok((op, relative_path, cache_path))
             }
             Self::Static {
@@ -1893,6 +1969,37 @@ mod input_output_test {
             .with_local_cache(cache)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_storage_cache_namespace_tracks_endpoint_not_credentials() {
+        let first = HashMap::from([
+            (
+                "s3.endpoint".to_string(),
+                "https://first.example".to_string(),
+            ),
+            ("s3.access-key".to_string(), "first-key".to_string()),
+        ]);
+        let rotated = HashMap::from([
+            (
+                "s3.endpoint".to_string(),
+                "https://first.example".to_string(),
+            ),
+            ("s3.access-key".to_string(), "rotated-key".to_string()),
+        ]);
+        let second = HashMap::from([(
+            "s3.endpoint".to_string(),
+            "https://second.example".to_string(),
+        )]);
+
+        assert_eq!(
+            storage_cache_namespace("s3", &first),
+            storage_cache_namespace("s3", &rotated)
+        );
+        assert_ne!(
+            storage_cache_namespace("s3", &first),
+            storage_cache_namespace("s3", &second)
+        );
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {

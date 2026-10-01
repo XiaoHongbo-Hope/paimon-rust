@@ -2369,11 +2369,32 @@ mod tests {
     use super::*;
     use crate::btree::test_util::BytesFileRead;
     use crate::common::CatalogOptions;
+    #[cfg(feature = "storage-oss")]
+    use crate::io::FileIOCacheContext;
     use crate::io::{BlobIndexCacheContext, FileIO, FileIOBuilder};
     use crate::spec::{ArrayType, BlobType, MapType, VarCharType};
     use arrow_array::Array;
+    #[cfg(feature = "storage-oss")]
+    use axum::{
+        body::Body,
+        extract::State,
+        http::{
+            header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+            HeaderMap, Response, StatusCode,
+        },
+        routing::get,
+        Router,
+    };
     use bytes::Bytes;
     use futures::TryStreamExt;
+    #[cfg(feature = "storage-oss")]
+    use opendal::{Configurator, HttpTransporter, OperationContext, Operator};
+    #[cfg(feature = "storage-oss")]
+    use opendal_http_transport_reqwest::ReqwestTransport;
+    #[cfg(feature = "storage-oss")]
+    use opendal_service_oss::OssConfig;
+    #[cfg(feature = "storage-oss")]
+    use std::collections::HashMap;
     use std::mem::size_of;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -2664,6 +2685,55 @@ mod tests {
             read_scalar_blob_file(&second_io, path).await,
             vec![Some(value.to_vec()), None]
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage-oss")]
+    async fn test_blob_index_cache_isolated_by_storage_endpoint() {
+        let value = b"value";
+        let first_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[
+            None,
+            Some(value.as_slice()),
+        ]));
+        let second_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[
+            Some(value.as_slice()),
+            None,
+        ]));
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        let first_endpoint = serve_blob_file(first_bytes.clone()).await;
+        let second_endpoint = serve_blob_file(second_bytes.clone()).await;
+        let cache_context = FileIOCacheContext::from_props(&HashMap::new()).unwrap();
+
+        let first_io = blob_oss_file_io(&first_endpoint, cache_context.clone());
+        let second_io = blob_oss_file_io(&second_endpoint, cache_context);
+        let path = "/data.blob";
+
+        let first = IndexedBlobReader::open(
+            Box::new(first_io.new_input(path).unwrap().reader().await.unwrap()),
+            first_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = IndexedBlobReader::open(
+            Box::new(second_io.new_input(path).unwrap().reader().await.unwrap()),
+            second_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.num_rows(), 2);
+        assert!(matches!(
+            first.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Null]
+        ));
+        assert!(matches!(
+            second.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Value(bytes)] if bytes.as_ref() == value
+        ));
     }
 
     #[tokio::test]
@@ -4043,6 +4113,63 @@ mod tests {
             key.len(),
             index.estimated_cache_bytes(),
         )
+    }
+
+    #[cfg(feature = "storage-oss")]
+    async fn serve_blob_file(bytes: Bytes) -> String {
+        async fn get_blob(State(bytes): State<Bytes>, headers: HeaderMap) -> Response<Body> {
+            let range = headers
+                .get(RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("bytes="))
+                .and_then(|value| value.split_once('-'))
+                .and_then(|(start, end)| {
+                    Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                });
+            let Some((start, end)) = range else {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_LENGTH, bytes.len())
+                    .body(Body::from(bytes))
+                    .unwrap();
+            };
+            let body = bytes.slice(start..=end);
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, body.len())
+                .header(
+                    CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", bytes.len()),
+                )
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let app = Router::new().fallback(get(get_blob)).with_state(bytes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[cfg(feature = "storage-oss")]
+    fn blob_oss_file_io(endpoint: &str, cache_context: FileIOCacheContext) -> FileIO {
+        let mut config = OssConfig::default();
+        config.endpoint = Some(endpoint.to_string());
+        config.addressing_style = Some("path".to_string());
+        config.skip_signature = true;
+        let operator = Operator::new(config.into_builder().bucket("bucket"))
+            .unwrap()
+            .with_context(
+                OperationContext::new()
+                    .with_http_transport(HttpTransporter::new(ReqwestTransport::default())),
+            );
+        FileIOBuilder::new("fs")
+            .with_prop("fs.oss.endpoint", endpoint)
+            .with_fs_operator(operator)
+            .with_cache_context(cache_context)
+            .build()
+            .unwrap()
     }
 
     #[derive(Clone)]

@@ -175,6 +175,16 @@ impl FileIOProvider for RESTTokenFileIO {
     async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
         self.current_file_io().await?.create_static(path)
     }
+
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> Result<(opendal::Operator, String, Option<String>)> {
+        let file_io = self.current_file_io().await?;
+        let cache_namespace = file_io.cache_namespace().to_string();
+        let (op, relative_path) = file_io.create_static(path)?;
+        Ok((op, relative_path, Some(cache_namespace)))
+    }
 }
 
 #[cfg(test)]
