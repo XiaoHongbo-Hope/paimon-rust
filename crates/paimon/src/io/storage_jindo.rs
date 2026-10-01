@@ -29,7 +29,7 @@ use opendal::{Buffer, Builder, BytesRange, Capability, EntryMode, ErrorKind, Met
 use opendal::{Error as OpendalError, OperationContext, Operator, Result as OpendalResult};
 use tokio::sync::{OnceCell, Semaphore};
 
-use crate::error::Error;
+use crate::error::{Error, JINDO_FORK_ERROR};
 use crate::Result;
 
 const OSS_IMPL: &str = "fs.oss.impl";
@@ -49,9 +49,6 @@ const JDO_REST_HTTP_403_ERROR: i32 = 6403;
 const JDO_REST_HTTP_404_ERROR: i32 = 6404;
 const JDO_REST_HTTP_503_ERROR: i32 = 6503;
 const JINDO_EXCEPTION_BUFFER_SIZE: usize = 1024;
-const JINDO_FORK_ERROR: &str =
-    "Jindo SDK cannot be reused after process fork; use spawn or avoid initializing Jindo in the parent process";
-
 type JdoPtr = *mut c_void;
 type JindoTeardown = Box<dyn FnOnce() + Send + 'static>;
 
@@ -1192,6 +1189,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use axum::Router;
 
+    #[cfg(target_os = "linux")]
     fn wait_for_jindo_teardown() -> bool {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         enqueue_jindo_teardown(Box::new(move || {

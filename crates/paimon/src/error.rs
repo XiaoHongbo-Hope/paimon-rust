@@ -17,6 +17,9 @@
 
 use snafu::prelude::*;
 
+pub(crate) const JINDO_FORK_ERROR: &str =
+    "Jindo SDK cannot be reused after process fork; use spawn or avoid initializing Jindo in the parent process";
+
 /// Result type used in paimon.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -66,6 +69,8 @@ pub enum Error {
         display("Paimon hitting unsupported io error {}", message)
     )]
     IoUnsupported { message: String },
+    #[snafu(display("{}", message))]
+    ProcessForkUnsupported { message: String },
     #[snafu(
         visibility(pub(crate)),
         display("Paimon hitting invalid config: {}", message)
@@ -136,6 +141,12 @@ pub enum Error {
 
 impl From<opendal::Error> for Error {
     fn from(source: opendal::Error) -> Self {
+        if source.kind() == opendal::ErrorKind::Unsupported && source.message() == JINDO_FORK_ERROR
+        {
+            return Error::ProcessForkUnsupported {
+                message: source.message().to_string(),
+            };
+        }
         // TODO: Simple use IoUnexpected for now
         Error::IoUnexpected {
             message: "IO operation failed on underlying storage".to_string(),
@@ -165,5 +176,17 @@ impl From<parquet::errors::ParquetError> for Error {
 impl From<crate::api::rest_error::RestError> for Error {
     fn from(source: crate::api::rest_error::RestError) -> Self {
         Error::RestApi { source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_jindo_fork_error_kind() {
+        let error: Error =
+            opendal::Error::new(opendal::ErrorKind::Unsupported, JINDO_FORK_ERROR).into();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
     }
 }

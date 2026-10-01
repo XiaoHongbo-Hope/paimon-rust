@@ -15,11 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
-use pyo3::PyErr;
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
+
+pyo3::create_exception!(
+    pypaimon_rust,
+    ForkSafetyError,
+    PyRuntimeError,
+    "Raised when native state inherited across process fork cannot be used safely."
+);
+
+pub fn register_module(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("ForkSafetyError", py.get_type::<ForkSafetyError>())
+}
 
 pub fn to_py_err(err: paimon::Error) -> PyErr {
     match err {
+        paimon::Error::ProcessForkUnsupported { .. } => ForkSafetyError::new_err(err.to_string()),
         // Unimplemented scan semantics: distinct from malformed input so upper
         // layers can catch NotImplementedError and decide on a fallback.
         paimon::Error::Unsupported { .. } => PyNotImplementedError::new_err(err.to_string()),
@@ -29,4 +41,19 @@ pub fn to_py_err(err: paimon::Error) -> PyErr {
 
 pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
     PyValueError::new_err(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_fork_error_has_distinct_python_type() {
+        Python::attach(|py| {
+            let error = to_py_err(paimon::Error::ProcessForkUnsupported {
+                message: "fork is not supported".to_string(),
+            });
+            assert!(error.is_instance_of::<ForkSafetyError>(py));
+        });
+    }
 }
