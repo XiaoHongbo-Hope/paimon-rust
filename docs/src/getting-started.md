@@ -350,12 +350,11 @@ blocking worker, reads only block headers and file metadata, and validates
 payload CRC lazily on the first hit. Use a separate `local-cache.dir` for each
 worker or process because processes do not share exact LRU or size accounting.
 
-### Decoded BLOB Index Cache
+### BLOB Index Cache
 
-Decoded `.blob` indexes are cached per catalog to avoid repeated footer and
-index reads across readers. `cache.blob-index.max-size` sets the memory budget
-(default `64 MiB`); set it to `0` to disable the cache. The budget covers
-decoded index metadata, not BLOB payloads.
+Decoded `.blob` indexes are cached per catalog. Set
+`cache.blob-index.max-size` to control the budget (default `64 MiB`; `0`
+disables caching). BLOB payloads are not cached.
 
 ### Manage Databases
 
