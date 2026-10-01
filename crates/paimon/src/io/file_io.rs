@@ -883,6 +883,12 @@ impl FileIOBuilder {
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
+    #[doc(hidden)]
+    #[deprecated(note = "BLOB index caching no longer uses numeric FileIO namespaces")]
+    fn cache_namespace(&self) -> Option<usize> {
+        None
+    }
+
     /// Stable identity of an immutable file within one storage context.
     fn cache_key(&self) -> Option<&str> {
         None
