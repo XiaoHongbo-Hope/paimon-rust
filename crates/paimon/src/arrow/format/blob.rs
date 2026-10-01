@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
-use crate::io::{FileRead, FileWrite};
+use crate::io::{BlobIndexCacheContext, FileRead, FileWrite};
 use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -33,7 +34,6 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lru::LruCache;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -93,7 +93,7 @@ impl IndexedBlobReader {
         blob_parallelism: usize,
     ) -> crate::Result<Self> {
         debug_assert!(blob_parallelism > 0);
-        let index = BlobFileIndex::load_cached(reader.as_ref(), file_size, &file_path).await?;
+        let index = BlobFileIndex::load_cached(reader.as_ref(), file_size).await?;
         Ok(Self {
             reader,
             index,
@@ -163,20 +163,9 @@ pub(crate) enum BlobReadValue {
 
 const BLOB_FOOTER_SIZE: u64 = 5;
 const BLOB_FORMAT_VERSION: u8 = 1;
-const BLOB_INDEX_CACHE_CAPACITY: usize = 16;
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct BlobIndexCacheKey {
-    namespace: usize,
-    file_path: String,
-}
-
-static BLOB_INDEX_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<LruCache<BlobIndexCacheKey, Arc<BlobFileIndex>>>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(LruCache::new(
-        std::num::NonZeroUsize::new(BLOB_INDEX_CACHE_CAPACITY).unwrap(),
-    ))
-});
+const BLOB_INDEX_CACHE_CONTAINER_OVERHEAD: usize = std::mem::size_of::<String>()
+    + std::mem::size_of::<Arc<BlobFileIndex>>()
+    + 4 * std::mem::size_of::<usize>();
 const BLOB_MAGIC_NUMBER: i32 = 1481511375;
 const BLOB_MAGIC_NUMBER_BYTES: [u8; 4] = BLOB_MAGIC_NUMBER.to_le_bytes();
 const BLOB_INLINE_HEADER_SIZE: u64 = 4;
@@ -1673,36 +1662,50 @@ struct BlobFileIndex {
     entries: Vec<BlobEntry>,
 }
 
-impl BlobFileIndex {
-    async fn load_cached(
-        reader: &dyn FileRead,
-        file_size: u64,
-        file_path: &str,
-    ) -> crate::Result<Arc<Self>> {
-        let cache_key = reader
-            .cache_namespace()
-            .filter(|_| !file_path.is_empty())
-            .map(|namespace| BlobIndexCacheKey {
-                namespace,
-                file_path: file_path.to_string(),
-            });
-        if let Some(cache_key) = &cache_key {
-            let mut cache = BLOB_INDEX_CACHE
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = cache.get(cache_key) {
-                return Ok(index.clone());
-            }
-        }
+struct BlobIndexCache {
+    entries: FileMetadataCache<String, BlobFileIndex>,
+}
 
-        let index = Arc::new(Self::load(reader, file_size).await?);
-        if let Some(cache_key) = cache_key {
-            BLOB_INDEX_CACHE
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .put(cache_key, index.clone());
+impl BlobIndexCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: FileMetadataCache::new(max_bytes, usize::MAX),
         }
-        Ok(index)
+    }
+}
+
+impl BlobFileIndex {
+    async fn load_cached(reader: &dyn FileRead, file_size: u64) -> crate::Result<Arc<Self>> {
+        let Some(context) = reader
+            .blob_index_cache()
+            .and_then(|cache| cache.downcast_ref::<BlobIndexCacheContext>())
+        else {
+            return Ok(Arc::new(Self::load(reader, file_size).await?));
+        };
+        let cache = context.get_or_init(BlobIndexCache::new);
+        let cache_key = reader.cache_key().map(ToOwned::to_owned);
+        let key_heap_bytes = cache_key.as_ref().map_or(0, String::capacity);
+        cache
+            .entries
+            .get_or_try_insert_with(
+                cache_key,
+                key_heap_bytes,
+                || async { Ok(Arc::new(Self::load(reader, file_size).await?)) },
+                Self::estimated_cache_bytes,
+            )
+            .await
+    }
+
+    fn estimated_cache_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<BlobEntry>()),
+            )
+            // Account for the LRU node, hash slot and Arc allocation which are
+            // not represented by the decoded index itself.
+            .saturating_add(BLOB_INDEX_CACHE_CONTAINER_OVERHEAD)
     }
 
     async fn load(reader: &dyn FileRead, file_size: u64) -> crate::Result<Self> {
@@ -2327,7 +2330,8 @@ fn encode_varint(value: i64, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use crate::btree::test_util::BytesFileRead;
-    use crate::io::{FileIO, FileIOBuilder};
+    use crate::common::CatalogOptions;
+    use crate::io::{BlobIndexCacheContext, FileIO, FileIOBuilder};
     use crate::spec::{ArrayType, BlobType, MapType, VarCharType};
     use arrow_array::Array;
     use bytes::Bytes;
@@ -2401,10 +2405,11 @@ mod tests {
     async fn test_blob_reader_reuses_cached_index() {
         let file_path = "file:///blob-index-cache-test/data.blob";
         let file_bytes = load_blob_fixture("blob-basic.blob");
-        let first =
-            TrackingFileRead::new(Bytes::from(file_bytes.clone())).with_cache_namespace(usize::MAX);
-        let second =
-            TrackingFileRead::new(Bytes::from(file_bytes.clone())).with_cache_namespace(usize::MAX);
+        let cache = blob_index_cache("64 MiB");
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
 
         let first_reader = IndexedBlobReader::open(
             Box::new(first.clone()),
@@ -2426,6 +2431,135 @@ mod tests {
         assert_eq!(first_reader.num_rows(), second_reader.num_rows());
         assert_eq!(first.ranges().len(), 2);
         assert!(second.ranges().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_can_be_disabled() {
+        let file_path = "file:///blob-index-cache-disabled/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let cache = blob_index_cache("0");
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
+
+        for reader in [first.clone(), second.clone()] {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                file_path.to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(first.ranges().len(), 2);
+        assert_eq!(second.ranges().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_coalesces_concurrent_loads() {
+        let file_path = "file:///blob-index-cache-concurrent/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let cache = blob_index_cache("64 MiB");
+        let tracking = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
+
+        let open = |reader: TrackingFileRead| {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                file_path.to_string(),
+                true,
+            )
+        };
+        let (first, second) = tokio::join!(open(tracking.clone()), open(tracking.clone()));
+
+        assert_eq!(first.unwrap().num_rows(), second.unwrap().num_rows());
+        assert_eq!(tracking.ranges().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_evicts_by_decoded_bytes() {
+        let first_key = "memory:/blob-index-cache-bytes/first.blob";
+        let second_key = "memory:/blob-index-cache-bytes/other.blob";
+        assert_eq!(first_key.len(), second_key.len());
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&[None, None]);
+        let max_bytes = blob_index_cache_entry_weight(first_key, 2);
+        let cache = blob_index_cache(&max_bytes.to_string());
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(first_key, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(second_key, cache.clone());
+        let first_again = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(first_key, cache);
+
+        for (reader, key) in [
+            (first.clone(), first_key),
+            (second.clone(), second_key),
+            (first_again.clone(), first_key),
+        ] {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                key.to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(first.ranges().len(), 2);
+        assert_eq!(second.ranges().len(), 2);
+        assert_eq!(first_again.ranges().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_blob_index_does_not_evict_cached_index() {
+        let small_key = "memory:/blob-index-cache-size/small.blob";
+        let large_key = "memory:/blob-index-cache-size/large.blob";
+        assert_eq!(small_key.len(), large_key.len());
+        let small_bytes = blob_test_utils::build_blob_file_bytes(&[None]);
+        let large_values = vec![None; 100];
+        let large_bytes = blob_test_utils::build_blob_file_bytes(&large_values);
+        let max_bytes = blob_index_cache_entry_weight(small_key, 1);
+        let cache = blob_index_cache(&max_bytes.to_string());
+        let small = TrackingFileRead::new(Bytes::from(small_bytes.clone()))
+            .with_blob_index_cache(small_key, cache.clone());
+        let large = TrackingFileRead::new(Bytes::from(large_bytes.clone()))
+            .with_blob_index_cache(large_key, cache.clone());
+        let small_again = TrackingFileRead::new(Bytes::from(small_bytes.clone()))
+            .with_blob_index_cache(small_key, cache);
+
+        IndexedBlobReader::open(
+            Box::new(small.clone()),
+            small_bytes.len() as u64,
+            small_key.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+        IndexedBlobReader::open(
+            Box::new(large.clone()),
+            large_bytes.len() as u64,
+            large_key.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+        IndexedBlobReader::open(
+            Box::new(small_again.clone()),
+            small_bytes.len() as u64,
+            small_key.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(small.ranges().len(), 2);
+        assert_eq!(large.ranges().len(), 2);
+        assert!(small_again.ranges().is_empty());
     }
 
     #[tokio::test]
@@ -2451,21 +2585,10 @@ mod tests {
             .await
             .unwrap();
 
-        let first_namespace = first_io
-            .new_input(path)
-            .unwrap()
-            .reader()
-            .await
-            .unwrap()
-            .cache_namespace();
-        let second_namespace = second_io
-            .new_input(path)
-            .unwrap()
-            .reader()
-            .await
-            .unwrap()
-            .cache_namespace();
-        assert_ne!(first_namespace, second_namespace);
+        assert!(!Arc::ptr_eq(
+            &first_io.blob_index_cache(),
+            &second_io.blob_index_cache()
+        ));
 
         assert_eq!(
             read_scalar_blob_file(&first_io, path).await,
@@ -3838,10 +3961,29 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
     }
 
+    fn blob_index_cache(max_size: &str) -> Arc<BlobIndexCacheContext> {
+        BlobIndexCacheContext::from_props(&std::collections::HashMap::from([(
+            CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE.to_string(),
+            max_size.to_string(),
+        )]))
+        .unwrap()
+    }
+
+    fn blob_index_cache_entry_weight(key: &str, rows: usize) -> usize {
+        let index = BlobFileIndex {
+            entries: vec![BlobEntry::Null; rows],
+        };
+        FileMetadataCache::<String, BlobFileIndex>::entry_weight(
+            key.len(),
+            index.estimated_cache_bytes(),
+        )
+    }
+
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
-        cache_namespace: Option<usize>,
+        cache_key: Option<String>,
+        blob_index_cache: Option<Arc<BlobIndexCacheContext>>,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
@@ -3851,15 +3993,21 @@ mod tests {
         fn new(bytes: Bytes) -> Self {
             Self {
                 bytes,
-                cache_namespace: None,
+                cache_key: None,
+                blob_index_cache: None,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 ranges: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn with_cache_namespace(mut self, cache_namespace: usize) -> Self {
-            self.cache_namespace = Some(cache_namespace);
+        fn with_blob_index_cache(
+            mut self,
+            cache_key: impl Into<String>,
+            cache: Arc<BlobIndexCacheContext>,
+        ) -> Self {
+            self.cache_key = Some(cache_key.into());
+            self.blob_index_cache = Some(cache);
             self
         }
 
@@ -3883,8 +4031,14 @@ mod tests {
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
         }
 
-        fn cache_namespace(&self) -> Option<usize> {
-            self.cache_namespace
+        fn cache_key(&self) -> Option<&str> {
+            self.cache_key.as_deref()
+        }
+
+        fn blob_index_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+            self.blob_index_cache
+                .as_deref()
+                .map(|cache| cache as &(dyn std::any::Any + Send + Sync))
         }
     }
 
