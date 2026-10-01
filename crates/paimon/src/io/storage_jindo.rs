@@ -1399,16 +1399,42 @@ mod tests {
             unsafe { libc::_exit(i32::from(!success)) };
         }
 
-        let status = tokio::task::spawn_blocking(move || {
-            let mut status = 0;
-            let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-            (waited, status)
+        let (status, timed_out) = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                if waited == child_pid {
+                    return std::io::Result::Ok((status, false));
+                }
+                if waited < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                    loop {
+                        let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                        if waited == child_pid {
+                            return Ok((status, true));
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         })
         .await
+        .unwrap()
         .unwrap();
-        assert_eq!(status.0, child_pid);
-        assert!(libc::WIFEXITED(status.1));
-        assert_eq!(libc::WEXITSTATUS(status.1), 0);
+        assert!(!timed_out, "Jindo child process hung after fork");
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
 
         // The parent-side client and teardown worker remain usable.
         assert!(operator.stat("objects/data.bin").await.unwrap().is_file());
