@@ -19,6 +19,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fmt::{Debug, Formatter};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -48,6 +49,8 @@ const JDO_REST_HTTP_403_ERROR: i32 = 6403;
 const JDO_REST_HTTP_404_ERROR: i32 = 6404;
 const JDO_REST_HTTP_503_ERROR: i32 = 6503;
 const JINDO_EXCEPTION_BUFFER_SIZE: usize = 1024;
+const JINDO_FORK_ERROR: &str =
+    "Jindo SDK cannot be reused after process fork; use spawn or avoid initializing Jindo in the parent process";
 
 type JdoPtr = *mut c_void;
 type JindoTeardown = Box<dyn FnOnce() + Send + 'static>;
@@ -424,6 +427,7 @@ impl LazyJindoClient {
     }
 
     async fn get(&self) -> OpendalResult<Arc<JindoClient>> {
+        ensure_jindo_process()?;
         let client = self
             .client
             .get_or_try_init(|| {
@@ -471,8 +475,20 @@ fn unsupported<T>(operation: &str) -> OpendalResult<T> {
     ))
 }
 
+fn ensure_jindo_process() -> OpendalResult<()> {
+    static SDK_PID: AtomicU32 = AtomicU32::new(0);
+
+    let pid = std::process::id();
+    match SDK_PID.compare_exchange(0, pid, AtomicOrdering::AcqRel, AtomicOrdering::Acquire) {
+        Ok(_) => Ok(()),
+        Err(owner) if owner == pid => Ok(()),
+        Err(_) => Err(OpendalError::new(ErrorKind::Unsupported, JINDO_FORK_ERROR)),
+    }
+}
+
 fn jindo_teardown_sender() -> OpendalResult<&'static Sender<JindoTeardown>> {
-    static SENDER: OnceLock<std::result::Result<Sender<JindoTeardown>, String>> = OnceLock::new();
+    static SENDER: OnceLock<std::result::Result<(u32, Sender<JindoTeardown>), String>> =
+        OnceLock::new();
 
     match SENDER.get_or_init(|| {
         let (sender, receiver) = mpsc::channel::<JindoTeardown>();
@@ -483,10 +499,14 @@ fn jindo_teardown_sender() -> OpendalResult<&'static Sender<JindoTeardown>> {
                     teardown();
                 }
             })
-            .map(|_| sender)
+            .map(|_| (std::process::id(), sender))
             .map_err(|error| error.to_string())
     }) {
-        Ok(sender) => Ok(sender),
+        Ok((pid, sender)) if *pid == std::process::id() => Ok(sender),
+        Ok(_) => Err(OpendalError::new(
+            ErrorKind::Unsupported,
+            "Jindo teardown worker is not available after process fork",
+        )),
         Err(message) => Err(OpendalError::new(
             ErrorKind::Unexpected,
             "failed to start Jindo teardown worker",
@@ -665,6 +685,7 @@ struct JindoClient {
     options: JdoPtr,
     store: JdoPtr,
     root: String,
+    pid: u32,
     initialized: bool,
 }
 
@@ -682,6 +703,7 @@ impl Debug for JindoClient {
 
 impl JindoClient {
     fn new(config: &JindoStorageConfig, bucket: &str) -> OpendalResult<Self> {
+        ensure_jindo_process()?;
         jindo_teardown_sender()?;
         let api = JindoApi::load(config.library_path.as_deref())?;
         let root = format!("oss://{bucket}/");
@@ -722,6 +744,7 @@ impl JindoClient {
             options,
             store,
             root,
+            pid: std::process::id(),
             initialized: false,
         };
         client.with_handle(|handle| {
@@ -1001,6 +1024,9 @@ impl JindoClient {
     }
 
     fn with_handle<T>(&self, call: impl FnOnce(JdoPtr) -> OpendalResult<T>) -> OpendalResult<T> {
+        if self.pid != std::process::id() {
+            return Err(OpendalError::new(ErrorKind::Unsupported, JINDO_FORK_ERROR));
+        }
         let handle = unsafe { (self.api.create_handle)(self.store) };
         if handle.is_null() {
             return Err(OpendalError::new(
@@ -1051,6 +1077,14 @@ impl JindoClient {
 
 impl Drop for JindoClient {
     fn drop(&mut self) {
+        if self.pid != std::process::id() {
+            // These handles belong to the parent process. The child must not
+            // call SDK teardown for them.
+            self.options = std::ptr::null_mut();
+            self.store = std::ptr::null_mut();
+            self.initialized = false;
+            return;
+        }
         let api = Arc::clone(&self.api);
         let options = std::mem::replace(&mut self.options, std::ptr::null_mut()) as usize;
         let store = std::mem::replace(&mut self.store, std::ptr::null_mut()) as usize;
@@ -1157,6 +1191,16 @@ mod tests {
     use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
     #[cfg(target_os = "linux")]
     use axum::Router;
+
+    fn wait_for_jindo_teardown() -> bool {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        enqueue_jindo_teardown(Box::new(move || {
+            let _ = done_tx.send(());
+        }));
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+    }
 
     #[test]
     fn test_use_jindo() {
@@ -1321,6 +1365,55 @@ mod tests {
             .unwrap();
         watchdog.join().unwrap();
         assert!(returned_before_timeout.load(Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_operator_rejects_reuse_after_fork(operator: Operator) {
+        operator.stat("objects/data.bin").await.unwrap();
+
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            let success = std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(_) => return false,
+                };
+                let rejected = runtime.block_on(async {
+                    match operator.stat("objects/data.bin").await {
+                        Ok(_) => false,
+                        Err(error) => {
+                            error.kind() == ErrorKind::Unsupported
+                                && error.to_string().contains("after process fork")
+                        }
+                    }
+                });
+                drop(operator);
+                rejected
+            })
+            .join()
+            .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!success)) };
+        }
+
+        let status = tokio::task::spawn_blocking(move || {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+            (waited, status)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status.0, child_pid);
+        assert!(libc::WIFEXITED(status.1));
+        assert_eq!(libc::WEXITSTATUS(status.1), 0);
+
+        // The parent-side client and teardown worker remain usable.
+        assert!(operator.stat("objects/data.bin").await.unwrap().is_file());
+        drop(operator);
+        assert!(wait_for_jindo_teardown());
     }
 
     #[test]
@@ -1670,6 +1763,9 @@ mod tests {
         assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 3);
         assert_eq!(state.range_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.unavailable_requests.load(Ordering::SeqCst), 1);
+
+        let fork_operator = jindo_config_build(&config, "jindo-test-bucket").unwrap();
+        assert_operator_rejects_reuse_after_fork(fork_operator).await;
         server.abort();
     }
 }
