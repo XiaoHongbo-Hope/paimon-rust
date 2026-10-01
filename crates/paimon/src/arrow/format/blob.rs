@@ -1662,8 +1662,10 @@ struct BlobFileIndex {
     entries: Vec<BlobEntry>,
 }
 
+type BlobIndexLoadResult = Result<Arc<BlobFileIndex>, Arc<Error>>;
+
 struct BlobIndexCache {
-    entries: FileMetadataCache<String, BlobFileIndex>,
+    entries: FileMetadataCache<String, BlobIndexLoadResult>,
 }
 
 impl BlobIndexCache {
@@ -1685,15 +1687,31 @@ impl BlobFileIndex {
         let cache = context.get_or_init(BlobIndexCache::new);
         let cache_key = reader.cache_key().map(ToOwned::to_owned);
         let key_heap_bytes = cache_key.as_ref().map_or(0, String::capacity);
-        cache
+        let load = cache
             .entries
-            .get_or_try_insert_with(
+            .get_or_try_insert_with_admission(
                 cache_key,
                 key_heap_bytes,
-                || async { Ok(Arc::new(Self::load(reader, file_size).await?)) },
-                Self::estimated_cache_bytes,
+                || async {
+                    Ok::<_, std::convert::Infallible>(Arc::new(
+                        Self::load(reader, file_size)
+                            .await
+                            .map(Arc::new)
+                            .map_err(Arc::new),
+                    ))
+                },
+                |load| {
+                    load.as_ref()
+                        .ok()
+                        .map(|index| index.estimated_cache_bytes())
+                },
             )
             .await
+            .unwrap();
+        match load.as_ref() {
+            Ok(index) => Ok(Arc::clone(index)),
+            Err(error) => Err(clone_blob_index_error(error)),
+        }
     }
 
     fn estimated_cache_bytes(&self) -> usize {
@@ -1779,6 +1797,26 @@ impl BlobFileIndex {
 
     fn entry(&self, position: usize) -> Option<&BlobEntry> {
         self.entries.get(position)
+    }
+}
+
+fn clone_blob_index_error(error: &Error) -> Error {
+    match error {
+        Error::DataInvalid { message, .. } => Error::DataInvalid {
+            message: message.clone(),
+            source: None,
+        },
+        Error::Unsupported { message } => Error::Unsupported {
+            message: message.clone(),
+        },
+        Error::UnexpectedError { message, .. } => Error::UnexpectedError {
+            message: message.clone(),
+            source: None,
+        },
+        _ => Error::UnexpectedError {
+            message: error.to_string(),
+            source: None,
+        },
     }
 }
 
@@ -2478,6 +2516,34 @@ mod tests {
 
         assert_eq!(first.unwrap().num_rows(), second.unwrap().num_rows());
         assert_eq!(tracking.ranges().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_coalesces_failure_then_retries() {
+        let file_path = "file:///blob-index-cache-failure/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let cache = blob_index_cache("64 MiB");
+        let failing = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache.clone())
+            .with_failure();
+
+        let open = |reader: TrackingFileRead| {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                file_path.to_string(),
+                true,
+            )
+        };
+        let failures = futures::future::join_all((0..8).map(|_| open(failing.clone()))).await;
+
+        assert!(failures.iter().all(Result::is_err));
+        assert_eq!(failing.ranges().len(), 1);
+
+        let retry = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
+        assert_eq!(open(retry.clone()).await.unwrap().num_rows(), 4);
+        assert_eq!(retry.ranges().len(), 2);
     }
 
     #[tokio::test]
@@ -3984,6 +4050,7 @@ mod tests {
         bytes: Bytes,
         cache_key: Option<String>,
         blob_index_cache: Option<Arc<BlobIndexCacheContext>>,
+        fail: bool,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
@@ -3995,6 +4062,7 @@ mod tests {
                 bytes,
                 cache_key: None,
                 blob_index_cache: None,
+                fail: false,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 ranges: Arc::new(Mutex::new(Vec::new())),
@@ -4008,6 +4076,11 @@ mod tests {
         ) -> Self {
             self.cache_key = Some(cache_key.into());
             self.blob_index_cache = Some(cache);
+            self
+        }
+
+        fn with_failure(mut self) -> Self {
+            self.fail = true;
             self
         }
 
@@ -4028,6 +4101,12 @@ mod tests {
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(Error::UnexpectedError {
+                    message: "injected BLOB index read failure".to_string(),
+                    source: None,
+                });
+            }
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
         }
 
