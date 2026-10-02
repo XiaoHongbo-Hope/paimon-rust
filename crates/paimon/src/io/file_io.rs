@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
@@ -33,6 +32,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use opendal::raw::{normalize_path, normalize_root};
 use opendal::Operator;
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
@@ -81,6 +81,15 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Object paths that OpenDAL would trim or collapse are rejected by FileIO.
     /// Rename requires both paths to resolve to the same shared service instance.
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
+
+    #[doc(hidden)]
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        let (op, relative_path) = self.create(path).await?;
+        Ok((op, relative_path, None))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,18 +101,14 @@ enum FileIOBackend {
 #[derive(Clone)]
 pub struct FileIO {
     backend: FileIOBackend,
+    cache_namespace: Arc<str>,
     cache: Option<Arc<LocalCache>>,
-    cache_namespace: usize,
     file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
-}
-
-static NEXT_FILE_IO_CACHE_NAMESPACE: AtomicUsize = AtomicUsize::new(1);
-
-fn next_file_io_cache_namespace() -> usize {
-    NEXT_FILE_IO_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed)
+    blob_index_cache: Arc<BlobIndexCacheContext>,
 }
 
 pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) struct FileFormatMetadataCacheContext {
     max_bytes: usize,
@@ -160,6 +165,76 @@ impl FileFormatMetadataCacheContext {
     }
 }
 
+pub(crate) struct BlobIndexCacheContext {
+    max_bytes: usize,
+    cache: OnceLock<Arc<dyn Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BlobIndexCacheContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobIndexCacheContext")
+            .field("max_bytes", &self.max_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BlobIndexCacheContext {
+    pub(crate) fn from_props(props: &HashMap<String, String>) -> crate::Result<Arc<Self>> {
+        let max_bytes = props
+            .get(CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE)
+            .map(|value| {
+                parse_memory_size(value)
+                    .ok()
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .ok_or_else(|| Error::ConfigInvalid {
+                        message: format!(
+                            "Invalid value for {}: {value}",
+                            CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE
+                        ),
+                    })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES);
+        Ok(Arc::new(Self {
+            max_bytes,
+            cache: OnceLock::new(),
+        }))
+    }
+
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    pub(crate) fn get_or_init<T>(&self, init: impl FnOnce(usize) -> T) -> Arc<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        let cache = Arc::clone(
+            self.cache
+                .get_or_init(|| Arc::new(init(self.max_bytes)) as Arc<dyn Any + Send + Sync>),
+        );
+        match cache.downcast::<T>() {
+            Ok(cache) => cache,
+            Err(_) => panic!("BLOB index cache type mismatch"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileIOCacheContext {
+    file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+    blob_index_cache: Arc<BlobIndexCacheContext>,
+}
+
+impl FileIOCacheContext {
+    pub(crate) fn from_props(props: &HashMap<String, String>) -> crate::Result<Self> {
+        Ok(Self {
+            file_format_metadata_cache: FileFormatMetadataCacheContext::from_props(props)?,
+            blob_index_cache: BlobIndexCacheContext::from_props(props)?,
+        })
+    }
+}
+
 impl std::fmt::Debug for FileIO {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileIO")
@@ -168,6 +243,10 @@ impl std::fmt::Debug for FileIO {
             .field(
                 "file_format_metadata_cache_max_bytes",
                 &self.file_format_metadata_cache.max_bytes(),
+            )
+            .field(
+                "blob_index_cache_max_bytes",
+                &self.blob_index_cache.max_bytes(),
             )
             .finish()
     }
@@ -198,13 +277,26 @@ impl FileIO {
     /// subsequently created by [`Self::new_input`] and [`Self::new_output`].
     pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
         self.backend = FileIOBackend::Provider(provider);
-        self.cache_namespace = next_file_io_cache_namespace();
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn file_format_metadata_cache(&self) -> Arc<FileFormatMetadataCacheContext> {
         Arc::clone(&self.file_format_metadata_cache)
+    }
+
+    pub(crate) fn blob_index_cache(&self) -> Arc<BlobIndexCacheContext> {
+        Arc::clone(&self.blob_index_cache)
+    }
+
+    pub(crate) fn cache_context(&self) -> FileIOCacheContext {
+        FileIOCacheContext {
+            file_format_metadata_cache: self.file_format_metadata_cache(),
+            blob_index_cache: self.blob_index_cache(),
+        }
+    }
+
+    pub(crate) fn cache_namespace(&self) -> &str {
+        &self.cache_namespace
     }
 
     pub(crate) fn create_static(&self, path: &str) -> crate::Result<(Operator, String)> {
@@ -224,12 +316,35 @@ impl FileIO {
         }
     }
 
-    fn file_source(&self, path: &str) -> crate::Result<FileSource> {
-        match &self.backend {
-            FileIOBackend::Provider(provider) => Ok(FileSource::Provider(provider.clone())),
+    async fn create_with_cache_path(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, String)> {
+        let (op, relative_path, namespace) = match &self.backend {
+            FileIOBackend::Provider(provider) => {
+                let (op, relative_path, namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                (op, relative_path, namespace)
+            }
             FileIOBackend::Storage(_) => {
                 let (op, relative_path) = self.create_static(path)?;
-                let cache_path = cache_object_path(&op, &relative_path);
+                (op, relative_path, None)
+            }
+        };
+        let namespace = namespace.as_deref().unwrap_or(&self.cache_namespace);
+        let cache_path = cache_object_path(namespace, &op, &relative_path);
+        Ok((op, relative_path, cache_path))
+    }
+
+    fn file_source(&self, path: &str) -> crate::Result<FileSource> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => Ok(FileSource::Provider {
+                provider: provider.clone(),
+                cache_namespace: Arc::clone(&self.cache_namespace),
+            }),
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                let cache_path = cache_object_path(&self.cache_namespace, &op, &relative_path);
                 Ok(FileSource::Static {
                     op,
                     relative_path,
@@ -289,8 +404,8 @@ impl FileIO {
         Ok(InputFile {
             source: self.file_source(path)?,
             path: path.to_string(),
-            cache_namespace: self.cache_namespace,
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
+            blob_index_cache: Arc::clone(&self.blob_index_cache),
             cache: self
                 .cache
                 .as_ref()
@@ -307,8 +422,8 @@ impl FileIO {
         Ok(OutputFile {
             source: self.file_source(path)?,
             path: path.to_string(),
-            cache_namespace: self.cache_namespace,
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
+            blob_index_cache: Arc::clone(&self.blob_index_cache),
             cache: self
                 .cache
                 .as_ref()
@@ -479,8 +594,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.create(path).await?;
-        let cache_path = cache_object_path(&op, relative_path.as_ref());
+        let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
 
         op.delete(relative_path.as_ref())
             .await
@@ -498,8 +612,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.create(path).await?;
-        let cache_path = cache_object_path(&op, relative_path.as_ref());
+        let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
 
         op.delete_with(relative_path.as_ref())
             .recursive(true)
@@ -576,8 +689,8 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
-        let (op_src, relative_path_src) = self.create(src).await?;
-        let (op_dst, relative_path_dst) = self.create(dst).await?;
+        let (op_src, relative_path_src, cache_path_src) = self.create_with_cache_path(src).await?;
+        let (op_dst, relative_path_dst, cache_path_dst) = self.create_with_cache_path(dst).await?;
         if matches!(self.backend, FileIOBackend::Provider(_))
             && !Arc::ptr_eq(op_src.service(), op_dst.service())
         {
@@ -586,9 +699,6 @@ impl FileIO {
                     .to_string(),
             });
         }
-        let cache_path_src = cache_object_path(&op_src, relative_path_src.as_ref());
-        let cache_path_dst = cache_object_path(&op_dst, relative_path_dst.as_ref());
-
         op_src
             .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
             .await
@@ -611,6 +721,15 @@ async fn resolve_provider(
     let (op, relative_path) = provider.create(path).await?;
     validate_provider_path(path, &relative_path)?;
     Ok((op, relative_path))
+}
+
+async fn resolve_provider_with_cache_namespace(
+    provider: &dyn FileIOProvider,
+    path: &str,
+) -> crate::Result<(Operator, String, Option<String>)> {
+    let (op, relative_path, cache_namespace) = provider.create_with_cache_namespace(path).await?;
+    validate_provider_path(path, &relative_path)?;
+    Ok((op, relative_path, cache_namespace))
 }
 
 fn validate_provider_path(path: &str, relative_path: &str) -> Result<()> {
@@ -663,15 +782,38 @@ fn status_path(base_path: &str, entry_path: &str) -> String {
     }
 }
 
-fn cache_object_path(op: &Operator, relative_path: &str) -> String {
+fn cache_object_path(namespace: &str, op: &Operator, relative_path: &str) -> String {
     let info = op.info();
     format!(
-        "{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}",
+        namespace,
         info.scheme(),
         info.name(),
         info.root(),
         relative_path.trim_start_matches('/')
     )
+}
+
+fn storage_cache_namespace(scheme: &str, props: &HashMap<String, String>) -> Arc<str> {
+    // Credentials may rotate while the storage namespace stays unchanged.
+    // Endpoints identify storage without coupling cache reuse to credentials.
+    let mut endpoints = props
+        .iter()
+        .filter(|(key, _)| key.to_ascii_lowercase().ends_with("endpoint"))
+        .collect::<Vec<_>>();
+    endpoints.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut digest = Sha256::new();
+    digest.update(scheme.to_ascii_lowercase());
+    for (key, value) in endpoints {
+        let key = key.to_ascii_lowercase();
+        let value = value.trim_end_matches('/');
+        digest.update((key.len() as u64).to_le_bytes());
+        digest.update(key);
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    Arc::from(hex::encode(digest.finalize()))
 }
 
 /// Whether `path` begins with a Windows drive specifier such as `C:\` or `C:/`.
@@ -689,6 +831,7 @@ pub struct FileIOBuilder {
     props: HashMap<String, String>,
     cache: Option<Arc<LocalCache>>,
     file_format_metadata_cache: Option<Arc<FileFormatMetadataCacheContext>>,
+    blob_index_cache: Option<Arc<BlobIndexCacheContext>>,
     operator: Option<Operator>,
     provider: Option<Arc<dyn FileIOProvider>>,
 }
@@ -700,6 +843,7 @@ impl FileIOBuilder {
             props: HashMap::default(),
             cache: None,
             file_format_metadata_cache: None,
+            blob_index_cache: None,
             operator: None,
             provider: None,
         }
@@ -754,6 +898,7 @@ impl FileIOBuilder {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_file_format_metadata_cache(
         mut self,
         cache: Arc<FileFormatMetadataCacheContext>,
@@ -762,13 +907,26 @@ impl FileIOBuilder {
         self
     }
 
+    pub(crate) fn with_cache_context(mut self, cache: FileIOCacheContext) -> Self {
+        self.file_format_metadata_cache = Some(cache.file_format_metadata_cache);
+        self.blob_index_cache = Some(cache.blob_index_cache);
+        self
+    }
+
     pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = self.cache.clone();
+        let cache_namespace =
+            storage_cache_namespace(self.scheme_str.as_deref().unwrap_or_default(), &self.props);
         let file_format_metadata_cache = self
             .file_format_metadata_cache
             .clone()
             .map(Ok)
             .unwrap_or_else(|| FileFormatMetadataCacheContext::from_props(&self.props))?;
+        let blob_index_cache = self
+            .blob_index_cache
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| BlobIndexCacheContext::from_props(&self.props))?;
         let backend = if let Some(provider) = self.provider.take() {
             if self.operator.is_some() {
                 return Err(Error::ConfigInvalid {
@@ -781,9 +939,10 @@ impl FileIOBuilder {
         };
         Ok(FileIO {
             backend,
+            cache_namespace,
             cache,
-            cache_namespace: next_file_io_cache_namespace(),
             file_format_metadata_cache,
+            blob_index_cache,
         })
     }
 }
@@ -793,6 +952,7 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
     #[doc(hidden)]
+    #[deprecated(note = "BLOB index caching no longer uses numeric FileIO namespaces")]
     fn cache_namespace(&self) -> Option<usize> {
         None
     }
@@ -804,6 +964,11 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
 
     #[doc(hidden)]
     fn file_format_metadata_cache(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn blob_index_cache(&self) -> Option<&(dyn Any + Send + Sync)> {
         None
     }
 }
@@ -818,15 +983,15 @@ impl FileRead for opendal::Reader {
 enum InputFileReader {
     Direct {
         reader: opendal::Reader,
-        cache_namespace: usize,
         cache_key: String,
         file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        blob_index_cache: Arc<BlobIndexCacheContext>,
     },
     Cached {
         reader: CachedFileReader,
-        cache_namespace: usize,
         cache_key: String,
         file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        blob_index_cache: Arc<BlobIndexCacheContext>,
     },
 }
 
@@ -858,15 +1023,15 @@ impl FileRead for InputFileReader {
         }
     }
 
-    fn cache_namespace(&self) -> Option<usize> {
-        Some(match self {
+    fn blob_index_cache(&self) -> Option<&(dyn Any + Send + Sync)> {
+        match self {
             Self::Direct {
-                cache_namespace, ..
+                blob_index_cache, ..
             }
             | Self::Cached {
-                cache_namespace, ..
-            } => *cache_namespace,
-        })
+                blob_index_cache, ..
+            } => Some(blob_index_cache.as_ref()),
+        }
     }
 }
 
@@ -980,15 +1145,23 @@ enum FileSource {
         relative_path: String,
         cache_path: String,
     },
-    Provider(Arc<dyn FileIOProvider>),
+    Provider {
+        provider: Arc<dyn FileIOProvider>,
+        cache_namespace: Arc<str>,
+    },
 }
 
 impl FileSource {
     async fn resolve(&self, path: &str) -> crate::Result<(Operator, String, String)> {
         match self {
-            Self::Provider(provider) => {
-                let (op, relative_path) = resolve_provider(provider.as_ref(), path).await?;
-                let cache_path = cache_object_path(&op, &relative_path);
+            Self::Provider {
+                provider,
+                cache_namespace,
+            } => {
+                let (op, relative_path, resolved_namespace) =
+                    resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
+                let namespace = resolved_namespace.as_deref().unwrap_or(cache_namespace);
+                let cache_path = cache_object_path(namespace, &op, &relative_path);
                 Ok((op, relative_path, cache_path))
             }
             Self::Static {
@@ -1004,8 +1177,8 @@ impl FileSource {
 pub struct InputFile {
     source: FileSource,
     path: String,
-    cache_namespace: usize,
     file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+    blob_index_cache: Arc<BlobIndexCacheContext>,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -1058,9 +1231,9 @@ impl InputFile {
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct {
                 reader,
-                cache_namespace: self.cache_namespace,
                 cache_key: cache_path,
                 file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
+                blob_index_cache: Arc::clone(&self.blob_index_cache),
             });
         };
         let read_token = cache.read_token(&cache_path);
@@ -1079,9 +1252,9 @@ impl InputFile {
                 cache.clone(),
                 read_token,
             ),
-            cache_namespace: self.cache_namespace,
             cache_key: cache_path,
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
+            blob_index_cache: Arc::clone(&self.blob_index_cache),
         })
     }
 }
@@ -1090,8 +1263,8 @@ impl InputFile {
 pub struct OutputFile {
     source: FileSource,
     path: String,
-    cache_namespace: usize,
     file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+    blob_index_cache: Arc<BlobIndexCacheContext>,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -1110,8 +1283,8 @@ impl OutputFile {
         InputFile {
             source: self.source,
             path: self.path,
-            cache_namespace: self.cache_namespace,
             file_format_metadata_cache: self.file_format_metadata_cache,
+            blob_index_cache: self.blob_index_cache,
             cache,
         }
     }
@@ -1798,6 +1971,37 @@ mod input_output_test {
             .unwrap()
     }
 
+    #[test]
+    fn test_storage_cache_namespace_tracks_endpoint_not_credentials() {
+        let first = HashMap::from([
+            (
+                "s3.endpoint".to_string(),
+                "https://first.example".to_string(),
+            ),
+            ("s3.access-key".to_string(), "first-key".to_string()),
+        ]);
+        let rotated = HashMap::from([
+            (
+                "s3.endpoint".to_string(),
+                "https://first.example".to_string(),
+            ),
+            ("s3.access-key".to_string(), "rotated-key".to_string()),
+        ]);
+        let second = HashMap::from([(
+            "s3.endpoint".to_string(),
+            "https://second.example".to_string(),
+        )]);
+
+        assert_eq!(
+            storage_cache_namespace("s3", &first),
+            storage_cache_namespace("s3", &rotated)
+        );
+        assert_ne!(
+            storage_cache_namespace("s3", &first),
+            storage_cache_namespace("s3", &second)
+        );
+    }
+
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
         let mut writer = output.writer().await.unwrap();
@@ -1980,6 +2184,57 @@ mod input_output_test {
         );
     }
 
+    #[tokio::test]
+    async fn test_blob_index_cache_size_reaches_file_reader() {
+        let path = "memory:/blob-index-cache-size.blob";
+        let default = setup_memory_file_io();
+        default
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            default
+                .new_input(path)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .blob_index_cache()
+                .unwrap()
+                .downcast_ref::<BlobIndexCacheContext>()
+                .unwrap()
+                .max_bytes(),
+            DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES
+        );
+
+        let configured = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE, "1 mb")
+            .build()
+            .unwrap();
+        configured
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            configured
+                .new_input(path)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .blob_index_cache()
+                .unwrap()
+                .downcast_ref::<BlobIndexCacheContext>()
+                .unwrap()
+                .max_bytes(),
+            1024 * 1024
+        );
+    }
+
     #[test]
     fn test_file_format_metadata_cache_size_rejects_invalid_value() {
         let error = FileIOBuilder::new("memory")
@@ -1992,6 +2247,17 @@ mod input_output_test {
         assert!(error
             .to_string()
             .contains(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE));
+    }
+
+    #[test]
+    fn test_blob_index_cache_size_rejects_invalid_value() {
+        let error = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE, "invalid")
+            .build()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE));
     }
 
     #[tokio::test]
