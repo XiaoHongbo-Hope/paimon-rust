@@ -1,269 +1,60 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-
-# Publish the paimon Python binding to PyPI.
-# Trigger: release tag push or manual dispatch.
-# Pre-release tags (containing '-') publish to TestPyPI; release tags publish to PyPI.
-#
-# Token auth: add secrets PYPI_API_TOKEN / TEST_PYPI_API_TOKEN for publishing.
-
-name: Release Python Binding
+name: Build temporary pypaimon-rust rc1010
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Release tag, for example v0.3.0-rc2
-        required: true
-        type: string
-
-concurrency:
-  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
-  cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
-env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+concurrency:
+  group: temporary-rc1010
+  cancel-in-progress: false
 
 jobs:
-  sdist:
+  linux-wheel:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
-
-      - name: Set Python release version
-        shell: bash
-        run: >
-          python3 scripts/python_release_version.py
-          --tag "${RELEASE_TAG}"
-          --pyproject bindings/python/pyproject.toml
-
-      - name: Verify Cargo lockfile
-        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
-
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          maturin-version: v1.14.1
-          working-directory: bindings/python
-          command: sdist
-          args: -o dist
-
-      - name: Verify sdist
-        run: python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
-
-      - name: Upload sdist
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-sdist
-          path: bindings/python/dist/*.tar.gz
-
-  wheels:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            target: "x86_64-pc-windows-msvc"
-            rust_target: "x86_64-pc-windows-msvc"
-          - os: macos-15-intel
-            target: "x86_64-apple-darwin"
-            rust_target: "x86_64-apple-darwin"
-          - os: macos-latest
-            target: "aarch64-apple-darwin"
-            rust_target: "aarch64-apple-darwin"
-          - os: ubuntu-latest
-            target: "x86_64-unknown-linux-gnu"
-            rust_target: "x86_64-unknown-linux-gnu"
-            manylinux: "manylinux2014"
-          - os: ubuntu-latest
-            target: "aarch64-unknown-linux-gnu"
-            rust_target: "aarch64-unknown-linux-gnu"
-            manylinux: "manylinux_2_28"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Install cargo-about
-        if: matrix.os != 'macos-15-intel'
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+          python-version: '3.11'
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833
         with:
           tool: cargo-about@0.9.1
-
-      - name: Install cargo-about on Intel macOS
-        if: matrix.os == 'macos-15-intel'
-        run: cargo install cargo-about --version 0.9.1 --locked --features cli
-
-      - name: Set Python release version
-        shell: bash
-        run: >
-          python3 scripts/python_release_version.py
-          --tag "${RELEASE_TAG}"
-          --pyproject bindings/python/pyproject.toml
-
-      - name: Generate wheel legal files
+      - name: Prepare version and licenses
         run: |
+          python3 scripts/python_release_version.py --tag v0.4.0-rc1010 --pyproject bindings/python/pyproject.toml
           cargo fetch --locked
-          python3 scripts/release_licenses.py --stage-python ${{ matrix.rust_target }}
-
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+          python3 scripts/release_licenses.py --stage-python x86_64-unknown-linux-gnu
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
           maturin-version: v1.14.1
           working-directory: bindings/python
-          target: ${{ matrix.target }}
+          target: x86_64-unknown-linux-gnu
           command: build
           args: --release --locked -o dist
-          manylinux: ${{ matrix.manylinux || 'auto' }}
+          manylinux: manylinux2014
           before-script-linux: |
-            # Install OpenSSL for x86_64 (manylinux2014 with OpenSSL 1.1)
-            if [ "${{ matrix.rust_target }}" = "x86_64-unknown-linux-gnu" ]; then
-              yum install -y openssl11-devel
-              # Create symlinks so pkg-config finds openssl11 as openssl
-              ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
-              ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
-              ln -sf /usr/lib64/pkgconfig/libcrypto11.pc /usr/lib64/pkgconfig/libcrypto.pc
-            fi
-
-            # Install precompiled OpenSSL from Debian packages for aarch64
-            if [ "${{ matrix.rust_target }}" = "aarch64-unknown-linux-gnu" ]; then
-              set -e
-              echo "Installing OpenSSL for aarch64 from Debian packages..."
-
-              (cd /tmp
-              DEBIAN_MIRROR="https://snapshot.debian.org/archive/debian/20231003T205808Z/pool/main/o/openssl"
-              LIBSSL_DEB="libssl1.1_1.1.1w-0+deb11u1_arm64.deb"
-              LIBSSL_SHA256="fe7a7d313c87e46e62e614a07137e4a476a79fc9e5aab7b23e8235211280fee3"
-              LIBSSL_DEV_DEB="libssl-dev_1.1.1w-0+deb11u1_arm64.deb"
-              LIBSSL_DEV_SHA256="6223f761bd4b961aa0c7c1662a6e99ab31150a1a7e6529d440428b361a9c8c4a"
-
-              curl --fail --location --show-error --silent \
-                --output "${LIBSSL_DEB}" "${DEBIAN_MIRROR}/${LIBSSL_DEB}"
-              curl --fail --location --show-error --silent \
-                --output "${LIBSSL_DEV_DEB}" "${DEBIAN_MIRROR}/${LIBSSL_DEV_DEB}"
-              printf '%s  %s\n' "${LIBSSL_SHA256}" "${LIBSSL_DEB}" | sha256sum -c -
-              printf '%s  %s\n' "${LIBSSL_DEV_SHA256}" "${LIBSSL_DEV_DEB}" | sha256sum -c -
-
-              # Extract .deb packages (ar format)
-              for deb in *.deb; do
-                ar x "$deb"
-                tar xf data.tar.*
-                rm -f debian-binary control.tar.* data.tar.*
-              done
-
-              # Install to maturin's expected location
-              TARGET_DIR="/usr/aarch64-unknown-linux-gnu"
-              mkdir -p "${TARGET_DIR}/include/openssl" "${TARGET_DIR}/lib"
-
-              # Copy main OpenSSL headers (architecture-independent)
-              cp -r usr/include/openssl/* "${TARGET_DIR}/include/openssl/"
-
-              # Overwrite with architecture-specific headers
-              cp -f usr/include/aarch64-linux-gnu/openssl/configuration.h "${TARGET_DIR}/include/openssl/" || true
-              cp -f usr/include/aarch64-linux-gnu/openssl/opensslconf.h "${TARGET_DIR}/include/openssl/" || true
-
-              # Copy libraries
-              cp -a usr/lib/aarch64-linux-gnu/libssl* "${TARGET_DIR}/lib/"
-              cp -a usr/lib/aarch64-linux-gnu/libcrypto* "${TARGET_DIR}/lib/"
-
-              # Verify
-              echo "✓ OpenSSL installed"
-              ls "${TARGET_DIR}/lib/libssl.a" && echo "✓ libssl.a found"
-              ls "${TARGET_DIR}/include/openssl/opensslv.h" && echo "✓ opensslv.h found"
-              ls "${TARGET_DIR}/include/openssl/opensslconf.h" && echo "✓ opensslconf.h found"
-              ) # End subshell
-
-              # Fix ring crate build: define ARM architecture version for aarch64
-              export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
-            fi
-
-      - name: Verify wheel
-        run: python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-${{ matrix.os }}-${{ matrix.rust_target }}
-          path: bindings/python/dist/*.whl
-
-  release:
-    name: Publish to PyPI
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    needs: [sdist, wheels]
-    if: startsWith(inputs.tag || github.ref_name, 'v')
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Install cargo-about
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
-        with:
-          tool: cargo-about@0.9.1
-
-      - name: Generate expected wheel legal files
+            yum install -y openssl11-devel
+            ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
+            ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
+            ln -sf /usr/lib64/pkgconfig/libcrypto11.pc /usr/lib64/pkgconfig/libcrypto.pc
+      - name: Verify and smoke test wheel
         run: |
-          cargo fetch --locked
-          python3 scripts/release_licenses.py \
-            --generate-python-reports bindings/python/licenses
-
-      - uses: actions/download-artifact@v8
+          python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
+          pip install bindings/python/dist/*.whl
+          python -c 'import pypaimon_rust; print(pypaimon_rust)'
+          cd bindings/python/dist
+          sha256sum *.whl > SHA256SUMS
+      - uses: actions/upload-artifact@v7
         with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: bindings/python/dist
-
-      - name: Verify release artifacts
-        run: python scripts/verify_python_wheels.py bindings/python/dist
-
-      - name: Publish to TestPyPI
-        if: contains(env.RELEASE_TAG, '-')
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          skip-existing: true
-          packages-dir: bindings/python/dist
-          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
-
-      - name: Publish to PyPI
-        if: ${{ !contains(env.RELEASE_TAG, '-') }}
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          skip-existing: true
-          packages-dir: bindings/python/dist
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          name: wheels-linux-x86_64-rc1010
+          path: bindings/python/dist/*
+      - name: Publish GitHub pre-release only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.4.0-rc1010 bindings/python/dist/* \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title 'Temporary pypaimon-rust 0.4.0rc1010' \
+            --notes "Linux x86_64 test wheel. Source: $GITHUB_SHA. Combines PR #1010 (BLOB tail prefetch), #1009 (native Variant projection), and #998 (BLOB index cache). Not an Apache release; not published to PyPI or TestPyPI."

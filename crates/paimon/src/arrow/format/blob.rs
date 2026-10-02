@@ -2681,8 +2681,8 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(first.ranges().len(), 2);
-        assert_eq!(second.ranges().len(), 2);
+        assert_eq!(first.ranges().len(), 1);
+        assert_eq!(second.ranges().len(), 1);
     }
 
     #[tokio::test]
@@ -2704,7 +2704,7 @@ mod tests {
         let (first, second) = tokio::join!(open(tracking.clone()), open(tracking.clone()));
 
         assert_eq!(first.unwrap().num_rows(), second.unwrap().num_rows());
-        assert_eq!(tracking.ranges().len(), 2);
+        assert_eq!(tracking.ranges().len(), 1);
     }
 
     #[tokio::test]
@@ -2732,7 +2732,7 @@ mod tests {
         let retry = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
             .with_blob_index_cache(file_path, cache);
         assert_eq!(open(retry.clone()).await.unwrap().num_rows(), 4);
-        assert_eq!(retry.ranges().len(), 2);
+        assert_eq!(retry.ranges().len(), 1);
     }
 
     #[tokio::test]
@@ -2765,9 +2765,9 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(first.ranges().len(), 2);
-        assert_eq!(second.ranges().len(), 2);
-        assert_eq!(first_again.ranges().len(), 2);
+        assert_eq!(first.ranges().len(), 1);
+        assert_eq!(second.ranges().len(), 1);
+        assert_eq!(first_again.ranges().len(), 1);
     }
 
     #[tokio::test]
@@ -2812,8 +2812,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(small.ranges().len(), 2);
-        assert_eq!(large.ranges().len(), 2);
+        assert_eq!(small.ranges().len(), 1);
+        assert_eq!(large.ranges().len(), 1);
         assert!(small_again.ranges().is_empty());
     }
 

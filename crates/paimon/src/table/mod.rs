@@ -871,7 +871,7 @@ pub(crate) async fn rest_query_auth_table() -> Table {
     options.set("token", "test_token");
     let api = std::sync::Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
     let metadata_cache =
-        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+        crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
     let table = query_auth_table();
     Table {
         rest_env: Some(RESTEnv::new(
