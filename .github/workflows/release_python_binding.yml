@@ -39,22 +39,32 @@ jobs:
             ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
             ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
             ln -sf /usr/lib64/pkgconfig/libcrypto11.pc /usr/lib64/pkgconfig/libcrypto.pc
+      - name: Preserve built wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-x86_64-rc1010
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+      - name: Prepare writable release directory
+        run: |
+          mkdir -p release-dist
+          cp bindings/python/dist/*.whl release-dist/
+          cd release-dist
+          sha256sum *.whl > SHA256SUMS
       - name: Verify and smoke test wheel
         run: |
           python scripts/verify_python_wheels.py --allow-partial bindings/python/dist
           pip install bindings/python/dist/*.whl
           python -c 'import pypaimon_rust; print(pypaimon_rust)'
-          cd bindings/python/dist
-          sha256sum *.whl > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-linux-x86_64-rc1010
-          path: bindings/python/dist/*
+          name: checksums-linux-x86_64-rc1010
+          path: release-dist/SHA256SUMS
       - name: Publish GitHub pre-release only
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.4.0-rc1010 bindings/python/dist/* \
+          gh release create v0.4.0-rc1010 release-dist/* \
             --target "$GITHUB_SHA" --prerelease --latest=false \
             --title 'Temporary pypaimon-rust 0.4.0rc1010' \
             --notes "Linux x86_64 test wheel. Source: $GITHUB_SHA. Combines PR #1010 (BLOB tail prefetch), #1009 (native Variant projection), and #998 (BLOB index cache). Not an Apache release; not published to PyPI or TestPyPI."
