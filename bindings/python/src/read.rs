@@ -19,14 +19,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::DataType as ArrowDataType;
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use paimon::spec::{
-    variant_extraction_row, BigIntType, DataField, DataType, Predicate, RowType, ROW_ID_FIELD_ID,
-    ROW_ID_FIELD_NAME,
-};
+use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -40,19 +36,9 @@ use crate::predicate::dict_to_table_predicate;
 const MAP_SELECTED_KEYS_PREFIX: &str = "__PAIMON_MAP_SELECTED_KEYS:";
 const MAP_SELECTED_KEYS_DELIMITER: char = ';';
 
-#[derive(Clone)]
-struct PyVariantProjection {
-    column: String,
-    paths: Vec<String>,
-    data_type: DataType,
-    fail_on_error: bool,
-}
-
 struct PyReadProjection<'a> {
-    table: &'a Table,
     columns: &'a Option<Vec<String>>,
     read_type: &'a Option<Vec<DataField>>,
-    variants: &'a [PyVariantProjection],
 }
 
 /// Time-travel selector option names, in the core's resolution priority order.
@@ -98,24 +84,7 @@ fn apply_read_config(
     case_sensitive: bool,
 ) -> PyResult<()> {
     builder.with_case_sensitive(case_sensitive);
-    if !projection.variants.is_empty() {
-        let base = match projection.read_type {
-            Some(read_type) => read_type.clone(),
-            None => match projection.columns {
-                Some(columns) => resolve_projection_fields(
-                    projection.table.schema().fields(),
-                    columns,
-                    case_sensitive,
-                )?,
-                None => projection.table.schema().fields().to_vec(),
-            },
-        };
-        builder.with_read_type(apply_variant_projections(
-            base,
-            projection.variants,
-            case_sensitive,
-        )?);
-    } else if let Some(read_type) = projection.read_type {
+    if let Some(read_type) = projection.read_type {
         builder.with_read_type(read_type.clone());
     } else if let Some(columns) = projection.columns {
         let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
@@ -128,207 +97,6 @@ fn apply_read_config(
         builder.with_filter(filter.clone());
     }
     Ok(())
-}
-
-fn resolve_projection_fields(
-    fields: &[DataField],
-    names: &[String],
-    case_sensitive: bool,
-) -> PyResult<Vec<DataField>> {
-    let mut resolved = Vec::with_capacity(names.len());
-    let mut seen = std::collections::HashSet::with_capacity(names.len());
-    for name in names {
-        let key = if case_sensitive {
-            name.clone()
-        } else {
-            name.to_ascii_lowercase()
-        };
-        if !seen.insert(key) {
-            return Err(PyValueError::new_err(format!(
-                "duplicate projection column '{name}'"
-            )));
-        }
-        if name == ROW_ID_FIELD_NAME {
-            resolved.push(DataField::new(
-                ROW_ID_FIELD_ID,
-                ROW_ID_FIELD_NAME.into(),
-                DataType::BigInt(BigIntType::with_nullable(true)),
-            ));
-            continue;
-        }
-        let matches = fields
-            .iter()
-            .filter(|field| {
-                if case_sensitive {
-                    field.name() == name
-                } else {
-                    field.name().eq_ignore_ascii_case(name)
-                }
-            })
-            .collect::<Vec<_>>();
-        let field = match matches.as_slice() {
-            [field] => (*field).clone(),
-            [] => {
-                return Err(PyValueError::new_err(format!(
-                    "projection column '{name}' does not exist"
-                )));
-            }
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "projection column '{name}' is ambiguous"
-                )));
-            }
-        };
-        resolved.push(field);
-    }
-    Ok(resolved)
-}
-
-fn apply_variant_projections(
-    mut fields: Vec<DataField>,
-    projections: &[PyVariantProjection],
-    case_sensitive: bool,
-) -> PyResult<Vec<DataField>> {
-    let mut seen = std::collections::HashSet::with_capacity(projections.len());
-    for projection in projections {
-        let key = if case_sensitive {
-            projection.column.clone()
-        } else {
-            projection.column.to_ascii_lowercase()
-        };
-        if !seen.insert(key) {
-            return Err(PyValueError::new_err(format!(
-                "duplicate Variant projection for column '{}'",
-                projection.column
-            )));
-        }
-        let matches = fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| {
-                if case_sensitive {
-                    field.name() == projection.column
-                } else {
-                    field.name().eq_ignore_ascii_case(&projection.column)
-                }
-            })
-            .collect::<Vec<_>>();
-        let (index, field) = match matches.as_slice() {
-            [(index, field)] => (*index, *field),
-            [] => {
-                return Err(PyValueError::new_err(format!(
-                    "Variant projection column '{}' is not in the read projection",
-                    projection.column
-                )));
-            }
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Variant projection column '{}' is ambiguous",
-                    projection.column
-                )));
-            }
-        };
-        if !matches!(field.data_type(), DataType::Variant(_)) {
-            return Err(PyValueError::new_err(format!(
-                "Variant projection column '{}' has type {}, expected VARIANT",
-                projection.column,
-                field.data_type()
-            )));
-        }
-        let row = variant_extraction_row(
-            field.data_type().is_nullable(),
-            projection.paths.iter().cloned().map(|path| {
-                (
-                    projection.data_type.clone(),
-                    path,
-                    projection.fail_on_error,
-                    "UTC".to_string(),
-                )
-            }),
-        );
-        fields[index] = DataField::new(field.id(), field.name().to_string(), DataType::Row(row))
-            .with_description(field.description().map(str::to_string));
-    }
-    Ok(fields)
-}
-
-fn supports_variant_target_type(data_type: &ArrowDataType) -> bool {
-    matches!(data_type, ArrowDataType::Float32)
-}
-
-fn extract_variant_projections(
-    variant_fields: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Vec<PyVariantProjection>> {
-    let Some(variant_fields) = variant_fields else {
-        return Ok(Vec::new());
-    };
-    let mut projections = Vec::with_capacity(variant_fields.len());
-    for (column, options) in variant_fields.iter() {
-        let column: String = column.extract().map_err(|_| {
-            PyTypeError::new_err("variant_fields keys must be Variant column names")
-        })?;
-        let options = options.cast::<PyDict>().map_err(|_| {
-            PyTypeError::new_err(format!("variant_fields['{column}'] must be a dict"))
-        })?;
-        for key in options.keys().iter() {
-            let key: String = key.extract().map_err(|_| {
-                PyTypeError::new_err(format!(
-                    "variant_fields['{column}'] option names must be strings"
-                ))
-            })?;
-            if !matches!(key.as_str(), "paths" | "target_type" | "fail_on_error") {
-                return Err(PyValueError::new_err(format!(
-                    "unknown variant_fields['{column}'] option '{key}'"
-                )));
-            }
-        }
-        let paths: Vec<String> = options
-            .get_item("paths")?
-            .ok_or_else(|| {
-                PyValueError::new_err(format!("variant_fields['{column}'] is missing 'paths'"))
-            })?
-            .extract()
-            .map_err(|_| {
-                PyTypeError::new_err(format!(
-                    "variant_fields['{column}']['paths'] must be a list of strings"
-                ))
-            })?;
-        if paths.is_empty() {
-            return Err(PyValueError::new_err(format!(
-                "variant_fields['{column}']['paths'] must not be empty"
-            )));
-        }
-        let target_type = options.get_item("target_type")?.ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "variant_fields['{column}'] is missing 'target_type'"
-            ))
-        })?;
-        let arrow_type = ArrowDataType::from_pyarrow_bound(&target_type)?;
-        if !supports_variant_target_type(&arrow_type) {
-            return Err(PyValueError::new_err(format!(
-                "variant_fields['{column}']['target_type'] must be float32, got {arrow_type:?}"
-            )));
-        }
-        let data_type =
-            paimon::arrow::arrow_to_paimon_type(&arrow_type, true).map_err(to_py_err)?;
-        if paimon::arrow::paimon_type_to_arrow(&data_type).map_err(to_py_err)? != arrow_type {
-            return Err(PyValueError::new_err(format!(
-                "variant_fields['{column}']['target_type'] cannot be returned unchanged: {arrow_type:?}"
-            )));
-        }
-        let fail_on_error = options
-            .get_item("fail_on_error")?
-            .map(|value| value.extract::<bool>())
-            .transpose()?
-            .unwrap_or(false);
-        projections.push(PyVariantProjection {
-            column,
-            paths,
-            data_type,
-            fail_on_error,
-        });
-    }
-    Ok(projections)
 }
 
 /// Resolve flat output paths to the authoritative nested read type used by the
@@ -455,7 +223,6 @@ pub struct PyReadBuilder {
     table: Arc<Table>,
     projection: Option<Vec<String>>,
     read_type: Option<Vec<DataField>>,
-    variant_projections: Vec<PyVariantProjection>,
     limit: Option<usize>,
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
@@ -470,7 +237,6 @@ impl PyReadBuilder {
             table,
             projection: None,
             read_type: None,
-            variant_projections: Vec::new(),
             limit: None,
             filter: None,
             row_ranges: None,
@@ -519,7 +285,6 @@ impl PyReadBuilder {
             table: Arc::new(traveled),
             projection: None,
             read_type: None,
-            variant_projections: Vec::new(),
             limit: None,
             filter: None,
             row_ranges: None,
@@ -532,17 +297,44 @@ impl PyReadBuilder {
 
 #[pymethods]
 impl PyReadBuilder {
-    /// Project columns, optionally extracting scalar paths from Variant columns.
-    #[pyo3(signature = (columns, *, variant_fields = None))]
-    fn with_projection<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        columns: Vec<String>,
-        variant_fields: Option<&Bound<'py, PyDict>>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        let variant_projections = extract_variant_projections(variant_fields)?;
+    /// Project top-level columns by name.
+    fn with_projection(mut slf: PyRefMut<'_, Self>, columns: Vec<String>) -> PyRefMut<'_, Self> {
         slf.projection = Some(columns);
         slf.read_type = None;
-        slf.variant_projections = variant_projections;
+        slf
+    }
+
+    /// Set the complete Paimon ROW read type, including nested field metadata.
+    /// The JSON representation is the same as RowType in a Paimon schema.
+    fn with_read_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        read_type_json: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let read_type: RowType = serde_json::from_str(read_type_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid Paimon read type: {e}")))?;
+        for field in read_type.fields() {
+            let source = slf
+                .table
+                .schema()
+                .fields()
+                .iter()
+                .find(|source| source.id() == field.id());
+            if let (Some(source), DataType::Row(row)) = (source, field.data_type()) {
+                if matches!(source.data_type(), DataType::Variant(_))
+                    && is_variant_extraction_row(row)
+                    && row
+                        .fields()
+                        .iter()
+                        .any(|child| !matches!(child.data_type(), DataType::Float(_)))
+                {
+                    return Err(PyValueError::new_err(
+                        "Variant extraction target type must be float32",
+                    ));
+                }
+            }
+        }
+        slf.read_type = Some(read_type.fields().to_vec());
+        slf.projection = None;
         Ok(slf)
     }
 
@@ -576,7 +368,6 @@ impl PyReadBuilder {
         }
         slf.read_type = Some(read_type);
         slf.projection = None;
-        slf.variant_projections.clear();
         Ok(slf)
     }
 
@@ -655,7 +446,6 @@ impl PyReadBuilder {
             table: Arc::clone(&self.table),
             projection: self.projection.clone(),
             read_type: self.read_type.clone(),
-            variant_projections: self.variant_projections.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
             row_ranges: self.row_ranges.clone(),
@@ -692,7 +482,6 @@ impl PyReadBuilder {
             table: Arc::clone(&self.table),
             projection: self.projection.clone(),
             read_type: self.read_type.clone(),
-            variant_projections: self.variant_projections.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
             case_sensitive: self.case_sensitive,
@@ -707,7 +496,6 @@ pub struct PyTableScan {
     table: Arc<Table>,
     projection: Option<Vec<String>>,
     read_type: Option<Vec<DataField>>,
-    variant_projections: Vec<PyVariantProjection>,
     limit: Option<usize>,
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
@@ -803,10 +591,8 @@ impl PyTableScan {
         apply_read_config(
             &mut builder,
             PyReadProjection {
-                table: &self.table,
                 columns: &self.projection,
                 read_type: &self.read_type,
-                variants: &self.variant_projections,
             },
             self.limit,
             &self.filter,
@@ -902,7 +688,6 @@ pub struct PyTableRead {
     table: Arc<Table>,
     projection: Option<Vec<String>>,
     read_type: Option<Vec<DataField>>,
-    variant_projections: Vec<PyVariantProjection>,
     limit: Option<usize>,
     filter: Option<Predicate>,
     case_sensitive: bool,
@@ -922,10 +707,8 @@ impl PyTableRead {
             apply_read_config(
                 &mut builder,
                 PyReadProjection {
-                    table: &self.table,
                     columns: &self.projection,
                     read_type: &self.read_type,
-                    variants: &self.variant_projections,
                 },
                 self.limit,
                 &self.filter,

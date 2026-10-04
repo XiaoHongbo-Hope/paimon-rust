@@ -28,6 +28,7 @@ InputFieldsLike: TypeAlias = Union[ArrowTypeLike, Sequence[ArrowTypeLike]]
 VolatilityLike: TypeAlias = Union[str, Any]
 
 class DataField:
+    def id(self) -> int: ...
     def name(self) -> str: ...
     def field_type(self) -> str: ...
     def is_nullable(self) -> bool: ...
@@ -87,14 +88,10 @@ class TableRead:
     def read(self, splits: Sequence[Split]) -> List[pyarrow.RecordBatch]: ...
 
 class ReadBuilder:
-    def with_projection(
-        self,
-        columns: List[str],
-        *,
-        variant_fields: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> "ReadBuilder":
-        """Project columns, optionally extracting Variant paths as float32."""
+    def with_read_type(self, read_type_json: str) -> "ReadBuilder":
+        """Set a complete Paimon ROW read type serialized as schema JSON."""
         ...
+    def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
     def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
         """Project top-level fields or nested ROW leaves by exact name paths. A MAP
         path keeps the complete MAP so the caller can extract literal keys."""
