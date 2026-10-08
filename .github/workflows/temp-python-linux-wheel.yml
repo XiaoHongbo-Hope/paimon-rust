@@ -1,0 +1,88 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Temporary Linux pypaimon-rust wheel
+
+on:
+  push:
+    branches:
+      - codex/temp-pypaimon-rust-2026100802
+
+permissions:
+  contents: write
+
+jobs:
+  linux-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-about@0.9.1
+
+      - name: Set temporary wheel version
+        run: >
+          python3 scripts/python_release_version.py
+          --tag v0.5.0-rc2026100802
+          --pyproject bindings/python/pyproject.toml
+
+      - name: Generate wheel legal files
+        run: |
+          cargo fetch --locked
+          python3 scripts/release_licenses.py --stage-python x86_64-unknown-linux-gnu
+
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          working-directory: bindings/python
+          target: x86_64-unknown-linux-gnu
+          command: build
+          args: --release --locked -o dist
+          manylinux: manylinux2014
+          before-script-linux: |
+            yum install -y openssl11-devel
+            ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
+            ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
+            ln -sf /usr/lib64/pkgconfig/libcrypto11.pc /usr/lib64/pkgconfig/libcrypto.pc
+
+      - name: Verify wheel and checksum
+        run: |
+          python3 scripts/verify_python_wheels.py --allow-partial bindings/python/dist
+          (cd bindings/python/dist && sha256sum *.whl) > SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pypaimon-rust-0.5.0rc2026100802-linux-x86_64
+          path: |
+            bindings/python/dist/*.whl
+            SHA256SUMS
+
+      - name: Publish temporary GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create temp-pypaimon-rust-0.5.0rc2026100802 \
+            bindings/python/dist/*.whl SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "Temporary pypaimon-rust 0.5.0rc2026100802 (Linux x86_64)" \
+            --notes "Linux x86_64 test wheel from upstream main c6c5099bccb8f3ad47f78a81f8cbdcea85a2eae5. Not an Apache release; not published to PyPI or TestPyPI." \
+            --prerelease
