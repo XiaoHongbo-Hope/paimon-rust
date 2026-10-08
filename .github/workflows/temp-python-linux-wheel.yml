@@ -42,7 +42,7 @@ jobs:
       - name: Set temporary wheel version
         run: >
           python3 scripts/python_release_version.py
-          --tag v0.4.0-rc20261008
+          --tag v0.5.0-rc20261008
           --pyproject bindings/python/pyproject.toml
 
       - name: Generate wheel legal files
@@ -71,7 +71,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: pypaimon-rust-0.4.0rc20261008-linux-x86_64
+          name: pypaimon-rust-0.5.0rc20261008-linux-x86_64
           path: |
             bindings/python/dist/*.whl
             SHA256SUMS
@@ -80,9 +80,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create temp-pypaimon-rust-0.4.0rc20261008 \
+          gh release create temp-pypaimon-rust-0.5.0rc20261008 \
             bindings/python/dist/*.whl SHA256SUMS \
             --target "$GITHUB_SHA" \
-            --title "Temporary pypaimon-rust 0.4.0rc20261008 (Linux x86_64)" \
+            --title "Temporary pypaimon-rust 0.5.0rc20261008 (Linux x86_64)" \
             --notes "Linux x86_64 test wheel from upstream main ff95db9399a60828d74e032a64b6053ef039cc83. Not an Apache release; not published to PyPI or TestPyPI." \
             --prerelease
