@@ -18,6 +18,7 @@
 name: Temporary Linux pypaimon-rust wheel
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - codex/temp-pypaimon-rust-20261013
