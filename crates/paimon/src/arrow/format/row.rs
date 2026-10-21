@@ -20,6 +20,7 @@
 //! Layout reference:
 //! `org.apache.paimon.format.row.RowFormatWriter` in paimon-java.
 
+use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
@@ -48,7 +49,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 #[derive(Default)]
 pub(crate) struct RowFormatReader {
@@ -84,6 +85,22 @@ const ROW_BLOCK_READ_CONCURRENCY: usize = 8;
 const FOOTER_SIZE: u64 = 32;
 const ROW_MAGIC: i32 = 0x524F5753;
 const ROW_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RowMetadataCacheKey {
+    file: String,
+    size: u64,
+}
+
+struct RowFileMetadata {
+    index: RowBlockIndex,
+    total_rows: usize,
+}
+
+// Experimental single-process A/B. Production cache ownership and fork safety
+// need a separate review before this can become a public option.
+static ROW_METADATA_CACHE: LazyLock<FileMetadataCache<RowMetadataCacheKey, RowFileMetadata>> =
+    LazyLock::new(|| FileMetadataCache::new(32 * 1024 * 1024, 4096));
 
 impl RowFormatWriter {
     pub(crate) async fn new(
@@ -267,56 +284,27 @@ impl FormatFileReader for RowFormatReader {
             });
         }
 
-        let footer_start = file_size - FOOTER_SIZE;
-        let footer_bytes = reader.read(footer_start..file_size).await?;
-        let footer = RowFileFooter::from_bytes(footer_bytes.as_ref())?;
-        if footer.index_offset < 0 || footer.index_length < 0 {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Invalid .row footer index offset/length: {}/{}",
-                    footer.index_offset, footer.index_length
-                ),
-                source: None,
-            });
-        }
-        let index_start = footer.index_offset as u64;
-        let index_end = index_start
-            .checked_add(footer.index_length as u64)
-            .ok_or_else(|| Error::DataInvalid {
-                message: ".row index range overflows u64".to_string(),
-                source: None,
-            })?;
-        if index_end > footer_start {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    ".row index range [{index_start}, {index_end}) exceeds footer start {footer_start}"
-                ),
-                source: None,
-            });
-        }
-        let index_bytes = reader.read(index_start..index_end).await?;
-        let index = RowBlockIndex::from_bytes(index_bytes.as_ref())?;
-        let footer_block_count =
-            usize::try_from(footer.block_count).map_err(|e| Error::DataInvalid {
-                message: format!("Invalid .row footer block count {}", footer.block_count),
-                source: Some(Box::new(e)),
-            })?;
-        if index.block_count() != footer_block_count {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    ".row footer block count {} does not match index block count {}",
-                    footer.block_count,
-                    index.block_count()
-                ),
-                source: None,
-            });
-        }
-        let total_rows =
-            usize::try_from(footer.total_row_count).map_err(|e| Error::DataInvalid {
-                message: format!("Invalid .row total row count {}", footer.total_row_count),
-                source: Some(Box::new(e)),
-            })?;
-        index.validate_for_file(total_rows, index_start)?;
+        let cache_key = if std::env::var("PAIMON_ROW_METADATA_CACHE").as_deref() == Ok("1") {
+            reader
+                .cache_key()
+                .filter(|key| !key.is_empty())
+                .map(|file| RowMetadataCacheKey {
+                    file: file.to_string(),
+                    size: file_size,
+                })
+        } else {
+            None
+        };
+        let key_heap_bytes = cache_key.as_ref().map_or(0, |key| key.file.capacity());
+        let metadata = ROW_METADATA_CACHE
+            .get_or_try_insert_with(
+                cache_key,
+                key_heap_bytes,
+                || load_row_file_metadata(reader.as_ref(), file_size),
+                |metadata| metadata.index.block_count() * 4 * std::mem::size_of::<i64>(),
+            )
+            .await?;
+        let total_rows = metadata.total_rows;
         validate_row_selection(total_rows, row_selection.as_deref())?;
         // Public callers may supply unordered or overlapping ranges. Normalize
         // once so every block can seek directly to its overlapping window.
@@ -341,13 +329,14 @@ impl FormatFileReader for RowFormatReader {
         });
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
 
-        let blocks_to_read = blocks_to_read(&index, total_rows, row_selection.as_deref());
+        let blocks_to_read = blocks_to_read(&metadata.index, total_rows, row_selection.as_deref());
         let predicates = predicates.map(|fp| FilePredicates {
             predicates: fp.predicates.clone(),
             row_filter_factory: None,
             file_fields: fp.file_fields.clone(),
         });
         Ok(try_stream! {
+            let index = &metadata.index;
             let mut blocks = futures::stream::iter(blocks_to_read.into_iter().map(|block_idx| {
                 read_row_block(reader.as_ref(), &index, block_idx)
             }))
@@ -382,6 +371,62 @@ impl FormatFileReader for RowFormatReader {
         }
         .boxed())
     }
+}
+
+async fn load_row_file_metadata(
+    reader: &dyn FileRead,
+    file_size: u64,
+) -> crate::Result<Arc<RowFileMetadata>> {
+    let footer_start = file_size - FOOTER_SIZE;
+    let footer_bytes = reader.read(footer_start..file_size).await?;
+    let footer = RowFileFooter::from_bytes(footer_bytes.as_ref())?;
+    if footer.index_offset < 0 || footer.index_length < 0 {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Invalid .row footer index offset/length: {}/{}",
+                footer.index_offset, footer.index_length
+            ),
+            source: None,
+        });
+    }
+    let index_start = footer.index_offset as u64;
+    let index_end = index_start
+        .checked_add(footer.index_length as u64)
+        .ok_or_else(|| Error::DataInvalid {
+            message: ".row index range overflows u64".to_string(),
+            source: None,
+        })?;
+    if index_end > footer_start {
+        return Err(Error::DataInvalid {
+            message: format!(
+                ".row index range [{index_start}, {index_end}) exceeds footer start {footer_start}"
+            ),
+            source: None,
+        });
+    }
+    let index_bytes = reader.read(index_start..index_end).await?;
+    let index = RowBlockIndex::from_bytes(index_bytes.as_ref())?;
+    let footer_block_count =
+        usize::try_from(footer.block_count).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid .row footer block count {}", footer.block_count),
+            source: Some(Box::new(e)),
+        })?;
+    if index.block_count() != footer_block_count {
+        return Err(Error::DataInvalid {
+            message: format!(
+                ".row footer block count {} does not match index block count {}",
+                footer.block_count,
+                index.block_count()
+            ),
+            source: None,
+        });
+    }
+    let total_rows = usize::try_from(footer.total_row_count).map_err(|e| Error::DataInvalid {
+        message: format!("Invalid .row total row count {}", footer.total_row_count),
+        source: Some(Box::new(e)),
+    })?;
+    index.validate_for_file(total_rows, index_start)?;
+    Ok(Arc::new(RowFileMetadata { index, total_rows }))
 }
 
 struct RowBlockPayload {
