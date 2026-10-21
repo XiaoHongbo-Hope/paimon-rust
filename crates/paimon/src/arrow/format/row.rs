@@ -36,10 +36,10 @@ use arrow_array::builder::{
     TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    ListArray, MapArray, RecordBatch, RecordBatchOptions, StringArray, StructArray,
-    Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    LargeBinaryArray, ListArray, MapArray, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -50,7 +50,20 @@ use bytes::Bytes;
 use futures::StreamExt;
 use std::sync::Arc;
 
-pub(crate) struct RowFormatReader;
+#[derive(Default)]
+pub(crate) struct RowFormatReader {
+    // Experimental A/B switch: keep the physical file schema and skip decoding
+    // columns that are not needed by the projection or residual predicate.
+    projected_fields: Option<Vec<DataField>>,
+}
+
+impl RowFormatReader {
+    pub(crate) fn with_projection(projected_fields: Vec<DataField>) -> Self {
+        Self {
+            projected_fields: Some(projected_fields),
+        }
+    }
+}
 
 pub(crate) struct RowFormatWriter {
     writer: Box<dyn FileWrite>,
@@ -311,6 +324,21 @@ impl FormatFileReader for RowFormatReader {
 
         let schema = build_target_arrow_schema(read_fields)?;
         let row_type = read_fields.to_vec();
+        let selected_fields = self.projected_fields.as_ref().and_then(|projected| {
+            if predicates
+                .and_then(|fp| fp.row_filter_factory.as_ref())
+                .is_some()
+            {
+                return None;
+            }
+            let needed = crate::arrow::residual::widen_scan_fields(projected, predicates);
+            Some(
+                read_fields
+                    .iter()
+                    .map(|field| needed.iter().any(|required| required.id() == field.id()))
+                    .collect::<Vec<_>>(),
+            )
+        });
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
 
         let blocks_to_read = blocks_to_read(&index, total_rows, row_selection.as_deref());
@@ -339,7 +367,9 @@ impl FormatFileReader for RowFormatReader {
                 }
 
                 for chunk in selected.chunks(batch_size) {
-                    let batch = decode_row_block(&data, &row_type, schema.clone(), chunk)?;
+                    let batch = decode_row_block_selected(
+                        &data, &row_type, schema.clone(), chunk, selected_fields.as_deref()
+                    )?;
                     let batch = match predicates.as_ref() {
                         Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
                             batch, fp, &row_type,
@@ -982,11 +1012,22 @@ fn write_timestamp(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_row_block(
     data: &[u8],
     fields: &[DataField],
     schema: SchemaRef,
     positions: &[usize],
+) -> crate::Result<RecordBatch> {
+    decode_row_block_selected(data, fields, schema, positions, None)
+}
+
+fn decode_row_block_selected(
+    data: &[u8],
+    fields: &[DataField],
+    schema: SchemaRef,
+    positions: &[usize],
+    selected_fields: Option<&[bool]>,
 ) -> crate::Result<RecordBatch> {
     if fields.is_empty() {
         return RecordBatch::try_new_with_options(
@@ -1008,9 +1049,23 @@ fn decode_row_block(
                 message: ".row block is too small for row offsets".to_string(),
                 source: None,
             })?;
+    let selected = selected_fields.unwrap_or(&[]);
+    if !selected.is_empty() && selected.len() != fields.len() {
+        return Err(Error::DataInvalid {
+            message: ".row projection mask length differs from physical field count".to_string(),
+            source: None,
+        });
+    }
     let mut builders = fields
         .iter()
-        .map(|f| ColumnBuilder::new(f.data_type(), positions.len()))
+        .enumerate()
+        .map(|(idx, f)| {
+            if selected.get(idx).copied().unwrap_or(true) {
+                ColumnBuilder::new(f.data_type(), positions.len()).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
         .collect::<crate::Result<Vec<_>>>()?;
     let header_size = fields.len().div_ceil(8);
 
@@ -1040,21 +1095,143 @@ fn decode_row_block(
         };
         for (field_idx, field) in fields.iter().enumerate() {
             if (data[offset + field_idx / 8] & (1 << (field_idx % 8))) != 0 {
-                builders[field_idx].append_null();
+                if let Some(builder) = &mut builders[field_idx] {
+                    builder.append_null();
+                }
             } else {
-                builders[field_idx].read_append(&mut input, field.data_type())?;
+                match &mut builders[field_idx] {
+                    Some(builder) => builder.read_append(&mut input, field.data_type())?,
+                    None => skip_field_value(&mut input, field.data_type())?,
+                }
             }
         }
     }
 
     let columns = builders
         .into_iter()
-        .map(ColumnBuilder::finish)
+        .enumerate()
+        .map(|(idx, builder)| match builder {
+            Some(builder) => builder.finish(),
+            None => Ok(new_null_array(
+                schema.field(idx).data_type(),
+                positions.len(),
+            )),
+        })
         .collect::<crate::Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
         message: format!("Failed to build .row RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
+}
+
+fn skip_field_value(input: &mut BlockInput<'_>, data_type: &DataType) -> crate::Result<()> {
+    match data_type {
+        DataType::Boolean(_) | DataType::TinyInt(_) => {
+            input.skip(1)?;
+        }
+        DataType::SmallInt(_) => {
+            input.skip(2)?;
+        }
+        DataType::Int(_) | DataType::Float(_) | DataType::Date(_) | DataType::Time(_) => {
+            input.skip(4)?;
+        }
+        DataType::BigInt(_) | DataType::Double(_) => {
+            input.skip(8)?;
+        }
+        DataType::Char(_)
+        | DataType::VarChar(_)
+        | DataType::Binary(_)
+        | DataType::VarBinary(_)
+        | DataType::Blob(_) => skip_byte_value(input)?,
+        DataType::Timestamp(t) => skip_timestamp(input, t.precision())?,
+        DataType::LocalZonedTimestamp(t) => skip_timestamp(input, t.precision())?,
+        DataType::Decimal(d) => {
+            if d.precision() <= 18 {
+                input.skip(8)?;
+            } else {
+                skip_byte_value(input)?;
+            }
+        }
+        DataType::Array(a) => {
+            skip_elements(input, a.element_type())?;
+        }
+        DataType::Vector(v) => {
+            let count = input.read_var_u32()?;
+            if count != v.length() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        ".row VECTOR length {count} differs from declared length {}",
+                        v.length()
+                    ),
+                    source: None,
+                });
+            }
+            for _ in 0..count {
+                skip_field_value(input, v.element_type())?;
+            }
+        }
+        DataType::Map(m) => {
+            let keys = skip_elements(input, m.key_type())?;
+            let values = skip_elements(input, m.value_type())?;
+            if keys != values {
+                return Err(Error::DataInvalid {
+                    message: format!(".row map key/value element counts differ: {keys}/{values}"),
+                    source: None,
+                });
+            }
+        }
+        DataType::Multiset(m) => {
+            let keys = skip_elements(input, m.element_type())?;
+            let values = skip_elements(input, &DataType::Int(IntType::new()))?;
+            if keys != values {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        ".row multiset key/count element counts differ: {keys}/{values}"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        DataType::Row(r) => {
+            let fields = r.fields();
+            let bitmap_start = input.skip(fields.len().div_ceil(8))?;
+            for (idx, field) in fields.iter().enumerate() {
+                if input.data[bitmap_start + idx / 8] & (1 << (idx % 8)) == 0 {
+                    skip_field_value(input, field.data_type())?;
+                }
+            }
+        }
+        DataType::Variant(_) => {
+            skip_byte_value(input)?;
+            skip_byte_value(input)?;
+        }
+    }
+    Ok(())
+}
+
+fn skip_byte_value(input: &mut BlockInput<'_>) -> crate::Result<()> {
+    let len = input.read_var_u32()? as usize;
+    input.skip(len)?;
+    Ok(())
+}
+
+fn skip_timestamp(input: &mut BlockInput<'_>, precision: u32) -> crate::Result<()> {
+    input.skip(8)?;
+    if precision > 3 {
+        input.read_var_u32()?;
+    }
+    Ok(())
+}
+
+fn skip_elements(input: &mut BlockInput<'_>, element_type: &DataType) -> crate::Result<usize> {
+    let count = input.read_var_u32()? as usize;
+    let bitmap_start = input.skip(count.div_ceil(8))?;
+    for idx in 0..count {
+        if input.data[bitmap_start + idx / 8] & (1 << (idx % 8)) == 0 {
+            skip_field_value(input, element_type)?;
+        }
+    }
+    Ok(count)
 }
 
 fn read_block_row_count(data: &[u8]) -> crate::Result<usize> {
@@ -2493,6 +2670,60 @@ mod tests {
     }
 
     #[test]
+    fn projection_decode_skips_string_and_array_without_shifting_later_fields() {
+        let fields = vec![
+            DataField::new(0, "id".into(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "label".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+            DataField::new(
+                2,
+                "samples".into(),
+                DataType::Array(ArrayType::new(DataType::Double(DoubleType::new()))),
+            ),
+            DataField::new(3, "reward".into(), DataType::Double(DoubleType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let samples = ListArray::try_new(
+            Arc::new(Field::new("element", ArrowDataType::Float64, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0])),
+            Some(null_buffer(vec![true, false])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec![Some("long label"), None])),
+                Arc::new(samples),
+                Arc::new(Float64Array::from(vec![0.5, -1.25])),
+            ],
+        )
+        .unwrap();
+        let mut writer = RowBlockWriter::new();
+        for row in 0..2 {
+            writer.write_row(&batch, row, &fields).unwrap();
+        }
+        let block = writer.finish();
+        let all = decode_row_block(&block, &fields, schema.clone(), &[0, 1]).unwrap();
+        let selected = decode_row_block_selected(
+            &block,
+            &fields,
+            schema,
+            &[0, 1],
+            Some(&[true, false, false, true]),
+        )
+        .unwrap();
+        assert_eq!(selected.column(0), all.column(0));
+        assert_eq!(selected.column(3), all.column(3));
+        assert_eq!(selected.column(1).null_count(), 2);
+        assert_eq!(selected.column(2).null_count(), 2);
+    }
+
+    #[test]
     fn row_block_index_rejects_invalid_values() {
         let message = expect_data_invalid(RowBlockIndex::from_bytes(&encoded_index_arrays(
             &[-1],
@@ -2563,7 +2794,7 @@ mod tests {
 
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2641,7 +2872,7 @@ mod tests {
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
         // read_fields is the FULL physical schema, as DataFileReader passes for `.row`.
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2730,7 +2961,7 @@ mod tests {
 
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2803,7 +3034,7 @@ mod tests {
 
         let input = file_io.new_input(path).unwrap();
         let bytes = input.read().await.unwrap();
-        let actual = RowFormatReader
+        let actual = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2863,7 +3094,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -2944,7 +3175,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3048,7 +3279,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3212,7 +3443,7 @@ mod tests {
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         let reader = TrackingFileRead::new(bytes.clone());
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(reader.clone()),
                 bytes.len() as u64,
@@ -3391,7 +3622,7 @@ mod tests {
         Box::new(writer).close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
@@ -3586,7 +3817,7 @@ mod tests {
         let fields = java_fixture_fields();
         let bytes = java_fixture_bytes();
         let file_size = bytes.len() as u64;
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 file_size,
@@ -3937,7 +4168,7 @@ mod tests {
             .await
             .unwrap();
 
-        let batches = RowFormatReader
+        let batches = RowFormatReader::default()
             .read_batch_stream(
                 Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,

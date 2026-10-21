@@ -411,7 +411,17 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".avro") {
         Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
-        Box::new(row::RowFormatReader)
+        if table_options
+            .get("row.projection-decode.enabled")
+            .map(String::as_str)
+            == Some("true")
+        {
+            Box::new(row::RowFormatReader::with_projection(
+                fields.projected.to_vec(),
+            ))
+        } else {
+            Box::new(row::RowFormatReader::default())
+        }
     } else if lower.ends_with(".mosaic") {
         Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
     } else {
