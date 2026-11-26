@@ -25,7 +25,8 @@ use paimon::arrow::ReadBudget;
 use paimon::io::FileBlockCache;
 use paimon::resource::ResourceContext;
 use paimon::spec::{
-    BinaryRow, BlobType, DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema,
+    BinaryRow, BlobType, DataType, Datum, IntType, PredicateBuilder, Schema, SchemaChange,
+    TableSchema,
 };
 use paimon::table::{DataSplitBuilder, Table};
 use parquet::arrow::ArrowWriter;
@@ -346,6 +347,35 @@ async fn zero_parallelism_fails_before_any_splits_are_read() {
 }
 
 #[tokio::test]
+async fn ordinary_projection_ignores_blob_output_budget_option() {
+    let table = table("append").await;
+    let splits = table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap()
+        .splits()
+        .to_vec();
+    let table = table.copy_with_options(std::collections::HashMap::from([(
+        "read.blob.output.max-buffered-bytes".into(),
+        "invalid".into(),
+    )]));
+    let batches = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(2)
+        .unwrap()
+        .to_arrow(&splits)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 12);
+}
+
+#[tokio::test]
 async fn finite_blob_reads_do_not_open_payloads_in_later_splits() {
     for primary_key in [false, true] {
         let mut schema = Schema::builder()
@@ -353,7 +383,8 @@ async fn finite_blob_reads_do_not_open_payloads_in_later_splits() {
             .column("id", DataType::Int(IntType::new()))
             .column("payload", DataType::Blob(BlobType::new()))
             .partition_keys(["p"])
-            .option("read.batch-size", "1");
+            .option("read.batch-size", "1")
+            .option("read.blob.output.max-buffered-bytes", "2mb");
         if primary_key {
             schema = schema.primary_key(["p", "id"]).option("bucket", "1");
         } else {
@@ -390,6 +421,36 @@ async fn finite_blob_reads_do_not_open_payloads_in_later_splits() {
         let plan = table.new_read_builder().new_scan().plan().await.unwrap();
         let splits = plan.splits();
         assert_eq!(splits.len(), 3);
+        for ordered in [false, true] {
+            let batches = table
+                .new_read_builder()
+                .new_read()
+                .unwrap()
+                .with_parallelism(8)
+                .unwrap()
+                .with_ordered(ordered)
+                .to_arrow(splits)
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut payloads = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("payload")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.unwrap().to_vec())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            payloads.sort();
+            assert_eq!(payloads, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        }
         let mut deleted = 0;
         for split in &splits[1..] {
             for status in io.list_status_recursive(split.bucket_path()).await.unwrap() {
@@ -673,6 +734,383 @@ async fn ordered_split_reads_do_not_wait_on_a_later_row_groups_budget_permit() {
         assert_eq!(
             order.later_data_started.load(Ordering::SeqCst),
             limit.is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn unordered_blob_budget_does_not_deadlock_with_parquet_prefetch() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("payload", DataType::Blob(BlobType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("blob-descriptor-field", "payload")
+        .option("read.batch-size", "1")
+        .option("read.blob.output.max-buffered-bytes", "256mb")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(
+        "memory:/unordered_blob_budget",
+        TableSchema::new(0, &schema),
+    );
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let payload_path = "memory:/unordered_blob_budget/payload";
+    io.new_output(payload_path)
+        .unwrap()
+        .write(Bytes::from_static(b"hello"))
+        .await
+        .unwrap();
+    let descriptor = paimon::spec::BlobDescriptor::new(payload_path.into(), 0, 5).serialize();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..16)) as ArrayRef,
+        ),
+        (
+            "payload",
+            Arc::new(LargeBinaryArray::from(vec![descriptor.as_slice(); 16])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(8))
+        .build();
+    let mut parquet = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut parquet, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    assert_eq!(writer.close().unwrap().num_row_groups(), 2);
+
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer.write_arrow_batch(&batch.slice(0, 1)).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let template = &messages[0].new_files[0];
+    let bucket_path = format!("{}/bucket-0", table.location());
+    io.mkdirs(&bucket_path).await.unwrap();
+    let mut splits = Vec::new();
+    for name in ["first.parquet", "second.parquet"] {
+        io.new_output(&format!("{bucket_path}/{name}"))
+            .unwrap()
+            .write(Bytes::copy_from_slice(&parquet))
+            .await
+            .unwrap();
+        let mut file = template.clone();
+        file.file_name = name.into();
+        file.file_size = parquet.len() as i64;
+        file.row_count = 16;
+        file.first_row_id = Some(0);
+        file.external_path = None;
+        splits.push(
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path.clone())
+                .with_total_buckets(1)
+                .with_data_files(vec![file])
+                .build()
+                .unwrap(),
+        );
+    }
+    let output = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(2)
+        .unwrap()
+        .with_ordered(false)
+        .with_parquet_read_budget(Arc::new(ReadBudget::new(2, 1024 * 1024).unwrap()))
+        .to_arrow(&splits)
+        .unwrap();
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        output.try_collect::<Vec<_>>(),
+    )
+    .await
+    .expect("BLOB output budget deadlocked with Parquet prefetch")
+    .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 32);
+}
+
+/// Block the first PK file until another split opens its Parquet file.
+#[derive(Debug)]
+struct ConcurrentPkFiles {
+    first_file: String,
+    first_waited: AtomicBool,
+    later_started: AtomicBool,
+    release: Notify,
+}
+
+#[async_trait::async_trait]
+impl FileBlockCache for ConcurrentPkFiles {
+    async fn get(&self, path: &str, _range: Range<u64>) -> Option<Bytes> {
+        if path.ends_with(".parquet") {
+            if path.ends_with(&self.first_file) {
+                self.first_waited.store(true, Ordering::SeqCst);
+                let released = self.release.notified();
+                if !self.later_started.load(Ordering::SeqCst) {
+                    released.await;
+                }
+            } else {
+                self.later_started.store(true, Ordering::SeqCst);
+                self.release.notify_waiters();
+            }
+        }
+        None
+    }
+
+    async fn put(&self, _path: &str, _offset: u64, _data: Bytes) {}
+    async fn invalidate_path(&self, _path: &str) {}
+    async fn invalidate_prefix(&self, _prefix: &str) {}
+}
+
+async fn write_partitioned_blobs(
+    mode: &str,
+    partitions: i32,
+    payloads: &[&[u8]],
+    batch_size: usize,
+    output_budget: Option<&str>,
+) -> (paimon::io::FileIO, Table) {
+    let mut schema = Schema::builder()
+        .column("p", DataType::Int(IntType::new()))
+        .column("id", DataType::Int(IntType::new()))
+        .column("payload", DataType::Blob(BlobType::new()))
+        .partition_keys(["p"])
+        .option("read.batch-size", batch_size.to_string());
+    if mode == "pk" {
+        schema = schema.primary_key(["p", "id"]).option("bucket", "1");
+    } else {
+        schema = schema
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.write-cols-optimization.enabled", "true");
+    }
+    if let Some(output_budget) = output_budget {
+        schema = schema.option("read.blob.output.max-buffered-bytes", output_budget);
+    }
+    let schema = schema.build().unwrap();
+    let (io, table) = memory_table(
+        &format!("memory:/parallel_blobs_{mode}"),
+        TableSchema::new(0, &schema),
+    );
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    for partition in 0..partitions {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "p",
+                Arc::new(Int32Array::from(vec![partition; payloads.len()])) as ArrayRef,
+            ),
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..payloads.len() as i32)) as ArrayRef,
+            ),
+            (
+                "payload",
+                Arc::new(LargeBinaryArray::from(payloads.to_vec())) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+    }
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    (io, table)
+}
+
+#[tokio::test]
+async fn managed_pk_blob_splits_read_concurrently_by_default() {
+    check_parallel_blob_reads("pk", None).await;
+}
+
+#[tokio::test]
+async fn optimized_de_blob_splits_read_concurrently_with_explicit_budget() {
+    check_parallel_blob_reads("de", Some("4mb")).await;
+}
+
+async fn check_parallel_blob_reads(mode: &str, output_budget: Option<&str>) {
+    let (io, table) =
+        write_partitioned_blobs(mode, 2, &[b"hello", b"world!"], 2048, output_budget).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let splits = plan.splits();
+    assert_eq!(splits.len(), 2);
+    let parquet_names = splits
+        .iter()
+        .map(|split| {
+            let file = split
+                .data_files()
+                .iter()
+                .find(|f| f.file_name.ends_with(".parquet"))
+                .unwrap();
+            assert!(file.write_cols.is_none());
+            file.file_name.clone()
+        })
+        .collect::<Vec<_>>();
+    if mode == "de" {
+        assert!(splits.iter().all(|split| split
+            .data_files()
+            .iter()
+            .any(|file| file.file_name.ends_with(".blob") && file.file_size < 1024 * 1024)));
+    }
+    let mut read_cases = vec![
+        (table.schema().clone(), false),
+        (table.schema().clone(), true),
+    ];
+    if mode == "de" {
+        let evolved = table
+            .schema()
+            .apply_changes(vec![SchemaChange::add_column(
+                "new_value".into(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        assert_ne!(evolved.id(), table.schema().id());
+        persist_table_schema(&io, table.location(), &evolved).await;
+        read_cases.push((evolved, false));
+    }
+    for (schema, ordered) in read_cases {
+        let gate = Arc::new(ConcurrentPkFiles {
+            first_file: parquet_names[0].clone(),
+            first_waited: AtomicBool::new(false),
+            later_started: AtomicBool::new(false),
+            release: Notify::new(),
+        });
+        let io = io
+            .clone()
+            .with_file_block_cache(gate.clone(), 64 * 1024, "data")
+            .unwrap();
+        let read_table = Table::new(
+            io,
+            table.identifier().clone(),
+            table.location().into(),
+            schema,
+            None,
+        );
+        let output = read_table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .with_parallelism(2)
+            .unwrap()
+            .with_ordered(ordered)
+            .to_arrow(splits)
+            .unwrap();
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            output.try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("a small BLOB split serialized the other partition")
+        .unwrap();
+        assert!(gate.first_waited.load(Ordering::SeqCst));
+        assert!(gate.later_started.load(Ordering::SeqCst));
+        let mut payloads = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("payload")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap().to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        payloads.sort();
+        assert_eq!(
+            payloads,
+            vec![
+                b"hello".to_vec(),
+                b"hello".to_vec(),
+                b"world!".to_vec(),
+                b"world!".to_vec()
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordered_single_blob_split_runs_without_tokio() {
+    let (_, table) = write_partitioned_blobs("de", 1, &[b"one", b"two"], 2048, Some("4mb")).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 1);
+    let output = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(8)
+        .unwrap()
+        .with_ordered(true)
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batches =
+        std::thread::spawn(move || futures::executor::block_on(output.try_collect::<Vec<_>>()))
+            .join()
+            .unwrap()
+            .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+#[tokio::test]
+async fn unordered_de_keeps_reservation_between_source_batch_slices() {
+    use futures::StreamExt;
+
+    let large = vec![42; 1536 * 1024];
+    let mut payloads = vec![b"x".as_slice(); 1024];
+    payloads.push(&large);
+    let (_, table) = write_partitioned_blobs("de", 3, &payloads, 2048, Some("2mb")).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 3);
+    for split in plan.splits() {
+        let blob = split
+            .data_files()
+            .iter()
+            .find(|f| f.file_name.ends_with(".blob"))
+            .unwrap();
+        assert!((1024 * 1024..2 * 1024 * 1024).contains(&blob.file_size));
+    }
+    let output = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(3)
+        .unwrap()
+        .with_ordered(false)
+        .to_arrow(plan.splits())
+        .unwrap();
+    let (partitions, batch_sizes) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut output = output;
+            let mut partitions = Vec::new();
+            let mut batch_sizes = Vec::new();
+            while let Some(batch) = output.next().await {
+                let batch = batch.unwrap();
+                let partition = batch
+                    .column_by_name("p")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                partitions.push(partition.value(0));
+                batch_sizes.push(batch.num_rows());
+            }
+            (partitions, batch_sizes)
+        })
+        .await
+        .expect("a reader stalled while holding the BLOB reservation");
+    assert_eq!(batch_sizes, vec![1024, 1, 1024, 1, 1024, 1]);
+    for [first, second] in partitions.as_chunks::<2>().0 {
+        assert_eq!(
+            first, second,
+            "another split started while the first still held BLOBs"
         );
     }
 }
